@@ -1,0 +1,30 @@
+[package]
+name    = "synaptex-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "synaptex-core"
+path = "src/main.rs"
+
+[dependencies]
+synaptex-types = { workspace = true }
+synaptex-proto = { workspace = true }
+synaptex-tuya  = { workspace = true }
+
+tokio              = { workspace = true }
+tokio-stream       = { workspace = true }
+futures-core       = { workspace = true }
+async-trait        = { workspace = true }
+tonic              = { workspace = true }
+postcard           = { workspace = true }
+serde              = { workspace = true }
+sled               = { workspace = true }
+dashmap            = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror          = { workspace = true }
+anyhow             = { workspace = true }
+bytes              = { workspace = true }
+clap               = { workspace = true }

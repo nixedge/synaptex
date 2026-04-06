@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+package synaptex.v1;
+
+// ─── Service ──────────────────────────────────────────────────────────────────
+
+service DeviceService {
+  // Fetch current cached state for one device.
+  rpc GetDeviceState(GetDeviceStateRequest) returns (GetDeviceStateResponse);
+
+  // Dispatch a command to a device.
+  rpc SetDeviceState(SetDeviceStateRequest) returns (SetDeviceStateResponse);
+
+  // Enumerate all registered devices.
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
+
+  // Server-streaming: push state events as they arrive on the internal bus.
+  rpc WatchDeviceState(WatchDeviceStateRequest) returns (stream DeviceStateEvent);
+
+  // Persist a new device + its plugin config; spawns the plugin immediately.
+  rpc RegisterDevice(RegisterDeviceRequest) returns (RegisterDeviceResponse);
+
+  // Remove a device and stop its plugin.
+  rpc UnregisterDevice(UnregisterDeviceRequest) returns (UnregisterDeviceResponse);
+}
+
+// ─── Core Types ───────────────────────────────────────────────────────────────
+
+// MAC address in canonical hex form: "AA:BB:CC:DD:EE:FF"
+message DeviceId {
+  string mac = 1;
+}
+
+message DeviceInfo {
+  DeviceId           id           = 1;
+  string             name         = 2;
+  string             model        = 3;
+  string             protocol     = 4;  // e.g. "tuya_local_3.3"
+  repeated Capability capabilities = 5;
+}
+
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  CAPABILITY_POWER       = 1;
+  CAPABILITY_DIMMER      = 2;
+  CAPABILITY_COLOR_TEMP  = 3;
+  CAPABILITY_RGB         = 4;
+  CAPABILITY_SWITCH      = 5;
+}
+
+// Full device state snapshot — optional fields absent when unsupported.
+message DeviceState {
+  DeviceId device_id     = 1;
+  bool     online        = 2;
+  uint64   updated_at_ms = 3;  // Unix epoch ms
+
+  optional bool     power        = 4;
+  optional uint32   brightness   = 5;  // 0–1000 normalised
+  optional uint32   color_temp_k = 6;  // Kelvin
+  optional RgbValue rgb          = 7;
+
+  map<uint32, bool> switches = 8;  // switch index → on/off
+}
+
+message RgbValue {
+  uint32 r = 1;  // 0–255
+  uint32 g = 2;
+  uint32 b = 3;
+}
+
+// ─── RPC Messages ─────────────────────────────────────────────────────────────
+
+message GetDeviceStateRequest  { DeviceId device_id = 1; }
+message GetDeviceStateResponse { DeviceState state  = 1; }
+
+message SetDeviceStateRequest {
+  DeviceId device_id = 1;
+
+  oneof command {
+    bool          set_power        = 2;
+    uint32        set_brightness   = 3;
+    uint32        set_color_temp_k = 4;
+    RgbValue      set_rgb          = 5;
+    SwitchCommand set_switch       = 6;
+  }
+}
+
+message SwitchCommand {
+  uint32 index = 1;
+  bool   state = 2;
+}
+
+message SetDeviceStateResponse {
+  bool   ok            = 1;
+  string error_message = 2;  // non-empty on failure
+}
+
+message ListDevicesRequest  {}
+message ListDevicesResponse { repeated DeviceInfo devices = 1; }
+
+// ─── Registration ─────────────────────────────────────────────────────────────
+
+// Tuya local-protocol connection parameters.
+// Protocol version (v3.3 / v3.4) is detected automatically by the daemon.
+message TuyaConfig {
+  string ip        = 1;
+  uint32 port      = 2;  // default 6668
+  string tuya_id   = 3;  // Tuya cloud device ID (e.g. "bfabc123...")
+  string local_key = 4;  // 16-char ASCII string from the Tuya API
+}
+
+message RegisterDeviceRequest {
+  DeviceInfo  info        = 1;
+  TuyaConfig  tuya_config = 2;
+}
+
+message RegisterDeviceResponse {
+  bool   ok            = 1;
+  string error_message = 2;
+}
+
+message UnregisterDeviceRequest  { DeviceId device_id = 1; }
+message UnregisterDeviceResponse { bool ok = 1; }
+
+// Empty device_ids = subscribe to all.
+message WatchDeviceStateRequest { repeated DeviceId device_ids = 1; }
+message DeviceStateEvent        { DeviceState state = 1; }

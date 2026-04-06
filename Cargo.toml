@@ -1,0 +1,65 @@
+[workspace]
+members = [
+    "crates/synaptex-types",
+    "crates/synaptex-proto",
+    "crates/synaptex-core",
+    "crates/synaptex-tuya",
+    "crates/synaptex-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+license     = "Apache-2.0"
+repository  = "https://github.com/nixedge/synaptex"
+
+[workspace.dependencies]
+# ── Internal ─────────────────────────────────────────────────────────────────
+synaptex-types = { path = "crates/synaptex-types" }
+synaptex-proto = { path = "crates/synaptex-proto" }
+synaptex-tuya  = { path = "crates/synaptex-tuya" }
+
+# ── Async runtime ─────────────────────────────────────────────────────────────
+tokio        = { version = "1",    features = ["full"] }
+async-trait  = "0.1"
+tokio-stream  = { version = "0.1", features = ["net", "sync"] }
+futures-core  = "0.3"
+hyper-util    = { version = "0.1", features = ["tokio"] }
+
+# ── gRPC / protobuf ───────────────────────────────────────────────────────────
+tonic = { version = "0.12", features = ["transport"] }
+prost = "0.13"
+
+# ── Serialization ─────────────────────────────────────────────────────────────
+postcard   = { version = "1", features = ["alloc"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+sled    = "0.34"
+dashmap = "6"
+
+# ── Crypto (Tuya AES-128-ECB / AES-128-CBC / HMAC-SHA256) ────────────────────
+aes       = "0.8"
+cipher    = { version = "0.4", features = ["block-padding"] }
+hex       = "0.4"
+crc32fast = "1"
+hmac      = "0.12"
+sha2      = "0.10"
+rand      = "0.8"
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+clap  = { version = "4", features = ["derive", "env"] }
+tower = "0.4"
+
+# ── Observability ─────────────────────────────────────────────────────────────
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── Error handling ────────────────────────────────────────────────────────────
+thiserror = "2"
+anyhow    = "1"
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+bytes = "1"

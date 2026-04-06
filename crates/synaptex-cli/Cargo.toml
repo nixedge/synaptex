@@ -1,0 +1,20 @@
+[package]
+name    = "synaptex-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "synaptex-cli"
+path = "src/main.rs"
+
+[dependencies]
+synaptex-proto = { workspace = true }
+synaptex-types = { workspace = true }
+
+tokio   = { workspace = true }
+tonic   = { workspace = true }
+tower   = { workspace = true }
+clap    = { workspace = true }
+anyhow     = { workspace = true }
+hyper-util = { workspace = true }
