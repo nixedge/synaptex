@@ -28,3 +28,5 @@ thiserror          = { workspace = true }
 anyhow             = { workspace = true }
 bytes              = { workspace = true }
 clap               = { workspace = true }
+rand               = { workspace = true }
+uuid               = { version = "1", features = ["v4"] }

@@ -1,0 +1,153 @@
+pub mod trees;
+pub use trees::Trees;
+
+use anyhow::Result;
+use postcard::{from_bytes, to_allocvec};
+use serde::{de::DeserializeOwned, Serialize};
+use sled::Tree;
+use synaptex_types::{device::DeviceId, DeviceInfo};
+use synaptex_tuya::TuyaDeviceConfig;
+
+// ─── Generic helpers ─────────────────────────────────────────────────────────
+
+/// Postcard-encode `val` and insert into `tree` keyed by `id`.
+pub fn put<V: Serialize>(tree: &Tree, id: &DeviceId, val: &V) -> Result<()> {
+    let encoded = to_allocvec(val)?;
+    tree.insert(id.0, encoded)?;
+    Ok(())
+}
+
+/// Fetch and postcard-decode a value from `tree` keyed by `id`.
+pub fn get<V: DeserializeOwned>(tree: &Tree, id: &DeviceId) -> Result<Option<V>> {
+    match tree.get(id.0)? {
+        Some(bytes) => Ok(Some(from_bytes(&bytes)?)),
+        None        => Ok(None),
+    }
+}
+
+// ─── Registry helpers ────────────────────────────────────────────────────────
+
+/// Persist device metadata to the registry tree.
+pub fn register_device(trees: &Trees, info: &DeviceInfo) -> Result<()> {
+    put(&trees.registry, &info.id, info)
+}
+
+/// Remove device metadata from the registry tree.
+pub fn remove_device(trees: &Trees, id: &DeviceId) -> Result<()> {
+    trees.registry.remove(id.0)?;
+    Ok(())
+}
+
+/// Retrieve all `DeviceInfo` records from the registry tree.
+pub fn list_all_devices(trees: &Trees) -> Result<Vec<DeviceInfo>> {
+    let mut devices = Vec::new();
+    for item in trees.registry.iter() {
+        let (_k, v) = item?;
+        let info: DeviceInfo = from_bytes(&v)?;
+        devices.push(info);
+    }
+    Ok(devices)
+}
+
+// ─── Plugin config helpers ────────────────────────────────────────────────────
+
+/// Config for a group device (synthetic MAC, fan-out to members).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GroupConfig {
+    pub device_id:  DeviceId,
+    pub member_ids: Vec<DeviceId>,
+}
+
+/// Discriminated union of all per-protocol configs stored in the `configs` tree.
+/// Add new variants here when Phase 4+ protocols are introduced.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum PluginConfig {
+    Tuya(TuyaDeviceConfig),
+    Group(GroupConfig),
+}
+
+/// A named room containing a set of devices (physical and/or group).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Room {
+    pub id:         String,        // UUID
+    pub name:       String,
+    pub device_ids: Vec<DeviceId>,
+}
+
+/// Persist a plugin config to the `configs` tree.
+pub fn save_plugin_config(trees: &Trees, id: &DeviceId, cfg: &PluginConfig) -> Result<()> {
+    put(&trees.configs, id, cfg)
+}
+
+/// Remove a plugin config from the `configs` tree.
+pub fn remove_plugin_config(trees: &Trees, id: &DeviceId) -> Result<()> {
+    trees.configs.remove(id.0)?;
+    Ok(())
+}
+
+/// Load all `PluginConfig` entries from the `configs` tree.
+pub fn load_all_plugin_configs(trees: &Trees) -> Result<Vec<PluginConfig>> {
+    let mut configs = Vec::new();
+    for item in trees.configs.iter() {
+        let (_k, v) = item?;
+        match from_bytes::<PluginConfig>(&v) {
+            Ok(cfg) => configs.push(cfg),
+            Err(e)  => tracing::warn!("skipping corrupt config entry: {e}"),
+        }
+    }
+    Ok(configs)
+}
+
+// ─── String-keyed generic helpers ─────────────────────────────────────────────
+
+fn put_str<V: Serialize>(tree: &Tree, key: &str, val: &V) -> Result<()> {
+    let encoded = to_allocvec(val)?;
+    tree.insert(key.as_bytes(), encoded)?;
+    Ok(())
+}
+
+fn get_str<V: DeserializeOwned>(tree: &Tree, key: &str) -> Result<Option<V>> {
+    match tree.get(key.as_bytes())? {
+        Some(bytes) => Ok(Some(from_bytes(&bytes)?)),
+        None        => Ok(None),
+    }
+}
+
+// ─── Room helpers ─────────────────────────────────────────────────────────────
+
+pub fn save_room(trees: &Trees, room: &Room) -> Result<()> {
+    put_str(&trees.rooms, &room.id, room)
+}
+
+pub fn get_room(trees: &Trees, room_id: &str) -> Result<Option<Room>> {
+    get_str(&trees.rooms, room_id)
+}
+
+pub fn list_rooms(trees: &Trees) -> Result<Vec<Room>> {
+    let mut rooms = Vec::new();
+    for item in trees.rooms.iter() {
+        let (_k, v) = item?;
+        match from_bytes::<Room>(&v) {
+            Ok(r)  => rooms.push(r),
+            Err(e) => tracing::warn!("skipping corrupt room entry: {e}"),
+        }
+    }
+    Ok(rooms)
+}
+
+pub fn remove_room(trees: &Trees, room_id: &str) -> Result<()> {
+    trees.rooms.remove(room_id.as_bytes())?;
+    Ok(())
+}
+
+pub fn find_room_by_name(trees: &Trees, name: &str) -> Result<Option<Room>> {
+    for item in trees.rooms.iter() {
+        let (_k, v) = item?;
+        if let Ok(r) = from_bytes::<Room>(&v) {
+            if r.name == name {
+                return Ok(Some(r));
+            }
+        }
+    }
+    Ok(None)
+}

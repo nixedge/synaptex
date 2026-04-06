@@ -3,35 +3,46 @@ use std::{pin::Pin, sync::Arc};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use synaptex_proto::{
     device_service_server::DeviceService,
+    CreateGroupRequest, CreateGroupResponse,
+    CreateRoomRequest, CreateRoomResponse,
+    DeleteRoomRequest, DeleteRoomResponse,
     DeviceStateEvent,
     GetDeviceStateRequest,
     GetDeviceStateResponse,
+    GetRoomRequest, GetRoomResponse,
     ListDevicesRequest,
     ListDevicesResponse,
+    ListRoomsRequest, ListRoomsResponse,
     RegisterDeviceRequest,
     RegisterDeviceResponse,
+    SendRoomCommandRequest, SendRoomCommandResponse,
     SetDeviceStateRequest,
     SetDeviceStateResponse,
     UnregisterDeviceRequest,
     UnregisterDeviceResponse,
+    UpdateGroupRequest, UpdateGroupResponse,
+    UpdateRoomRequest, UpdateRoomResponse,
     WatchDeviceStateRequest,
 };
 use synaptex_tuya::{TuyaPlugin, plugin::TuyaConfig};
-use synaptex_types::plugin::StateBusSender;
+use synaptex_types::{device::DeviceInfo, plugin::StateBusSender};
 
 use crate::{
     cache::StateCache,
-    db::{self, PluginConfig, Trees},
+    db::{self, GroupConfig, PluginConfig, Room, Trees},
+    group::{self, GroupPlugin},
     plugin::PluginRegistry,
 };
 
 use super::convert::{
     device_info_to_proto, device_state_to_proto,
-    proto_command_to_device_command, proto_id_to_internal,
-    proto_register_to_internal,
+    proto_command_to_device_command, proto_id_to_internal, internal_id_to_proto,
+    proto_register_to_internal, room_info_to_proto,
+    proto_send_room_command_to_device_command,
 };
 
 // ─── Service handle ──────────────────────────────────────────────────────────
@@ -85,7 +96,7 @@ impl DeviceService for DeviceServiceImpl {
         })?)?;
 
         let cmd        = req.command.ok_or_else(|| Status::invalid_argument("command is required"))?;
-        let device_cmd = proto_command_to_device_command(cmd);
+        let device_cmd = proto_command_to_device_command(cmd)?;
 
         info!(device = %id, cmd = ?device_cmd, "command received");
 
@@ -163,19 +174,20 @@ impl DeviceService for DeviceServiceImpl {
         &self,
         req: Request<RegisterDeviceRequest>,
     ) -> Result<Response<RegisterDeviceResponse>, Status> {
-        let (info, tuya_cfg) = proto_register_to_internal(req.into_inner())?;
+        let (mut info, tuya_cfg) = proto_register_to_internal(req.into_inner())?;
+
+        // If the client didn't send explicit capabilities, derive them from the DP map.
+        if info.capabilities.is_empty() {
+            info.capabilities = tuya_cfg.dp_map().capabilities();
+        }
+
         let id = info.id;
 
-        // Persist both the device metadata and the plugin config atomically
-        // (sled doesn't do multi-tree transactions, but both writes are
-        // idempotent so a partial failure on restart is recoverable).
         db::register_device(&self.trees, &info)
             .map_err(|e| Status::internal(format!("persist device info: {e}")))?;
         db::save_plugin_config(&self.trees, &id, &PluginConfig::Tuya(tuya_cfg.clone()))
             .map_err(|e| Status::internal(format!("persist plugin config: {e}")))?;
 
-        // Instantiate and register the plugin immediately — the supervisor
-        // will connect it in the background.
         let plugin = TuyaPlugin::new(
             info,
             TuyaConfig {
@@ -216,5 +228,321 @@ impl DeviceService for DeviceServiceImpl {
 
         info!(%id, "device unregistered");
         Ok(Response::new(UnregisterDeviceResponse { ok: true }))
+    }
+
+    // ── CreateGroup ──────────────────────────────────────────────────────────
+
+    async fn create_group(
+        &self,
+        req: Request<CreateGroupRequest>,
+    ) -> Result<Response<CreateGroupResponse>, Status> {
+        let req = req.into_inner();
+
+        if req.member_ids.is_empty() {
+            return Ok(Response::new(CreateGroupResponse {
+                ok: false,
+                error_message: "member_ids is required".into(),
+                id: None,
+            }));
+        }
+
+        let member_ids: Result<Vec<_>, _> = req.member_ids
+            .iter()
+            .map(proto_id_to_internal)
+            .collect();
+        let member_ids = member_ids.map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        // Compute union of capabilities from member DeviceInfos.
+        let mut capabilities = Vec::new();
+        for &mid in &member_ids {
+            match db::get::<DeviceInfo>(&self.trees.registry, &mid)
+                .map_err(|e| Status::internal(e.to_string()))?
+            {
+                Some(info) => {
+                    for cap in info.capabilities {
+                        if !capabilities.contains(&cap) {
+                            capabilities.push(cap);
+                        }
+                    }
+                }
+                None => {
+                    return Ok(Response::new(CreateGroupResponse {
+                        ok: false,
+                        error_message: format!("member {mid} not found in registry"),
+                        id: None,
+                    }));
+                }
+            }
+        }
+
+        let group_id = group::new_group_id();
+        let info = DeviceInfo {
+            id:           group_id,
+            name:         req.name,
+            model:        req.model,
+            protocol:     "group".into(),
+            capabilities: capabilities.clone(),
+        };
+
+        db::register_device(&self.trees, &info)
+            .map_err(|e| Status::internal(format!("persist group info: {e}")))?;
+        db::save_plugin_config(
+            &self.trees,
+            &group_id,
+            &PluginConfig::Group(GroupConfig { device_id: group_id, member_ids: member_ids.clone() }),
+        )
+        .map_err(|e| Status::internal(format!("persist group config: {e}")))?;
+
+        let plugin = GroupPlugin::new(
+            info,
+            member_ids,
+            self.registry.clone(),
+            self.cache.clone(),
+            self.bus_tx.clone(),
+        );
+        self.registry.register(Arc::new(plugin));
+
+        info!(group = %group_id, "group created");
+        Ok(Response::new(CreateGroupResponse {
+            ok: true,
+            error_message: String::new(),
+            id: Some(internal_id_to_proto(&group_id)),
+        }))
+    }
+
+    // ── UpdateGroup ──────────────────────────────────────────────────────────
+
+    async fn update_group(
+        &self,
+        req: Request<UpdateGroupRequest>,
+    ) -> Result<Response<UpdateGroupResponse>, Status> {
+        let req      = req.into_inner();
+        let group_id = proto_id_to_internal(
+            req.group_id.as_ref()
+                .ok_or_else(|| Status::invalid_argument("group_id is required"))?,
+        )?;
+
+        let mut info: DeviceInfo = db::get(&self.trees.registry, &group_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("group {group_id} not found")))?;
+
+        if !req.name.is_empty() {
+            info.name = req.name;
+        }
+
+        let member_ids = if !req.member_ids.is_empty() {
+            let ids: Result<Vec<_>, _> = req.member_ids.iter().map(proto_id_to_internal).collect();
+            let ids = ids.map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+            // Recompute capability union.
+            let mut capabilities = Vec::new();
+            for &mid in &ids {
+                match db::get::<DeviceInfo>(&self.trees.registry, &mid)
+                    .map_err(|e| Status::internal(e.to_string()))?
+                {
+                    Some(minfo) => {
+                        for cap in minfo.capabilities {
+                            if !capabilities.contains(&cap) {
+                                capabilities.push(cap);
+                            }
+                        }
+                    }
+                    None => {
+                        return Ok(Response::new(UpdateGroupResponse {
+                            ok: false,
+                            error_message: format!("member {mid} not found"),
+                        }));
+                    }
+                }
+            }
+            info.capabilities = capabilities;
+            ids
+        } else {
+            // Keep existing members from persisted config.
+            let cfg: PluginConfig = db::get(&self.trees.configs, &group_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("group config not found"))?;
+            match cfg {
+                PluginConfig::Group(g) => g.member_ids,
+                _ => return Err(Status::internal("expected group config")),
+            }
+        };
+
+        db::register_device(&self.trees, &info)
+            .map_err(|e| Status::internal(format!("persist group info: {e}")))?;
+        db::save_plugin_config(
+            &self.trees,
+            &group_id,
+            &PluginConfig::Group(GroupConfig { device_id: group_id, member_ids: member_ids.clone() }),
+        )
+        .map_err(|e| Status::internal(format!("persist group config: {e}")))?;
+
+        // Replace the running plugin.
+        self.registry.deregister(&group_id).await;
+        let plugin = GroupPlugin::new(
+            info,
+            member_ids,
+            self.registry.clone(),
+            self.cache.clone(),
+            self.bus_tx.clone(),
+        );
+        self.registry.register(Arc::new(plugin));
+
+        info!(group = %group_id, "group updated");
+        Ok(Response::new(UpdateGroupResponse { ok: true, error_message: String::new() }))
+    }
+
+    // ── CreateRoom ───────────────────────────────────────────────────────────
+
+    async fn create_room(
+        &self,
+        req: Request<CreateRoomRequest>,
+    ) -> Result<Response<CreateRoomResponse>, Status> {
+        let req = req.into_inner();
+
+        let device_ids: Result<Vec<_>, _> = req.device_ids
+            .iter()
+            .map(proto_id_to_internal)
+            .collect();
+        let device_ids = device_ids.map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        // Validate all device IDs exist.
+        for &did in &device_ids {
+            let exists: bool = db::get::<DeviceInfo>(&self.trees.registry, &did)
+                .map_err(|e| Status::internal(e.to_string()))?
+                .is_some();
+            if !exists {
+                return Ok(Response::new(CreateRoomResponse {
+                    ok: false,
+                    error_message: format!("device {did} not found"),
+                    id: String::new(),
+                }));
+            }
+        }
+
+        let room_id = Uuid::new_v4().to_string();
+        let room = Room { id: room_id.clone(), name: req.name, device_ids };
+        db::save_room(&self.trees, &room)
+            .map_err(|e| Status::internal(format!("persist room: {e}")))?;
+
+        info!(room_id = %room_id, "room created");
+        Ok(Response::new(CreateRoomResponse {
+            ok: true, error_message: String::new(), id: room_id,
+        }))
+    }
+
+    // ── UpdateRoom ───────────────────────────────────────────────────────────
+
+    async fn update_room(
+        &self,
+        req: Request<UpdateRoomRequest>,
+    ) -> Result<Response<UpdateRoomResponse>, Status> {
+        let req = req.into_inner();
+
+        let mut room = db::get_room(&self.trees, &req.room_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("room {} not found", req.room_id)))?;
+
+        if !req.name.is_empty() {
+            room.name = req.name;
+        }
+
+        if !req.device_ids.is_empty() {
+            let device_ids: Result<Vec<_>, _> = req.device_ids
+                .iter()
+                .map(proto_id_to_internal)
+                .collect();
+            let device_ids = device_ids.map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+            for &did in &device_ids {
+                let exists = db::get::<DeviceInfo>(&self.trees.registry, &did)
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .is_some();
+                if !exists {
+                    return Ok(Response::new(UpdateRoomResponse {
+                        ok: false,
+                        error_message: format!("device {did} not found"),
+                    }));
+                }
+            }
+
+            room.device_ids = device_ids;
+        }
+
+        db::save_room(&self.trees, &room)
+            .map_err(|e| Status::internal(format!("persist room: {e}")))?;
+
+        info!(room_id = %room.id, "room updated");
+        Ok(Response::new(UpdateRoomResponse { ok: true, error_message: String::new() }))
+    }
+
+    // ── DeleteRoom ───────────────────────────────────────────────────────────
+
+    async fn delete_room(
+        &self,
+        req: Request<DeleteRoomRequest>,
+    ) -> Result<Response<DeleteRoomResponse>, Status> {
+        let room_id = req.into_inner().room_id;
+        db::remove_room(&self.trees, &room_id)
+            .map_err(|e| Status::internal(format!("remove room: {e}")))?;
+
+        info!(room_id = %room_id, "room deleted");
+        Ok(Response::new(DeleteRoomResponse { ok: true, error_message: String::new() }))
+    }
+
+    // ── ListRooms ────────────────────────────────────────────────────────────
+
+    async fn list_rooms(
+        &self,
+        _req: Request<ListRoomsRequest>,
+    ) -> Result<Response<ListRoomsResponse>, Status> {
+        let rooms = db::list_rooms(&self.trees)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .map(room_info_to_proto)
+            .collect();
+
+        Ok(Response::new(ListRoomsResponse { rooms }))
+    }
+
+    // ── GetRoom ──────────────────────────────────────────────────────────────
+
+    async fn get_room(
+        &self,
+        req: Request<GetRoomRequest>,
+    ) -> Result<Response<GetRoomResponse>, Status> {
+        let room_id = req.into_inner().room_id;
+        let room = db::get_room(&self.trees, &room_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("room {room_id} not found")))?;
+
+        Ok(Response::new(GetRoomResponse {
+            room: Some(room_info_to_proto(room)),
+        }))
+    }
+
+    // ── SendRoomCommand ──────────────────────────────────────────────────────
+
+    async fn send_room_command(
+        &self,
+        req: Request<SendRoomCommandRequest>,
+    ) -> Result<Response<SendRoomCommandResponse>, Status> {
+        let req     = req.into_inner();
+        let room_id = req.room_id.clone();
+
+        let room = db::get_room(&self.trees, &room_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("room {room_id} not found")))?;
+
+        let cmd = proto_send_room_command_to_device_command(req.command)?;
+
+        match crate::room::execute_room_command(&room, cmd, &self.registry).await {
+            Ok(()) => Ok(Response::new(SendRoomCommandResponse {
+                ok: true, error_message: String::new(),
+            })),
+            Err(e) => Ok(Response::new(SendRoomCommandResponse {
+                ok: false, error_message: e.to_string(),
+            })),
+        }
     }
 }

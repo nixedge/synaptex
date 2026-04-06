@@ -40,8 +40,9 @@ serde_json = "1"
 sled    = "0.34"
 dashmap = "6"
 
-# ── Crypto (Tuya AES-128-ECB / AES-128-CBC / HMAC-SHA256) ────────────────────
+# ── Crypto (Tuya AES-128-ECB / AES-128-CBC / AES-128-GCM / HMAC-SHA256) ──────
 aes       = "0.8"
+aes-gcm   = "0.10"
 cipher    = { version = "0.4", features = ["block-padding"] }
 hex       = "0.4"
 crc32fast = "1"
@@ -63,3 +64,4 @@ anyhow    = "1"
 
 # ── Misc ──────────────────────────────────────────────────────────────────────
 bytes = "1"
+uuid  = { version = "1", features = ["v4"] }

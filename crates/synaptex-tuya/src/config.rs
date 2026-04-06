@@ -10,22 +10,35 @@ use crate::dp_map::DpMap;
 /// Persisted via postcard in the sled `configs` tree, keyed by `DeviceId`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuyaDeviceConfig {
-    pub device_id: DeviceId,
-    pub ip:        IpAddr,
+    pub device_id:  DeviceId,
+    pub ip:         IpAddr,
     /// Tuya local API port — almost always 6668.
-    pub port:      u16,
+    pub port:       u16,
     /// Tuya cloud device ID (e.g. `"bfabc123456789012345"`).
-    /// Used as the `devId` field in every JSON payload sent to the device.
-    pub tuya_id:   String,
-    /// 16-character ASCII string obtained from the Tuya API.
-    /// The raw bytes of this string are the AES-128 key.
-    pub local_key: String,
-    /// `None` → use `DpMap::default()` (covers most common bulb/switch firmware).
-    pub dp_map:    Option<DpMap>,
+    pub tuya_id:    String,
+    /// 16-character ASCII string from the Tuya API.
+    pub local_key:  String,
+    /// Named DP profile: "bulb_a" | "bulb_b" | "switch" | "fan" | "ir1" | "ir2" | "custom".
+    /// When "custom" (or empty), `dp_map_override` is used if present.
+    pub dp_profile: String,
+    /// Per-device DP map override.  Takes precedence over `dp_profile` when `Some`.
+    pub dp_map:     Option<DpMap>,
 }
 
 impl TuyaDeviceConfig {
+    /// Resolve the effective `DpMap` for this device.
+    ///
+    /// Resolution order:
+    /// 1. `dp_map` override (if `Some`)
+    /// 2. Preset named by `dp_profile`
+    /// 3. `DpMap::default()` (Type-B bulb)
     pub fn dp_map(&self) -> DpMap {
-        self.dp_map.clone().unwrap_or_default()
+        if let Some(ref m) = self.dp_map {
+            return m.clone();
+        }
+        if !self.dp_profile.is_empty() {
+            return DpMap::from_profile(&self.dp_profile);
+        }
+        DpMap::default()
     }
 }

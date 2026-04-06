@@ -1,46 +1,74 @@
-/// Tuya local protocol v3.3 / v3.4 TCP framing.
+/// Tuya local protocol TCP framing — v3.3 (CRC32), v3.4 (HMAC), and v3.5 (AES-128-GCM).
 ///
-/// Message layout (all multi-byte fields are big-endian):
-///
+/// ## v3.3 / v3.4 (0x55AA) frame layout (big-endian):
 /// ```text
-/// ┌─────────────┬──────────┬──────────┬──────────┬──────────────┬──────────┬─────────────┐
-/// │ Prefix (4B) │ Seq (4B) │ Cmd (4B) │ Len (4B) │ Data (N B)   │ CRC (4B) │ Suffix (4B) │
-/// │ 0x0055AA    │          │          │ N+8      │ encrypted JSON│ crc32    │ 0x0055AA    │
-/// └─────────────┴──────────┴──────────┴──────────┴──────────────┴──────────┴─────────────┘
+/// ┌──────────┬────────┬────────┬────────┬──────────────┬──────────────┬─────────┐
+/// │ Prefix   │ Seq    │ Cmd    │ Len    │ Data         │ Trailer      │ Suffix  │
+/// │ 0x0055AA │ (4 B)  │ (4 B)  │ (4 B)  │ encrypted    │ CRC32 or     │ 0xAA55  │
+/// │  (4 B)   │        │        │ N+8    │ JSON (N B)   │ HMAC-SHA256  │  (4 B)  │
+/// └──────────┴────────┴────────┴────────┴──────────────┴──────────────┴─────────┘
 /// ```
+/// CRC32 trailer = 4 B; HMAC-SHA256 trailer = 32 B; total `Len` field:
+/// - CRC32:  N + 8  (data + CRC + suffix)
+/// - HMAC:   N + 36 (data + HMAC + suffix)
 ///
-/// For v3.3 the data field of **commands** is prefixed with the 12-byte
-/// version string `"3.3\0\0\0\0\0\0\0\0\0"` before encryption.
+/// ## v3.5 (0x6699) frame layout:
+/// ```text
+/// ┌───────────┬────────┬────────┬────────┬────────┬──────────────────┬─────────┐
+/// │ Prefix    │ Unk    │ Seq    │ Cmd    │ Len    │ Data             │ Suffix  │
+/// │ 0x006699  │ 0x0000 │ (4 B)  │ (4 B)  │ (4 B)  │ retcode(4) +     │ 0x9966  │
+/// │ (4 B)     │ (2 B)  │        │        │        │ IV(12) + CT + T  │ (4 B)   │
+/// └───────────┴────────┴────────┴────────┴────────┴──────────────────┴─────────┘
+/// ```
+/// Total frame = 18 + Len + 4.  Len = 4 + 12 + N + 16 = N + 32.
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crc32fast::Hasher as Crc32Hasher;
 
-use crate::error::TuyaError;
+use crate::{cipher, error::TuyaError};
 
-// ─── Constants ───────────────────────────────────────────────────────────────
+// ─── 0x55AA constants ────────────────────────────────────────────────────────
 
-pub const PREFIX: [u8; 4] = [0x00, 0x00, 0x55, 0xAA];
-pub const SUFFIX: [u8; 4] = [0x00, 0x00, 0xAA, 0x55];
+pub const PREFIX:    [u8; 4] = [0x00, 0x00, 0x55, 0xAA];
+pub const SUFFIX:    [u8; 4] = [0x00, 0x00, 0xAA, 0x55];
 
-/// Minimum frame size: prefix(4) + seq(4) + cmd(4) + len(4) + crc(4) + suffix(4)
+/// Minimum 0x55AA frame size (CRC32 trailer).
 pub const MIN_FRAME_LEN: usize = 24;
 
-/// v3.3 command data prefix (15 bytes): `"3.3"` + 12 null bytes.
-///
-/// This is prepended to the **ciphertext** (after AES-ECB encryption) only for
-/// Control (0x07) commands.  DpQuery and all other commands send the ciphertext
-/// directly with no prefix.
-pub const V33_DATA_PREFIX: &[u8; 15] = b"3.3\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+pub const TRAILER_CRC_LEN:  usize = 8;   // CRC32(4) + suffix(4)
+pub const TRAILER_HMAC_LEN: usize = 36;  // HMAC-SHA256(32) + suffix(4)
 
-// ─── Command words ───────────────────────────────────────────────────────────
+// ─── 0x6699 (v3.5) constants ──────────────────────────────────────────────────
+
+pub const PREFIX_6699: [u8; 4] = [0x00, 0x00, 0x66, 0x99];
+pub const SUFFIX_6699: [u8; 4] = [0x00, 0x00, 0x99, 0x66];
+
+/// v3.3 command data prefix (15 bytes): `"3.3"` + 12 null bytes.
+pub const V33_DATA_PREFIX: &[u8; 15] =
+    b"3.3\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+
+// ─── Trailer kind ─────────────────────────────────────────────────────────────
+
+/// Selects which trailer format to use when building or verifying 0x55AA frames.
+#[derive(Clone, Copy)]
+pub enum TrailerKind<'a> {
+    /// 4-byte CRC32 (v3.3 and session-key-negotiation frames).
+    Crc32,
+    /// 32-byte HMAC-SHA256 keyed with the given session key (v3.4 data frames).
+    Hmac(&'a [u8; 16]),
+}
+
+// ─── Command words ────────────────────────────────────────────────────────────
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandWord {
-    Heartbeat  = 0x09,
-    DpQuery    = 0x0A,
-    Control    = 0x07,
-    StatusPush = 0x08,
-    // v3.4 session key negotiation
+    Control          = 0x07,
+    StatusPush       = 0x08,
+    Heartbeat        = 0x09,
+    DpQuery          = 0x0A,
+    /// v3.4+ preferred DP-query command.
+    DpQueryNew       = 0x0D,
+    // v3.4 session-key negotiation
     SessKeyNegStart  = 0x03,
     SessKeyNegResp   = 0x04,
     SessKeyNegFinish = 0x05,
@@ -50,105 +78,267 @@ impl TryFrom<u32> for CommandWord {
     type Error = TuyaError;
     fn try_from(v: u32) -> Result<Self, TuyaError> {
         match v {
-            0x09 => Ok(Self::Heartbeat),
-            0x0A => Ok(Self::DpQuery),
-            0x07 => Ok(Self::Control),
-            0x08 => Ok(Self::StatusPush),
             0x03 => Ok(Self::SessKeyNegStart),
             0x04 => Ok(Self::SessKeyNegResp),
             0x05 => Ok(Self::SessKeyNegFinish),
+            0x07 => Ok(Self::Control),
+            0x08 => Ok(Self::StatusPush),
+            0x09 => Ok(Self::Heartbeat),
+            0x0A => Ok(Self::DpQuery),
+            0x0D => Ok(Self::DpQueryNew),
             other => Err(TuyaError::Protocol(format!("unknown command word: 0x{other:02X}"))),
         }
     }
 }
 
-// ─── Frame ───────────────────────────────────────────────────────────────────
+// ─── Frame ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct TuyaFrame {
     pub seq_no:  u32,
     pub command: CommandWord,
-    /// Raw (decrypted) payload bytes.
+    /// Raw payload bytes.  For 0x55AA frames this is the still-encrypted
+    /// payload; the caller decrypts.  For 0x6699 frames this is already
+    /// decrypted (GCM handles it inside `parse_frame_any`).
     pub payload: Bytes,
 }
 
-// ─── Build a command frame ────────────────────────────────────────────────────
+// ─── Build 0x55AA frame ───────────────────────────────────────────────────────
 
-/// Encode a `TuyaFrame` into wire bytes, including CRC and prefix/suffix.
-/// `encrypted_payload` must already be AES-128-ECB encrypted.
-pub fn build_frame(seq_no: u32, cmd: CommandWord, encrypted_payload: &[u8]) -> Bytes {
-    // data_len = payload + 4 (CRC) + 4 (suffix)
-    let data_len = encrypted_payload.len() as u32 + 8;
+/// Encode a frame into wire bytes with either CRC32 or HMAC-SHA256 trailer.
+/// `payload` must already be AES-encrypted by the caller.
+pub fn build_frame(
+    seq_no:  u32,
+    cmd:     CommandWord,
+    payload: &[u8],
+    trailer: TrailerKind,
+) -> Bytes {
+    let trailer_len = match trailer {
+        TrailerKind::Crc32   => TRAILER_CRC_LEN,
+        TrailerKind::Hmac(_) => TRAILER_HMAC_LEN,
+    };
+    let data_len = payload.len() as u32 + trailer_len as u32;
 
-    // Build the portion over which CRC is computed (prefix through end of data).
-    let mut buf = BytesMut::with_capacity(MIN_FRAME_LEN + encrypted_payload.len());
+    let mut buf = BytesMut::with_capacity(16 + payload.len() + trailer_len);
     buf.put_slice(&PREFIX);
     buf.put_u32(seq_no);
     buf.put_u32(cmd as u32);
     buf.put_u32(data_len);
-    buf.put_slice(encrypted_payload);
+    buf.put_slice(payload);
 
-    let crc = crc32_of(&buf);
-    buf.put_u32(crc);
+    match trailer {
+        TrailerKind::Crc32 => {
+            let crc = crc32_of(&buf);
+            buf.put_u32(crc);
+        }
+        TrailerKind::Hmac(key) => {
+            let hmac = cipher::hmac_sha256(key, &buf);
+            buf.put_slice(&hmac);
+        }
+    }
     buf.put_slice(&SUFFIX);
-
     buf.freeze()
 }
 
-// ─── Parse a received frame ──────────────────────────────────────────────────
+// ─── Parse 0x55AA frame ───────────────────────────────────────────────────────
 
-/// Attempt to parse one `TuyaFrame` from `buf`.
+/// Attempt to parse one 0x55AA `TuyaFrame` from `buf`.
 ///
 /// Returns `Ok(Some((frame, consumed)))` when a complete frame is available,
 /// `Ok(None)` when more data is needed, or an error on malformed data.
-pub fn parse_frame(buf: &[u8]) -> Result<Option<(TuyaFrame, usize)>, TuyaError> {
+pub fn parse_frame(buf: &[u8], trailer: TrailerKind) -> Result<Option<(TuyaFrame, usize)>, TuyaError> {
     if buf.len() < MIN_FRAME_LEN {
         return Ok(None);
     }
-
-    // Locate prefix.
     if &buf[..4] != PREFIX {
-        return Err(TuyaError::Protocol(format!(
-            "bad prefix: {:02X?}",
-            &buf[..4]
-        )));
+        return Err(TuyaError::Protocol(format!("bad prefix: {:02X?}", &buf[..4])));
     }
 
     let mut cursor = &buf[4..];
     let seq_no   = cursor.get_u32();
     let cmd_raw  = cursor.get_u32();
-    let data_len = cursor.get_u32() as usize; // includes CRC(4) + suffix(4)
+    let data_len = cursor.get_u32() as usize; // includes trailer + suffix
 
-    let total_frame = 4 + 4 + 4 + 4 + data_len; // prefix + seq + cmd + len + rest
+    let total_frame = 16 + data_len; // prefix(4)+seq(4)+cmd(4)+len(4) + data_len
     if buf.len() < total_frame {
-        return Ok(None); // incomplete frame
+        return Ok(None); // incomplete
     }
 
-    // payload = everything between the header and CRC+suffix
-    let payload_len = data_len.saturating_sub(8);
-    let payload_end = 4 + 4 + 4 + 4 + payload_len;
-    let payload     = Bytes::copy_from_slice(&buf[16..payload_end]);
+    match trailer {
+        TrailerKind::Crc32 => {
+            let payload_len = data_len.saturating_sub(8);
+            let payload_end = 16 + payload_len;
+            let payload     = Bytes::copy_from_slice(&buf[16..payload_end]);
 
-    // Verify CRC over prefix through end of payload.
-    let expected_crc = u32::from_be_bytes(buf[payload_end..payload_end + 4].try_into().unwrap());
-    let actual_crc   = crc32_of(&buf[..payload_end]);
-    if expected_crc != actual_crc {
+            let expected_crc = u32::from_be_bytes(
+                buf[payload_end..payload_end + 4].try_into().unwrap(),
+            );
+            let actual_crc = crc32_of(&buf[..payload_end]);
+            if expected_crc != actual_crc {
+                return Err(TuyaError::Protocol(format!(
+                    "CRC mismatch: expected {expected_crc:#010X}, got {actual_crc:#010X}"
+                )));
+            }
+            if &buf[payload_end + 4..payload_end + 8] != SUFFIX {
+                return Err(TuyaError::Protocol("bad suffix".into()));
+            }
+            let command = CommandWord::try_from(cmd_raw)?;
+            Ok(Some((TuyaFrame { seq_no, command, payload }, total_frame)))
+        }
+
+        TrailerKind::Hmac(key) => {
+            let payload_len = data_len.saturating_sub(36);
+            let payload_end = 16 + payload_len;
+            let payload     = Bytes::copy_from_slice(&buf[16..payload_end]);
+
+            let expected_hmac = &buf[payload_end..payload_end + 32];
+            let actual_hmac   = cipher::hmac_sha256(key, &buf[..payload_end]);
+            if expected_hmac != &actual_hmac {
+                return Err(TuyaError::Cipher("HMAC verification failed".into()));
+            }
+            if &buf[payload_end + 32..payload_end + 36] != SUFFIX {
+                return Err(TuyaError::Protocol("bad v3.4 suffix".into()));
+            }
+            let command = CommandWord::try_from(cmd_raw)?;
+            Ok(Some((TuyaFrame { seq_no, command, payload }, total_frame)))
+        }
+    }
+}
+
+// ─── Build v3.5 (0x6699) frame ────────────────────────────────────────────────
+
+/// Build a v3.5 (0x6699) AES-128-GCM frame.
+///
+/// `session_key` is the AES-128-GCM key.  `iv` is the 12-byte nonce (caller
+/// must ensure uniqueness; for data frames use a fresh random nonce per call).
+/// AAD = header bytes `[4..18]` (0u16 + seqno + cmd + len).
+///
+/// Wire layout: `PREFIX_6699(4) | 0u16(2) | seq(4) | cmd(4) | len(4) |`
+///              `0u32_retcode(4) | gcm_encrypt(payload)(IV+CT+tag) | SUFFIX_6699(4)`
+pub fn build_frame_v35(
+    seq_no:      u32,
+    cmd:         CommandWord,
+    payload:     &[u8],
+    session_key: &[u8; 16],
+    iv:          &[u8; 12],
+) -> Result<Bytes, TuyaError> {
+    // data_len = retcode(4) + gcm_out = retcode + IV(12) + ciphertext + tag(16)
+    let data_len = 4u32 + 12u32 + payload.len() as u32 + 16u32;
+
+    // AAD = header[4..18]: 0u16(2) + seq(4) + cmd(4) + data_len(4) = 14 bytes
+    let mut aad = [0u8; 14];
+    aad[0..2].copy_from_slice(&0u16.to_be_bytes());
+    aad[2..6].copy_from_slice(&seq_no.to_be_bytes());
+    aad[6..10].copy_from_slice(&(cmd as u32).to_be_bytes());
+    aad[10..14].copy_from_slice(&data_len.to_be_bytes());
+
+    // gcm_encrypt returns IV(12) ++ ciphertext ++ tag(16)
+    let gcm_out = cipher::gcm_encrypt(session_key, &iv, &aad, payload);
+
+    let total = 22 + data_len as usize; // header(18) + data + suffix(4)
+    let mut buf = BytesMut::with_capacity(total);
+    buf.put_slice(&PREFIX_6699);
+    buf.put_u16(0u16);
+    buf.put_u32(seq_no);
+    buf.put_u32(cmd as u32);
+    buf.put_u32(data_len);
+    buf.put_u32(0u32); // retcode = 0 for commands
+    buf.put_slice(&gcm_out); // IV(12) + ciphertext + tag(16)
+    buf.put_slice(&SUFFIX_6699);
+    Ok(buf.freeze())
+}
+
+// ─── Parse any frame (0x55AA or 0x6699) ──────────────────────────────────────
+
+/// Parse one frame from `buf`, auto-detecting 0x55AA vs 0x6699 prefix.
+///
+/// `session_key`:
+/// - `None`                  → 0x55AA CRC32; 0x6699 returns error (no GCM key).
+/// - `Some((gcm_key, tk))`   → 0x6699 GCM-decrypts with `gcm_key`;
+///                             0x55AA uses `tk` (CRC32 or HMAC).
+///
+/// For 0x6699, the returned `TuyaFrame.payload` is already GCM-decrypted.
+pub fn parse_frame_any<'a>(
+    buf:         &[u8],
+    session_key: Option<(&'a [u8; 16], TrailerKind<'a>)>,
+) -> Result<Option<(TuyaFrame, usize)>, TuyaError> {
+    if buf.len() < 4 {
+        return Ok(None);
+    }
+
+    if &buf[..4] == PREFIX_6699 {
+        parse_frame_v35(buf, session_key.map(|(k, _)| k))
+    } else {
+        let tk = session_key
+            .map(|(_, tk)| tk)
+            .unwrap_or(TrailerKind::Crc32);
+        parse_frame(buf, tk)
+    }
+}
+
+// ─── Parse a single 0x6699 frame ─────────────────────────────────────────────
+
+fn parse_frame_v35(
+    buf:         &[u8],
+    session_key: Option<&[u8; 16]>,
+) -> Result<Option<(TuyaFrame, usize)>, TuyaError> {
+    // Header: PREFIX_6699(4) + 0u16(2) + seq(4) + cmd(4) + len(4) = 18 bytes
+    if buf.len() < 18 {
+        return Ok(None);
+    }
+    if &buf[..4] != PREFIX_6699 {
         return Err(TuyaError::Protocol(format!(
-            "CRC mismatch: expected {expected_crc:#010X}, got {actual_crc:#010X}"
+            "parse_frame_v35: bad prefix {:02X?}",
+            &buf[..4]
         )));
     }
 
-    // Verify suffix.
-    if &buf[payload_end + 4..payload_end + 8] != SUFFIX {
-        return Err(TuyaError::Protocol("bad suffix".into()));
+    let seq_no   = u32::from_be_bytes(buf[6..10].try_into().unwrap());
+    let cmd_raw  = u32::from_be_bytes(buf[10..14].try_into().unwrap());
+    let data_len = u32::from_be_bytes(buf[14..18].try_into().unwrap()) as usize;
+
+    let total_frame = 18 + data_len + 4; // header + data + suffix
+    if buf.len() < total_frame {
+        return Ok(None);
     }
 
-    let command = CommandWord::try_from(cmd_raw)?;
-    let frame   = TuyaFrame { seq_no, command, payload };
-    Ok(Some((frame, total_frame)))
+    // Verify suffix
+    if &buf[total_frame - 4..total_frame] != SUFFIX_6699 {
+        return Err(TuyaError::Protocol("bad v3.5 suffix".into()));
+    }
+
+    let data = &buf[18..18 + data_len];
+    // data = retcode(4) + IV(12) + ciphertext(N) + tag(16)
+    if data.len() < 4 + 12 + 16 {
+        return Err(TuyaError::Protocol(format!(
+            "v3.5 data too short: {} bytes",
+            data.len()
+        )));
+    }
+
+    let _retcode   = u32::from_be_bytes(data[0..4].try_into().unwrap());
+    let iv: &[u8; 12] = data[4..16].try_into().unwrap();
+    let rest          = &data[16..]; // ciphertext + tag
+    let ct_len        = rest.len().saturating_sub(16);
+    let ciphertext    = &rest[..ct_len];
+    let tag: &[u8; 16] = rest[ct_len..].try_into().unwrap();
+
+    // AAD = buf[4..18]
+    let aad = &buf[4..18];
+
+    let key = session_key.ok_or_else(|| {
+        TuyaError::Protocol("v3.5 frame received but no GCM session key available".into())
+    })?;
+
+    let plaintext = cipher::gcm_decrypt(key, iv, aad, ciphertext, tag)?;
+    let command   = CommandWord::try_from(cmd_raw)?;
+    Ok(Some((
+        TuyaFrame { seq_no, command, payload: Bytes::from(plaintext) },
+        total_frame,
+    )))
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 fn crc32_of(data: &[u8]) -> u32 {
     let mut h = Crc32Hasher::new();
@@ -157,9 +347,6 @@ fn crc32_of(data: &[u8]) -> u32 {
 }
 
 /// Returns `true` if this v3.3 command requires the 15-byte version prefix.
-///
-/// Only `Control` (0x07) carries the prefix; `DpQuery`, `Heartbeat`, and
-/// session-key negotiation frames are sent as raw ciphertext.
 pub fn v33_needs_prefix(cmd: CommandWord) -> bool {
     cmd == CommandWord::Control
 }

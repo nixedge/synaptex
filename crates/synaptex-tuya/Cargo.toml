@@ -16,6 +16,7 @@ tracing     = { workspace = true }
 bytes       = { workspace = true }
 hex         = { workspace = true }
 aes         = { workspace = true }
+aes-gcm     = { workspace = true }
 cipher      = { workspace = true }
 crc32fast   = { workspace = true }
 hmac        = { workspace = true }

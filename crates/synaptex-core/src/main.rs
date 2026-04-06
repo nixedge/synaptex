@@ -1,7 +1,9 @@
 mod bus;
 mod cache;
 mod db;
+mod group;
 mod plugin;
+mod room;
 mod rpc;
 
 use std::{path::PathBuf, sync::Arc};
@@ -94,6 +96,29 @@ async fn main() -> Result<()> {
                         local_key: tuya_cfg.local_key.clone(),
                         dp_map:    tuya_cfg.dp_map(),
                     },
+                    bus_tx.clone(),
+                );
+                registry.register(Arc::new(plugin));
+            }
+            PluginConfig::Group(group_cfg) => {
+                let info = match db::get(&trees.registry, &group_cfg.device_id)
+                    .context("read group device info")?
+                {
+                    Some(info) => info,
+                    None => {
+                        tracing::warn!(
+                            device = %group_cfg.device_id,
+                            "group config found but no registry entry — skipping"
+                        );
+                        continue;
+                    }
+                };
+
+                let plugin = group::GroupPlugin::new(
+                    info,
+                    group_cfg.member_ids,
+                    registry.clone(),
+                    cache.clone(),
                     bus_tx.clone(),
                 );
                 registry.register(Arc::new(plugin));

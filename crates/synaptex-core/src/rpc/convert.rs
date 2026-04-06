@@ -8,16 +8,21 @@ use synaptex_proto::{
     DeviceState as ProtoDeviceState,
     RegisterDeviceRequest,
     RgbValue,
+    RoomInfo as ProtoRoomInfo,
     TuyaConfig as ProtoTuyaConfig,
+    send_room_command_request::Command as ProtoRoomCommand,
     set_device_state_request::Command as ProtoCommand,
+    set_dp_command::Value as ProtoDpValue,
 };
 use synaptex_types::{
     capability::{Capability, DeviceCommand},
     device::{DeviceId, DeviceInfo},
     plugin::DeviceState,
 };
-use synaptex_tuya::{TuyaDeviceConfig, plugin::TuyaConfig};
+use synaptex_tuya::TuyaDeviceConfig;
 use tonic::Status;
+
+use crate::db::Room;
 
 // ─── DeviceId ────────────────────────────────────────────────────────────────
 
@@ -34,11 +39,30 @@ pub fn internal_id_to_proto(id: &DeviceId) -> ProtoDeviceId {
 
 fn capability_to_proto(c: &Capability) -> i32 {
     match c {
-        Capability::Power        => ProtoCapability::Power as i32,
-        Capability::Dimmer { .. }    => ProtoCapability::Dimmer as i32,
-        Capability::ColorTemp { .. } => ProtoCapability::ColorTemp as i32,
-        Capability::Rgb          => ProtoCapability::Rgb as i32,
-        Capability::Switch { .. }    => ProtoCapability::Switch as i32,
+        Capability::Power           => ProtoCapability::Power as i32,
+        Capability::Dimmer { .. }   => ProtoCapability::Dimmer as i32,
+        Capability::ColorTemp { .. }=> ProtoCapability::ColorTemp as i32,
+        Capability::Rgb             => ProtoCapability::Rgb as i32,
+        Capability::Switch { .. }   => ProtoCapability::Switch as i32,
+        Capability::Fan             => ProtoCapability::Fan as i32,
+        Capability::Ir              => ProtoCapability::Ir as i32,
+    }
+}
+
+/// Convert a proto capability integer to an internal `Capability`.
+/// Returns `None` for `CAPABILITY_UNSPECIFIED` or unknown values.
+/// `Dimmer` and `ColorTemp` use standard normalized ranges; `Switch` defaults
+/// to index 0.  Use `DpMap::capabilities()` for precise ranges from a device config.
+pub fn proto_capability_to_internal(c: i32) -> Option<Capability> {
+    match ProtoCapability::try_from(c).ok()? {
+        ProtoCapability::Unspecified => None,
+        ProtoCapability::Power       => Some(Capability::Power),
+        ProtoCapability::Dimmer      => Some(Capability::Dimmer { min: 0, max: 1000 }),
+        ProtoCapability::ColorTemp   => Some(Capability::ColorTemp { min_k: 2700, max_k: 6500 }),
+        ProtoCapability::Rgb         => Some(Capability::Rgb),
+        ProtoCapability::Switch      => Some(Capability::Switch { index: 0 }),
+        ProtoCapability::Fan         => Some(Capability::Fan),
+        ProtoCapability::Ir          => Some(Capability::Ir),
     }
 }
 
@@ -78,10 +102,8 @@ pub fn device_state_to_proto(s: DeviceState) -> ProtoDeviceState {
     }
 }
 
-// ─── Registration ────────────────────────────────────────────────────────────
+// ─── Registration ─────────────────────────────────────────────────────────────
 
-/// Validate and convert a `RegisterDeviceRequest` into the internal pair
-/// `(DeviceInfo, TuyaDeviceConfig)` required by the plugin factory.
 pub fn proto_register_to_internal(
     req: RegisterDeviceRequest,
 ) -> Result<(DeviceInfo, TuyaDeviceConfig), Status> {
@@ -100,18 +122,22 @@ fn proto_device_info_to_internal(p: ProtoDeviceInfo) -> Result<DeviceInfo, Statu
         p.id.as_ref()
             .ok_or_else(|| Status::invalid_argument("device_id is required"))?,
     )?;
+    let capabilities = p.capabilities
+        .iter()
+        .filter_map(|&c| proto_capability_to_internal(c))
+        .collect();
     Ok(DeviceInfo {
         id,
         name:         p.name,
         model:        p.model,
         protocol:     p.protocol,
-        capabilities: vec![], // populated by the plugin at runtime
+        capabilities,
     })
 }
 
 fn proto_tuya_config_to_internal(
-    id:  &DeviceId,
-    p:   &ProtoTuyaConfig,
+    id: &DeviceId,
+    p:  &ProtoTuyaConfig,
 ) -> Result<TuyaDeviceConfig, Status> {
     let ip = IpAddr::from_str(&p.ip)
         .map_err(|_| Status::invalid_argument(format!("invalid IP address: {}", p.ip)))?;
@@ -119,8 +145,6 @@ fn proto_tuya_config_to_internal(
     if p.tuya_id.is_empty() {
         return Err(Status::invalid_argument("tuya_id is required"));
     }
-
-    // The local_key is a 16-character ASCII string; its raw bytes are the AES key.
     if p.local_key.len() != 16 {
         return Err(Status::invalid_argument(format!(
             "local_key must be exactly 16 characters, got {}",
@@ -131,28 +155,83 @@ fn proto_tuya_config_to_internal(
     let port = if p.port == 0 { 6668 } else { p.port as u16 };
 
     Ok(TuyaDeviceConfig {
-        device_id: *id,
+        device_id:  *id,
         ip,
         port,
-        tuya_id:   p.tuya_id.clone(),
-        local_key: p.local_key.clone(),
-        dp_map:    None, // use defaults
+        tuya_id:    p.tuya_id.clone(),
+        local_key:  p.local_key.clone(),
+        dp_profile: p.dp_profile.clone(),
+        dp_map:     None,
     })
+}
+
+// ─── Room ─────────────────────────────────────────────────────────────────────
+
+pub fn room_info_to_proto(r: Room) -> ProtoRoomInfo {
+    ProtoRoomInfo {
+        id:         r.id,
+        name:       r.name,
+        device_ids: r.device_ids.iter().map(internal_id_to_proto).collect(),
+    }
 }
 
 // ─── Command ─────────────────────────────────────────────────────────────────
 
-pub fn proto_command_to_device_command(cmd: ProtoCommand) -> DeviceCommand {
-    match cmd {
-        ProtoCommand::SetPower(v)       => DeviceCommand::SetPower(v),
-        ProtoCommand::SetBrightness(v)  => DeviceCommand::SetBrightness(v as u16),
-        ProtoCommand::SetColorTempK(v)  => DeviceCommand::SetColorTemp(v as u16),
-        ProtoCommand::SetRgb(rgb)       => DeviceCommand::SetRgb(
+pub fn proto_command_to_device_command(cmd: ProtoCommand) -> Result<DeviceCommand, Status> {
+    let dc = match cmd {
+        ProtoCommand::SetPower(v)      => DeviceCommand::SetPower(v),
+        ProtoCommand::SetBrightness(v) => DeviceCommand::SetBrightness(v as u16),
+        ProtoCommand::SetColorTempK(v) => DeviceCommand::SetColorTemp(v as u16),
+        ProtoCommand::SetRgb(rgb)      => DeviceCommand::SetRgb(
             rgb.r as u8, rgb.g as u8, rgb.b as u8,
         ),
-        ProtoCommand::SetSwitch(sw)     => DeviceCommand::SetSwitch {
+        ProtoCommand::SetSwitch(sw)    => DeviceCommand::SetSwitch {
             index: sw.index as u8,
             state: sw.state,
         },
-    }
+        ProtoCommand::SendIr(ir)       => DeviceCommand::SendIr {
+            head: if ir.head.is_empty() { None } else { Some(ir.head) },
+            key:  ir.key,
+        },
+        ProtoCommand::SetDp(dp)        => {
+            let value = dp.value.ok_or_else(|| Status::invalid_argument("set_dp.value is required"))?;
+            match value {
+                ProtoDpValue::BoolVal(b)   => DeviceCommand::SetDpBool { dp: dp.dp as u16, value: b },
+                ProtoDpValue::IntVal(i)    => DeviceCommand::SetDpInt  { dp: dp.dp as u16, value: i },
+                ProtoDpValue::StringVal(s) => DeviceCommand::SetDpStr  { dp: dp.dp as u16, value: s },
+            }
+        }
+    };
+    Ok(dc)
+}
+
+pub fn proto_send_room_command_to_device_command(
+    cmd: Option<ProtoRoomCommand>,
+) -> Result<DeviceCommand, Status> {
+    let cmd = cmd.ok_or_else(|| Status::invalid_argument("command is required"))?;
+    let dc = match cmd {
+        ProtoRoomCommand::SetPower(v)      => DeviceCommand::SetPower(v),
+        ProtoRoomCommand::SetBrightness(v) => DeviceCommand::SetBrightness(v as u16),
+        ProtoRoomCommand::SetColorTempK(v) => DeviceCommand::SetColorTemp(v as u16),
+        ProtoRoomCommand::SetRgb(rgb)      => DeviceCommand::SetRgb(
+            rgb.r as u8, rgb.g as u8, rgb.b as u8,
+        ),
+        ProtoRoomCommand::SetSwitch(sw)    => DeviceCommand::SetSwitch {
+            index: sw.index as u8,
+            state: sw.state,
+        },
+        ProtoRoomCommand::SendIr(ir)       => DeviceCommand::SendIr {
+            head: if ir.head.is_empty() { None } else { Some(ir.head) },
+            key:  ir.key,
+        },
+        ProtoRoomCommand::SetDp(dp)        => {
+            let value = dp.value.ok_or_else(|| Status::invalid_argument("set_dp.value is required"))?;
+            match value {
+                ProtoDpValue::BoolVal(b)   => DeviceCommand::SetDpBool { dp: dp.dp as u16, value: b },
+                ProtoDpValue::IntVal(i)    => DeviceCommand::SetDpInt  { dp: dp.dp as u16, value: i },
+                ProtoDpValue::StringVal(s) => DeviceCommand::SetDpStr  { dp: dp.dp as u16, value: s },
+            }
+        }
+    };
+    Ok(dc)
 }
