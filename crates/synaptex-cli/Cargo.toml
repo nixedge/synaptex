@@ -9,15 +9,8 @@ name = "synaptex-cli"
 path = "src/main.rs"
 
 [dependencies]
-synaptex-proto = { workspace = true }
-synaptex-types = { workspace = true }
-
-tokio   = { workspace = true }
-tonic   = { workspace = true }
-tower   = { workspace = true }
-clap    = { workspace = true }
+tokio      = { workspace = true }
+clap       = { workspace = true }
 anyhow     = { workspace = true }
-hyper-util = { workspace = true }
 reqwest    = { workspace = true }
-serde      = { workspace = true }
 serde_json = { workspace = true }

@@ -6,19 +6,15 @@ mod plugin;
 mod rest;
 mod room;
 mod routine;
-mod rpc;
+mod router_client;
 mod tuya_cloud;
 
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::net::UnixListener;
-use tokio_stream::wrappers::UnixListenerStream;
-use tonic::transport::Server;
 use tracing::info;
 
-use synaptex_proto::device_service_server::DeviceServiceServer;
 use synaptex_tuya::{TuyaPlugin, plugin::TuyaConfig};
 
 use db::PluginConfig;
@@ -26,13 +22,9 @@ use db::PluginConfig;
 #[derive(Debug, Parser)]
 #[command(name = "synaptex-core", version, about = "Synaptex smart home controller daemon")]
 struct Args {
-    /// Path for the Unix domain socket.
-    #[arg(long, default_value = "./synaptex.sock", env = "SYNAPTEX_SOCKET")]
-    socket: PathBuf,
-
     /// Path for the sled database directory.
     #[arg(long, default_value = "./db", env = "SYNAPTEX_DB")]
-    db: PathBuf,
+    db: std::path::PathBuf,
 
     /// Port for the HTTP REST API.
     #[arg(long, default_value_t = 8080u16, env = "SYNAPTEX_HTTP_PORT")]
@@ -148,53 +140,22 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── HTTP REST API ────────────────────────────────────────────────────────
-    {
-        let app_state = rest::AppState {
-            cache:          cache.clone(),
-            registry:       registry.clone(),
-            trees:          trees.clone(),
-            bus_tx:         bus_tx.clone(),
-            routine_runner: routine_runner.clone(),
-        };
-        let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.http_port));
-        tokio::spawn(async move {
-            let tcp = tokio::net::TcpListener::bind(http_addr)
-                .await
-                .expect("bind HTTP port");
-            info!(addr = %http_addr, "HTTP API listening");
-            axum::serve(tcp, rest::mk_router(app_state))
-                .await
-                .expect("HTTP server error");
-        });
-    }
-
-    // ── gRPC server on UDS ────────────────────────────────────────────────────
-    if let Some(parent) = args.socket.parent() {
-        std::fs::create_dir_all(parent).context("create socket directory")?;
-    }
-    if args.socket.exists() {
-        std::fs::remove_file(&args.socket).context("remove stale socket")?;
-    }
-
-    let listener   = UnixListener::bind(&args.socket).context("bind UDS")?;
-    let uds_stream = UnixListenerStream::new(listener);
-
-    let service = rpc::DeviceServiceImpl {
-        cache,
-        registry,
-        trees,
-        bus_tx,
-        routine_runner,
+    // ── HTTP REST API (blocks until shutdown) ────────────────────────────────
+    let app_state = rest::AppState {
+        cache:          cache.clone(),
+        registry:       registry.clone(),
+        trees:          trees.clone(),
+        bus_tx:         bus_tx.clone(),
+        routine_runner: routine_runner.clone(),
     };
-
-    info!(socket = %args.socket.display(), "gRPC server listening");
-
-    Server::builder()
-        .add_service(DeviceServiceServer::new(service))
-        .serve_with_incoming(uds_stream)
+    let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.http_port));
+    let tcp = tokio::net::TcpListener::bind(http_addr)
         .await
-        .context("gRPC server error")?;
+        .context("bind HTTP port")?;
+    info!(addr = %http_addr, "HTTP API listening");
+    axum::serve(tcp, rest::mk_router(app_state))
+        .await
+        .context("HTTP server error")?;
 
     Ok(())
 }

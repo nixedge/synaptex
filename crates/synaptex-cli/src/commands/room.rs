@@ -1,20 +1,7 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Subcommand;
-use tonic::transport::Channel;
 
-use synaptex_proto::{
-    device_service_client::DeviceServiceClient,
-    CreateRoomRequest,
-    DeleteRoomRequest,
-    DeviceId as ProtoDeviceId,
-    GetRoomRequest,
-    ListRoomsRequest,
-    SendRoomCommandRequest,
-    UpdateRoomRequest,
-    send_room_command_request::Command,
-};
-
-use super::device::build_command;
+use super::device::build_command_json;
 
 // ─── Subcommands ─────────────────────────────────────────────────────────────
 
@@ -97,109 +84,113 @@ pub enum RoomCmd {
 
 // ─── Dispatch ────────────────────────────────────────────────────────────────
 
-pub async fn run(cmd: RoomCmd, client: &mut DeviceServiceClient<Channel>) -> Result<()> {
+pub async fn run(cmd: RoomCmd, http_url: &str, api_key: Option<&str>) -> Result<()> {
     match cmd {
-        RoomCmd::Create { name, devices }                                         => create(name, devices, client).await,
-        RoomCmd::Update { id, name, devices }                                     => update(id, name, devices, client).await,
-        RoomCmd::Delete { id }                                                    => delete(id, client).await,
-        RoomCmd::List                                                             => list(client).await,
-        RoomCmd::Get { id }                                                       => get(id, client).await,
-        RoomCmd::Set { id, power, brightness, color_temp, rgb, send_ir, set_dp } => {
-            set(id, power, brightness, color_temp, rgb, send_ir, set_dp, client).await
-        }
+        RoomCmd::Create { name, devices }                                         => create(name, devices, http_url, api_key).await,
+        RoomCmd::Update { id, name, devices }                                     => update(id, name, devices, http_url, api_key).await,
+        RoomCmd::Delete { id }                                                    => delete(id, http_url, api_key).await,
+        RoomCmd::List                                                             => list(http_url, api_key).await,
+        RoomCmd::Get { id }                                                       => get(id, http_url, api_key).await,
+        RoomCmd::Set { id, power, brightness, color_temp, rgb, send_ir, set_dp } =>
+            set(id, power, brightness, color_temp, rgb, send_ir, set_dp, http_url, api_key).await,
     }
 }
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
-async fn create(name: String, devices: String, client: &mut DeviceServiceClient<Channel>) -> Result<()> {
-    let device_ids = parse_mac_list(&devices)?;
-    let resp = client
-        .create_room(CreateRoomRequest { name, device_ids })
-        .await?
-        .into_inner();
+async fn create(name: String, devices: String, http_url: &str, api_key: Option<&str>) -> Result<()> {
+    let macs: Vec<&str> = devices.split(',').map(str::trim).collect();
+    let body = serde_json::json!({ "name": name, "devices": macs });
 
-    if resp.ok {
-        println!("room created — id: {}", resp.id);
-    } else {
-        bail!("room creation failed: {}", resp.error_message);
+    let client = reqwest::Client::new();
+    let mut req = client.post(format!("{http_url}/api/v1/rooms")).json(&body);
+    if let Some(key) = api_key { req = req.header("Authorization", format!("Bearer {key}")); }
+    let resp = req.send().await.context("POST /api/v1/rooms")?;
+    if !resp.status().is_success() {
+        bail!("room creation failed: {}", resp.text().await?);
     }
+    let result: serde_json::Value = resp.json().await?;
+    println!("room created — id: {}", result["id"].as_str().unwrap_or("?"));
     Ok(())
 }
 
 async fn update(
-    id:      String,
-    name:    Option<String>,
-    devices: Option<String>,
-    client:  &mut DeviceServiceClient<Channel>,
+    id:       String,
+    name:     Option<String>,
+    devices:  Option<String>,
+    http_url: &str,
+    api_key:  Option<&str>,
 ) -> Result<()> {
-    let device_ids = devices.map(|d| parse_mac_list(&d)).transpose()?
-        .unwrap_or_default();
-
-    let resp = client
-        .update_room(UpdateRoomRequest {
-            room_id:    id,
-            name:       name.unwrap_or_default(),
-            device_ids,
-        })
-        .await?
-        .into_inner();
-
-    if resp.ok {
-        println!("room updated");
-    } else {
-        bail!("room update failed: {}", resp.error_message);
+    let mut body = serde_json::json!({});
+    if let Some(n) = name    { body["name"]    = serde_json::json!(n); }
+    if let Some(d) = devices {
+        let macs: Vec<&str> = d.split(',').map(str::trim).collect();
+        body["devices"] = serde_json::json!(macs);
     }
+
+    let client = reqwest::Client::new();
+    let mut req = client.patch(format!("{http_url}/api/v1/rooms/{id}")).json(&body);
+    if let Some(key) = api_key { req = req.header("Authorization", format!("Bearer {key}")); }
+    let resp = req.send().await.context("PATCH /api/v1/rooms/{id}")?;
+    if !resp.status().is_success() {
+        bail!("room update failed: {}", resp.text().await?);
+    }
+    println!("room updated");
     Ok(())
 }
 
-async fn delete(id: String, client: &mut DeviceServiceClient<Channel>) -> Result<()> {
-    let resp = client
-        .delete_room(DeleteRoomRequest { room_id: id })
-        .await?
-        .into_inner();
-
-    if resp.ok {
-        println!("room deleted");
-    } else {
-        bail!("room deletion failed: {}", resp.error_message);
+async fn delete(id: String, http_url: &str, api_key: Option<&str>) -> Result<()> {
+    let client = reqwest::Client::new();
+    let mut req = client.delete(format!("{http_url}/api/v1/rooms/{id}"));
+    if let Some(key) = api_key { req = req.header("Authorization", format!("Bearer {key}")); }
+    let resp = req.send().await.context("DELETE /api/v1/rooms/{id}")?;
+    if !resp.status().is_success() {
+        bail!("room deletion failed: {}", resp.text().await?);
     }
+    println!("room deleted");
     Ok(())
 }
 
-async fn list(client: &mut DeviceServiceClient<Channel>) -> Result<()> {
-    let resp = client
-        .list_rooms(ListRoomsRequest {})
-        .await?
-        .into_inner();
+async fn list(http_url: &str, api_key: Option<&str>) -> Result<()> {
+    let client = reqwest::Client::new();
+    let mut req = client.get(format!("{http_url}/api/v1/rooms"));
+    if let Some(key) = api_key { req = req.header("Authorization", format!("Bearer {key}")); }
+    let resp = req.send().await.context("GET /api/v1/rooms")?;
+    if !resp.status().is_success() {
+        bail!("server error: {}", resp.text().await?);
+    }
 
-    if resp.rooms.is_empty() {
+    let rooms: Vec<serde_json::Value> = resp.json().await?;
+    if rooms.is_empty() {
         println!("no rooms");
         return Ok(());
     }
-
-    for r in &resp.rooms {
-        let device_count = r.device_ids.len();
-        println!("{}  {:32}  {} device(s)", r.id, r.name, device_count);
+    for r in &rooms {
+        let device_count = r["devices"].as_array().map(Vec::len).unwrap_or(0);
+        println!("{}  {:32}  {} device(s)",
+            r["id"].as_str().unwrap_or("?"),
+            r["name"].as_str().unwrap_or("?"),
+            device_count,
+        );
     }
     Ok(())
 }
 
-async fn get(id: String, client: &mut DeviceServiceClient<Channel>) -> Result<()> {
-    let resp = client
-        .get_room(GetRoomRequest { room_id: id })
-        .await?
-        .into_inner();
+async fn get(id: String, http_url: &str, api_key: Option<&str>) -> Result<()> {
+    let client = reqwest::Client::new();
+    let mut req = client.get(format!("{http_url}/api/v1/rooms/{id}"));
+    if let Some(key) = api_key { req = req.header("Authorization", format!("Bearer {key}")); }
+    let resp = req.send().await.context("GET /api/v1/rooms/{id}")?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND { bail!("room not found"); }
+    if !resp.status().is_success() { bail!("server error: {}", resp.text().await?); }
 
-    match resp.room {
-        None => bail!("room not found"),
-        Some(r) => {
-            println!("id:      {}", r.id);
-            println!("name:    {}", r.name);
-            println!("devices:");
-            for d in &r.device_ids {
-                println!("  {}", d.mac);
-            }
+    let r: serde_json::Value = resp.json().await?;
+    println!("id:      {}", r["id"].as_str().unwrap_or("?"));
+    println!("name:    {}", r["name"].as_str().unwrap_or("?"));
+    println!("devices:");
+    if let Some(devs) = r["devices"].as_array() {
+        for d in devs {
+            println!("  {}", d.as_str().unwrap_or("?"));
         }
     }
     Ok(())
@@ -214,47 +205,20 @@ async fn set(
     rgb:        Option<String>,
     send_ir:    Option<String>,
     set_dp:     Option<String>,
-    client:     &mut DeviceServiceClient<Channel>,
+    http_url:   &str,
+    api_key:    Option<&str>,
 ) -> Result<()> {
-    // Reuse device set command builder; convert to room command variant.
-    let device_cmd = build_command(power, brightness, color_temp, rgb, send_ir, set_dp)?;
+    let cmd_json = build_command_json(power, brightness, color_temp, rgb, send_ir, set_dp)?;
 
-    let command: Command = match device_cmd {
-        synaptex_proto::set_device_state_request::Command::SetPower(v)      => Command::SetPower(v),
-        synaptex_proto::set_device_state_request::Command::SetBrightness(v) => Command::SetBrightness(v),
-        synaptex_proto::set_device_state_request::Command::SetColorTempK(v) => Command::SetColorTempK(v),
-        synaptex_proto::set_device_state_request::Command::SetRgb(v)        => Command::SetRgb(v),
-        synaptex_proto::set_device_state_request::Command::SetSwitch(v)     => Command::SetSwitch(v),
-        synaptex_proto::set_device_state_request::Command::SendIr(v)        => Command::SendIr(v),
-        synaptex_proto::set_device_state_request::Command::SetDp(v)         => Command::SetDp(v),
-    };
-
-    let resp = client
-        .send_room_command(SendRoomCommandRequest {
-            room_id: id,
-            command: Some(command),
-        })
-        .await?
-        .into_inner();
-
-    if resp.ok {
-        println!("room command sent");
-    } else {
-        bail!("room command failed: {}", resp.error_message);
+    let client = reqwest::Client::new();
+    let mut req = client
+        .post(format!("{http_url}/api/v1/rooms/{id}/command"))
+        .json(&cmd_json);
+    if let Some(key) = api_key { req = req.header("Authorization", format!("Bearer {key}")); }
+    let resp = req.send().await.context("POST /api/v1/rooms/{id}/command")?;
+    if !resp.status().is_success() {
+        bail!("room command failed: {}", resp.text().await?);
     }
+    println!("room command sent");
     Ok(())
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-fn parse_mac_list(s: &str) -> Result<Vec<ProtoDeviceId>> {
-    s.split(',')
-        .map(|m| {
-            let m = m.trim().to_string();
-            if m.is_empty() {
-                bail!("empty MAC address in list");
-            }
-            Ok(ProtoDeviceId { mac: m })
-        })
-        .collect()
 }

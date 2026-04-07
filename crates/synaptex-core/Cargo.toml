@@ -9,15 +9,14 @@ name = "synaptex-core"
 path = "src/main.rs"
 
 [dependencies]
-synaptex-types = { workspace = true }
-synaptex-proto = { workspace = true }
-synaptex-tuya  = { workspace = true }
+synaptex-types        = { workspace = true }
+synaptex-tuya         = { workspace = true }
+synaptex-router-proto = { workspace = true }
+tonic              = { workspace = true }
 
 tokio              = { workspace = true }
 tokio-stream       = { workspace = true }
-futures-core       = { workspace = true }
 async-trait        = { workspace = true }
-tonic              = { workspace = true }
 postcard           = { workspace = true }
 serde              = { workspace = true }
 sled               = { workspace = true }
@@ -36,6 +35,10 @@ reqwest            = { workspace = true }
 serde_json         = { workspace = true }
 hmac               = { workspace = true }
 sha2               = { workspace = true }
+md-5               = { workspace = true }
 hex                = { workspace = true }
+aes                = { workspace = true }
+aes-gcm            = { workspace = true }
+socket2            = { workspace = true }
 cron               = { workspace = true }
 chrono             = { workspace = true }

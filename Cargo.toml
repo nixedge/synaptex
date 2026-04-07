@@ -1,11 +1,12 @@
 [workspace]
 members = [
     "crates/synaptex-types",
-    "crates/synaptex-proto",
     "crates/synaptex-core",
     "crates/synaptex-tuya",
     "crates/synaptex-cli",
     "crates/synaptex-app",
+    "crates/synaptex-router-proto",
+    "crates/synaptex-router",
 ]
 resolver = "2"
 
@@ -17,20 +18,19 @@ repository  = "https://github.com/nixedge/synaptex"
 
 [workspace.dependencies]
 # ── Internal ─────────────────────────────────────────────────────────────────
-synaptex-types = { path = "crates/synaptex-types" }
-synaptex-proto = { path = "crates/synaptex-proto" }
-synaptex-tuya  = { path = "crates/synaptex-tuya" }
+synaptex-types        = { path = "crates/synaptex-types" }
+synaptex-tuya         = { path = "crates/synaptex-tuya" }
+synaptex-router-proto = { path = "crates/synaptex-router-proto" }
 
 # ── Async runtime ─────────────────────────────────────────────────────────────
 tokio        = { version = "1",    features = ["full"] }
 async-trait  = "0.1"
-tokio-stream  = { version = "0.1", features = ["net", "sync"] }
-futures-core  = "0.3"
-hyper-util    = { version = "0.1", features = ["tokio"] }
+tokio-stream  = { version = "0.1", features = ["sync"] }
 
-# ── gRPC / protobuf ───────────────────────────────────────────────────────────
-tonic = { version = "0.12", features = ["transport"] }
+# ── gRPC / protobuf (router ↔ core IPC) ───────────────────────────────────────
+tonic = { version = "0.12", features = ["transport", "tls"] }
 prost = "0.13"
+rcgen = "0.12"
 
 # ── Serialization ─────────────────────────────────────────────────────────────
 postcard   = { version = "1", features = ["alloc"] }
@@ -49,16 +49,17 @@ hex       = "0.4"
 crc32fast = "1"
 hmac      = "0.12"
 sha2      = "0.10"
+md-5      = "0.10"
 rand      = "0.8"
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────
 axum        = { version = "0.7", features = ["macros"] }
 tower-http  = { version = "0.5", features = ["cors", "trace"] }
 reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+socket2     = { version = "0.5", features = ["all"] }
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 clap  = { version = "4", features = ["derive", "env"] }
-tower = "0.4"
 
 # ── Observability ─────────────────────────────────────────────────────────────
 tracing            = "0.1"
