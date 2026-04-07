@@ -29,6 +29,18 @@ struct Args {
     /// Port for the HTTP REST API.
     #[arg(long, default_value_t = 8080u16, env = "SYNAPTEX_HTTP_PORT")]
     http_port: u16,
+
+    /// gRPC endpoint of synaptex-router, e.g. "https://10.40.1.1:50052".
+    /// When set, core connects to the router and streams device discovery events.
+    /// Requires --router-cert.
+    #[arg(long, env = "SYNAPTEX_ROUTER_URL")]
+    router_url: Option<String>,
+
+    /// Path to synaptex-router's TLS certificate PEM.
+    /// Copy router.crt from the router host after its first run.
+    /// Required when --router-url is set.
+    #[arg(long, env = "SYNAPTEX_ROUTER_CERT")]
+    router_cert: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -140,6 +152,26 @@ async fn main() -> Result<()> {
         }
     }
 
+    // ── Router device cache (shared between discovery loop and REST handlers) ─
+    let router_devices = Arc::new(dashmap::DashMap::new());
+
+    // ── Router client (optional) ─────────────────────────────────────────────
+    match (&args.router_url, &args.router_cert) {
+        (Some(url), Some(cert_path)) => {
+            let cert_pem = std::fs::read(cert_path)
+                .with_context(|| format!("read router cert {}", cert_path.display()))?;
+            let cfg = router_client::RouterClientConfig {
+                endpoint:        url.clone(),
+                router_cert_pem: cert_pem,
+            };
+            tokio::spawn(router_client::run_discovery_loop(cfg, router_devices.clone()));
+            info!(endpoint = %url, "router client starting");
+        }
+        (Some(_), None) => anyhow::bail!("--router-cert is required when --router-url is set"),
+        (None, Some(_)) => anyhow::bail!("--router-url is required when --router-cert is set"),
+        (None, None) => {}
+    }
+
     // ── HTTP REST API (blocks until shutdown) ────────────────────────────────
     let app_state = rest::AppState {
         cache:          cache.clone(),
@@ -147,6 +179,7 @@ async fn main() -> Result<()> {
         trees:          trees.clone(),
         bus_tx:         bus_tx.clone(),
         routine_runner: routine_runner.clone(),
+        router_devices,
     };
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.http_port));
     let tcp = tokio::net::TcpListener::bind(http_addr)

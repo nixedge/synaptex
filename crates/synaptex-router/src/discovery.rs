@@ -381,7 +381,7 @@ async fn listen_loop(port: u16, tx: Arc<broadcast::Sender<DiscoveredDevice>>, se
         let ip  = parsed.payload_ip.unwrap_or(src_ip);
         let mac = resolve_mac(ip).await;
 
-        tracing::info!(
+        tracing::debug!(
             tuya_id = %parsed.tuya_id,
             %ip,
             %mac,

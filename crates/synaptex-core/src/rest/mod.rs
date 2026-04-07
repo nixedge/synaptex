@@ -10,6 +10,7 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Router,
 };
+use dashmap::DashMap;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use synaptex_types::plugin::StateBusSender;
@@ -19,6 +20,7 @@ use crate::{
     db::Trees,
     plugin::PluginRegistry,
     routine::RoutineRunner,
+    router_client::RouterDiscoveredDevice,
 };
 
 use handlers::{config, devices, events, groups, pairing, rooms, routines};
@@ -27,11 +29,14 @@ use handlers::{config, devices, events, groups, pairing, rooms, routines};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub cache:          Arc<StateCache>,
-    pub registry:       Arc<PluginRegistry>,
-    pub trees:          Arc<Trees>,
-    pub bus_tx:         StateBusSender,
-    pub routine_runner: Arc<RoutineRunner>,
+    pub cache:           Arc<StateCache>,
+    pub registry:        Arc<PluginRegistry>,
+    pub trees:           Arc<Trees>,
+    pub bus_tx:          StateBusSender,
+    pub routine_runner:  Arc<RoutineRunner>,
+    /// Devices most recently seen by the synaptex-router gRPC stream,
+    /// keyed by Tuya device ID.  Empty when router integration is disabled.
+    pub router_devices:  Arc<DashMap<String, RouterDiscoveredDevice>>,
 }
 
 // ─── Router factory ──────────────────────────────────────────────────────────

@@ -236,14 +236,28 @@ pub async fn import_cloud_devices(
             continue;
         }
 
-        // Found via UDP?
+        // Found via local UDP?
         if let Some(local) = discovery_map.get(&cloud_dev.id) {
             register_device_into_state(&state, &cloud_dev, local.ip, &local.mac,
                 &dp_profile, &mut registered)?;
             continue;
         }
 
-        // Online but not found via UDP.
+        // Not found locally — check the router discovery cache as fallback.
+        // This covers the case where core is on a different subnet and cannot
+        // broadcast-discover the device directly, but the router can.
+        if let Some(router_dev) = state.router_devices.get(&cloud_dev.id) {
+            tracing::info!(
+                tuya_id = %cloud_dev.id,
+                ip = %router_dev.ip,
+                "import: using router-discovered device",
+            );
+            register_device_into_state(&state, &cloud_dev, router_dev.ip, &router_dev.mac,
+                &dp_profile, &mut registered)?;
+            continue;
+        }
+
+        // Online but not found anywhere.
         if cloud_dev.online {
             not_discovered.push(CloudDeviceDto::from(cloud_dev));
         }

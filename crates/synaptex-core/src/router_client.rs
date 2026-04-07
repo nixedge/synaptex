@@ -1,19 +1,27 @@
+/// Cached info about a device most recently seen by the router.
+#[derive(Clone, Debug)]
+pub struct RouterDiscoveredDevice {
+    pub ip:      std::net::Ipv4Addr,
+    pub mac:     String,
+    pub version: String,
+}
+
 /// Client for the synaptex-router gRPC service.
 ///
-/// synaptex-core connects to synaptex-router over mTLS to:
+/// synaptex-core connects to synaptex-router over TLS to:
 /// - Subscribe to device discovery events (`WatchDiscovery` streaming RPC)
 /// - Manage DHCP static reservations
 /// - Manage nftables firewall rules
 ///
 /// # TLS setup
 /// The router generates a self-signed certificate on first run.  Copy that
-/// certificate to this host and configure `--router-cert` (or
-/// `SYNAPTEX_ROUTER_CERT`) to point at it.  Optionally provide a client
-/// certificate (`--core-cert` / `--core-key`) to enable full mTLS.
-///
-/// # Current state
-/// Stub — connection logic is in place but callers are not yet wired in.
+/// certificate to this host and point `--router-cert` (or
+/// `SYNAPTEX_ROUTER_CERT`) at it.  Core pins that cert as the CA so the
+/// connection is authenticated without a PKI.
+use std::{sync::Arc, time::Duration};
+
 use anyhow::{Context, Result};
+use dashmap::DashMap;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig};
 
 use synaptex_router_proto::router_service_client::RouterServiceClient;
@@ -45,6 +53,7 @@ impl RouterClient {
             .context("invalid router endpoint")?
             .tls_config(tls)
             .context("configure TLS")?
+            .connect_timeout(Duration::from_secs(10))
             .connect()
             .await
             .with_context(|| format!("connect to synaptex-router at {}", cfg.endpoint))?;
@@ -107,5 +116,73 @@ impl RouterClient {
             anyhow::bail!("remove_firewall_rule failed: {}", ack.error);
         }
         Ok(())
+    }
+}
+
+// ─── Discovery loop ───────────────────────────────────────────────────────────
+
+/// Connect to synaptex-router and stream discovered devices indefinitely,
+/// reconnecting with exponential backoff on any failure.
+///
+/// Each `DiscoveredDevice` received from the router is upserted into
+/// `cache` (keyed by `tuya_id`) so that `POST /pairing/import` can use
+/// router-side discovery as a fallback when core cannot see the device
+/// subnet directly.
+pub async fn run_discovery_loop(
+    cfg:   RouterClientConfig,
+    cache: Arc<DashMap<String, RouterDiscoveredDevice>>,
+) {
+    let mut backoff = Duration::from_secs(2);
+
+    loop {
+        tracing::info!(endpoint = %cfg.endpoint, "router: connecting");
+
+        match RouterClient::connect(cfg.clone()).await {
+            Err(e) => {
+                tracing::warn!("router: connection failed: {e}; retry in {backoff:?}");
+            }
+            Ok(mut client) => {
+                backoff = Duration::from_secs(2);
+
+                match client.watch_discovery().await {
+                    Err(e) => tracing::warn!("router: WatchDiscovery RPC failed: {e}"),
+                    Ok(mut stream) => {
+                        tracing::info!("router: discovery stream open");
+                        loop {
+                            match stream.message().await {
+                                Ok(Some(device)) => {
+                                    tracing::info!(
+                                        tuya_id = %device.tuya_id,
+                                        ip      = %device.ip,
+                                        mac     = %device.mac,
+                                        version = %device.version,
+                                        "router: device discovered",
+                                    );
+                                    // Parse the IP — skip on failure rather than crashing.
+                                    if let Ok(ip) = device.ip.parse() {
+                                        cache.insert(device.tuya_id.clone(), RouterDiscoveredDevice {
+                                            ip,
+                                            mac:     device.mac.clone(),
+                                            version: device.version.clone(),
+                                        });
+                                    }
+                                }
+                                Ok(None) => {
+                                    tracing::info!("router: discovery stream closed by server");
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("router: stream error: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(60));
     }
 }

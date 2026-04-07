@@ -7,7 +7,7 @@ use synaptex_types::{
     plugin::{BoxedPlugin, PluginError, PluginResult, StateBusSender},
 };
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::cache::StateCache;
 
@@ -52,7 +52,7 @@ impl PluginRegistry {
         let id         = *plugin.device_id();
         let supervisor = Self::spawn_supervisor(plugin.clone(), self.cache.clone());
         self.entries.insert(id, Entry { plugin, supervisor });
-        info!(%id, "plugin registered");
+        debug!(%id, "plugin registered");
     }
 
     /// Dispatch a command to the plugin owning `id`.
@@ -99,10 +99,10 @@ impl PluginRegistry {
 
             loop {
                 if !plugin.is_connected() {
-                    info!(%id, ?backoff, "attempting connect");
+                    debug!(%id, ?backoff, "attempting connect");
                     match plugin.connect().await {
                         Ok(()) => {
-                            info!(%id, "connected");
+                            debug!(%id, "connected");
                             backoff = INITIAL_BACKOFF; // reset on success
 
                             // Hydrate cache with a fresh state snapshot.

@@ -423,7 +423,7 @@ impl DevicePlugin for TuyaPlugin {
 
     async fn connect(&self) -> PluginResult<()> {
         let addr = format!("{}:{}", self.config.ip, self.config.port);
-        info!(device = %self.info.id, %addr, "connecting");
+        debug!(device = %self.info.id, %addr, "connecting");
 
         let mut stream = TcpStream::connect(&addr)
             .await
@@ -586,7 +586,7 @@ impl DevicePlugin for TuyaPlugin {
                                                     let dps: HashMap<String, Value> =
                                                         dps_obj.clone().into_iter().collect();
 
-                                                    info!(device = %plugin_id, dps = %val["dps"], "← dps update");
+                                                    debug!(device = %plugin_id, dps = %val["dps"], "← dps update");
 
                                                     let mut state = DeviceState {
                                                         device_id:     plugin_id,
@@ -630,7 +630,7 @@ impl DevicePlugin for TuyaPlugin {
             }
         });
 
-        info!(device = %self.info.id, "connected");
+        debug!(device = %self.info.id, "connected");
         Ok(())
     }
 
