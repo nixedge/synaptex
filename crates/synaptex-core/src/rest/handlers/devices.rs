@@ -25,7 +25,11 @@ pub async fn list_devices(
 
     let dtos = infos.iter().map(|info| {
         let st = state.cache.get(&info.id);
-        device_dto(info, st)
+        let ip = db::load_plugin_config(&state.trees, &info.id)
+            .ok()
+            .flatten()
+            .and_then(|cfg| if let PluginConfig::Tuya(t) = cfg { Some(t.ip.to_string()) } else { None });
+        device_dto(info, st, ip)
     }).collect();
 
     Ok(Json(dtos))
@@ -43,7 +47,11 @@ pub async fn get_device(
         .ok_or_else(|| ApiError::not_found(format!("device {mac} not found")))?;
 
     let st = state.cache.get(&id);
-    Ok(Json(device_dto(&info, st)))
+    let ip = db::load_plugin_config(&state.trees, &id)
+        .ok()
+        .flatten()
+        .and_then(|cfg| if let PluginConfig::Tuya(t) = cfg { Some(t.ip.to_string()) } else { None });
+    Ok(Json(device_dto(&info, st, ip)))
 }
 
 pub async fn register_device(

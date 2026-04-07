@@ -85,6 +85,11 @@ pub fn remove_plugin_config(trees: &Trees, id: &DeviceId) -> Result<()> {
     Ok(())
 }
 
+/// Load a single plugin config by device ID.
+pub fn load_plugin_config(trees: &Trees, id: &DeviceId) -> Result<Option<PluginConfig>> {
+    get(&trees.configs, id)
+}
+
 /// Load all `PluginConfig` entries from the `configs` tree.
 pub fn load_all_plugin_configs(trees: &Trees) -> Result<Vec<PluginConfig>> {
     let mut configs = Vec::new();

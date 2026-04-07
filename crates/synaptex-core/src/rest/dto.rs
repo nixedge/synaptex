@@ -20,6 +20,7 @@ pub struct DeviceDto {
     pub name:         String,
     pub model:        String,
     pub protocol:     String,
+    pub ip:           Option<String>,
     pub capabilities: Vec<CapabilityDto>,
     pub state:        Option<DeviceStateDto>,
 }
@@ -62,12 +63,13 @@ impl From<&Capability> for CapabilityDto {
     }
 }
 
-pub fn device_dto(info: &DeviceInfo, state: Option<DeviceState>) -> DeviceDto {
+pub fn device_dto(info: &DeviceInfo, state: Option<DeviceState>, ip: Option<String>) -> DeviceDto {
     DeviceDto {
         mac:          info.id.to_string(),
         name:         info.name.clone(),
         model:        info.model.clone(),
         protocol:     info.protocol.clone(),
+        ip,
         capabilities: info.capabilities.iter().map(CapabilityDto::from).collect(),
         state:        state.map(|s| DeviceStateDto {
             online:        s.online,
@@ -351,4 +353,30 @@ pub struct ResetBody {
 pub enum ResetMode {
     Soft,
     Full,
+}
+
+// ─── Import ───────────────────────────────────────────────────────────────────
+
+/// Summary of a single successfully imported device.
+#[derive(Debug, Serialize)]
+pub struct ImportedDeviceDto {
+    pub mac:        String,
+    pub name:       String,
+    pub tuya_id:    String,
+    pub ip:         String,
+    pub dp_profile: String,
+}
+
+/// Response from POST /pairing/import.
+#[derive(Debug, Serialize)]
+pub struct ImportResultDto {
+    /// Devices discovered on the local network and registered.
+    pub registered:         Vec<ImportedDeviceDto>,
+    /// Devices already registered (skipped).
+    pub already_registered: Vec<ImportedDeviceDto>,
+    /// Online cloud devices that could not be found or resolved locally.
+    pub not_discovered:     Vec<CloudDeviceDto>,
+    /// Cloud-only virtual devices skipped (vdevo* IDs, gateway sub-devices with
+    /// non-hex suffixes like *mu29/*ayps — these have no local TCP endpoint).
+    pub skipped_virtual:    Vec<CloudDeviceDto>,
 }

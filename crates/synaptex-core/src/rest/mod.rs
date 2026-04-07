@@ -88,6 +88,8 @@ fn api_router(state: AppState) -> Router {
             post(pairing::probe_device))
         .route("/pairing/cloud-devices/:tuya_id/reset",
             post(pairing::reset_device))
+        .route("/pairing/import",
+            post(pairing::import_cloud_devices))
         .route_layer(middleware::from_fn_with_state(
             state.trees.clone(),
             auth::bearer_auth,
