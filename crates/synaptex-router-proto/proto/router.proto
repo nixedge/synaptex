@@ -1,0 +1,109 @@
+syntax = "proto3";
+package synaptex.router.v1;
+
+// ─── Service ──────────────────────────────────────────────────────────────────
+
+service RouterService {
+    // Health / introspection
+    rpc GetStatus(StatusRequest) returns (StatusResponse);
+
+    // Device discovery — streams events to core as devices announce on the LAN.
+    // Core calls this once; the router keeps the stream open and pushes devices
+    // as their UDP broadcasts are received.
+    rpc WatchDiscovery(DiscoveryRequest) returns (stream DiscoveredDevice);
+
+    // DHCP static reservations (delegates to Kea control socket).
+    rpc AddDhcpReservation(DhcpReservation) returns (Ack);
+    rpc RemoveDhcpReservation(MacAddress) returns (Ack);
+    rpc ListDhcpReservations(Empty) returns (DhcpReservationList);
+
+    // Firewall rules (delegates to nftables).
+    rpc UpsertFirewallRule(FirewallRule) returns (Ack);
+    rpc RemoveFirewallRule(RuleId) returns (Ack);
+    rpc ListFirewallRules(Empty) returns (FirewallRuleList);
+}
+
+// ─── Common ───────────────────────────────────────────────────────────────────
+
+message Empty {}
+
+message Ack {
+    bool   ok    = 1;
+    string error = 2;
+}
+
+// ─── Status ───────────────────────────────────────────────────────────────────
+
+message StatusRequest {}
+
+message StatusResponse {
+    bool   discovery_active          = 1;
+    uint32 devices_seen_last_minute  = 2;
+    string version                   = 3;
+}
+
+// ─── Discovery ────────────────────────────────────────────────────────────────
+
+message DiscoveryRequest {
+    // Leave empty to receive all devices on all interfaces.
+    // Future: repeated string interfaces = 1;
+}
+
+message DiscoveredDevice {
+    string tuya_id = 1;   // Tuya gateway/device ID
+    string ip      = 2;   // IPv4 address seen in the UDP broadcast
+    string mac     = 3;   // MAC if resolvable via ARP (empty otherwise)
+    string version = 4;   // Tuya protocol version: "3.3", "3.4", "3.5"
+}
+
+// ─── DHCP ─────────────────────────────────────────────────────────────────────
+
+message MacAddress {
+    string mac = 1;   // "AA:BB:CC:DD:EE:FF"
+}
+
+message DhcpReservation {
+    string mac      = 1;   // "AA:BB:CC:DD:EE:FF"
+    string ip       = 2;   // e.g. "10.40.8.100"
+    string hostname = 3;   // optional, used as DNS name
+}
+
+message DhcpReservationList {
+    repeated DhcpReservation reservations = 1;
+}
+
+// ─── Firewall ─────────────────────────────────────────────────────────────────
+
+enum FirewallAction {
+    FIREWALL_ACTION_UNSPECIFIED = 0;
+    FIREWALL_ACTION_ACCEPT      = 1;
+    FIREWALL_ACTION_DROP        = 2;
+    FIREWALL_ACTION_REJECT      = 3;
+}
+
+enum FirewallHook {
+    FIREWALL_HOOK_UNSPECIFIED = 0;
+    FIREWALL_HOOK_INPUT       = 1;   // traffic destined for the router itself
+    FIREWALL_HOOK_FORWARD     = 2;   // traffic being routed through
+    FIREWALL_HOOK_OUTPUT      = 3;   // traffic originating from the router
+}
+
+message FirewallRule {
+    string         id       = 1;   // stable UUID — used for upsert / remove
+    FirewallHook   hook     = 2;
+    FirewallAction action   = 3;
+    string         src_cidr = 4;   // optional; e.g. "10.40.8.5/32" or "10.40.8.0/24"
+    string         dst_cidr = 5;   // optional; "0.0.0.0/0" means any
+    uint32         dst_port = 6;   // optional; 0 = any
+    string         ip_proto = 7;   // "tcp", "udp", "" = any
+    int32          priority = 8;   // lower number = evaluated earlier
+    string         comment  = 9;   // human-readable; written as nftables comment
+}
+
+message RuleId {
+    string id = 1;
+}
+
+message FirewallRuleList {
+    repeated FirewallRule rules = 1;
+}
