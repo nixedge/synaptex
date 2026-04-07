@@ -1,0 +1,9 @@
+[application]
+name    = "synaptex-app"
+default_platform = "mobile"
+
+[web.app]
+title = "Synaptex"
+
+[mobile.app]
+package_name = "com.nixedge.synaptex"

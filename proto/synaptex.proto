@@ -23,6 +23,15 @@ service DeviceService {
   rpc ListRooms(ListRoomsRequest)               returns (ListRoomsResponse);
   rpc GetRoom(GetRoomRequest)                   returns (GetRoomResponse);
   rpc SendRoomCommand(SendRoomCommandRequest)   returns (SendRoomCommandResponse);
+
+  // ── Routines ──
+  rpc CreateRoutine(CreateRoutineRequest)   returns (CreateRoutineResponse);
+  rpc UpdateRoutine(UpdateRoutineRequest)   returns (UpdateRoutineResponse);
+  rpc DeleteRoutine(DeleteRoutineRequest)   returns (DeleteRoutineResponse);
+  rpc ListRoutines(ListRoutinesRequest)     returns (ListRoutinesResponse);
+  rpc GetRoutine(GetRoutineRequest)         returns (GetRoutineResponse);
+  rpc TriggerRoutine(TriggerRoutineRequest) returns (TriggerRoutineResponse);
+  rpc CancelRoutine(CancelRoutineRequest)   returns (CancelRoutineResponse);
 }
 
 // ─── Core Types ───────────────────────────────────────────────────────────────
@@ -210,3 +219,59 @@ message SendRoomCommandResponse {
   bool   ok            = 1;
   string error_message = 2;
 }
+
+// ─── Routines ─────────────────────────────────────────────────────────────────
+
+/// A single step in a routine that sends a command to a target.
+message CommandStep {
+  oneof target {
+    string   room_id   = 1;
+    DeviceId device_id = 2;
+  }
+  oneof command {
+    bool          set_power        = 3;
+    uint32        set_brightness   = 4;
+    uint32        set_color_temp_k = 5;
+    RgbValue      set_rgb          = 6;
+    SwitchCommand set_switch       = 7;
+    SendIrCommand send_ir          = 8;
+    SetDpCommand  set_dp           = 9;
+  }
+}
+
+message WaitStep { uint64 secs = 1; }
+
+message RoutineStep {
+  oneof step {
+    CommandStep command = 1;
+    WaitStep    wait    = 2;
+  }
+}
+
+message RoutineInfo {
+  string               id       = 1;
+  string               name     = 2;
+  string               schedule = 3;  // empty = manual only
+  repeated RoutineStep steps    = 4;
+}
+
+message CreateRoutineRequest  { string name = 1; string schedule = 2; repeated RoutineStep steps = 3; }
+message CreateRoutineResponse { bool ok = 1; string error_message = 2; string id = 3; }
+
+message UpdateRoutineRequest  { string id = 1; string name = 2; string schedule = 3; repeated RoutineStep steps = 4; }
+message UpdateRoutineResponse { bool ok = 1; string error_message = 2; }
+
+message DeleteRoutineRequest  { string id = 1; }
+message DeleteRoutineResponse { bool ok = 1; string error_message = 2; }
+
+message ListRoutinesRequest   {}
+message ListRoutinesResponse  { repeated RoutineInfo routines = 1; }
+
+message GetRoutineRequest     { string id = 1; }
+message GetRoutineResponse    { RoutineInfo routine = 1; }
+
+message TriggerRoutineRequest  { string id = 1; }
+message TriggerRoutineResponse { bool ok = 1; string error_message = 2; }
+
+message CancelRoutineRequest   { string id = 1; }
+message CancelRoutineResponse  { bool ok = 1; string error_message = 2; }

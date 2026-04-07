@@ -13,7 +13,7 @@ pub enum Capability {
 }
 
 /// Commands the core may dispatch to a plugin.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DeviceCommand {
     SetPower(bool),
     SetBrightness(u16),

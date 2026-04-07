@@ -7,25 +7,32 @@ use uuid::Uuid;
 
 use synaptex_proto::{
     device_service_server::DeviceService,
+    CancelRoutineRequest, CancelRoutineResponse,
     CreateGroupRequest, CreateGroupResponse,
     CreateRoomRequest, CreateRoomResponse,
+    CreateRoutineRequest, CreateRoutineResponse,
     DeleteRoomRequest, DeleteRoomResponse,
+    DeleteRoutineRequest, DeleteRoutineResponse,
     DeviceStateEvent,
     GetDeviceStateRequest,
     GetDeviceStateResponse,
     GetRoomRequest, GetRoomResponse,
+    GetRoutineRequest, GetRoutineResponse,
     ListDevicesRequest,
     ListDevicesResponse,
     ListRoomsRequest, ListRoomsResponse,
+    ListRoutinesRequest, ListRoutinesResponse,
     RegisterDeviceRequest,
     RegisterDeviceResponse,
     SendRoomCommandRequest, SendRoomCommandResponse,
     SetDeviceStateRequest,
     SetDeviceStateResponse,
+    TriggerRoutineRequest, TriggerRoutineResponse,
     UnregisterDeviceRequest,
     UnregisterDeviceResponse,
     UpdateGroupRequest, UpdateGroupResponse,
     UpdateRoomRequest, UpdateRoomResponse,
+    UpdateRoutineRequest, UpdateRoutineResponse,
     WatchDeviceStateRequest,
 };
 use synaptex_tuya::{TuyaPlugin, plugin::TuyaConfig};
@@ -33,25 +40,28 @@ use synaptex_types::{device::DeviceInfo, plugin::StateBusSender};
 
 use crate::{
     cache::StateCache,
-    db::{self, GroupConfig, PluginConfig, Room, Trees},
+    db::{self, GroupConfig, PluginConfig, Room, Routine, Trees},
     group::{self, GroupPlugin},
     plugin::PluginRegistry,
+    routine::RoutineRunner,
 };
 
 use super::convert::{
     device_info_to_proto, device_state_to_proto,
-    proto_command_to_device_command, proto_id_to_internal, internal_id_to_proto,
-    proto_register_to_internal, room_info_to_proto,
-    proto_send_room_command_to_device_command,
+    internal_id_to_proto, proto_command_to_device_command,
+    proto_id_to_internal, proto_register_to_internal,
+    proto_routine_step_to_internal, proto_send_room_command_to_device_command,
+    room_info_to_proto, routine_info_to_proto,
 };
 
 // ─── Service handle ──────────────────────────────────────────────────────────
 
 pub struct DeviceServiceImpl {
-    pub cache:    Arc<StateCache>,
-    pub registry: Arc<PluginRegistry>,
-    pub trees:    Arc<Trees>,
-    pub bus_tx:   StateBusSender,
+    pub cache:          Arc<StateCache>,
+    pub registry:       Arc<PluginRegistry>,
+    pub trees:          Arc<Trees>,
+    pub bus_tx:         StateBusSender,
+    pub routine_runner: Arc<RoutineRunner>,
 }
 
 type BoxStream<T> =
@@ -544,5 +554,162 @@ impl DeviceService for DeviceServiceImpl {
                 ok: false, error_message: e.to_string(),
             })),
         }
+    }
+
+    // ── CreateRoutine ────────────────────────────────────────────────────────
+
+    async fn create_routine(
+        &self,
+        req: Request<CreateRoutineRequest>,
+    ) -> Result<Response<CreateRoutineResponse>, Status> {
+        let req = req.into_inner();
+
+        let steps: Result<Vec<_>, _> = req.steps
+            .into_iter()
+            .map(proto_routine_step_to_internal)
+            .collect();
+        let steps = steps?;
+
+        let id      = Uuid::new_v4().to_string();
+        let routine = Routine {
+            id:       id.clone(),
+            name:     req.name,
+            schedule: if req.schedule.is_empty() { None } else { Some(req.schedule) },
+            steps,
+        };
+        let has_schedule = routine.schedule.is_some();
+
+        db::save_routine(&self.trees, &routine)
+            .map_err(|e| Status::internal(format!("persist routine: {e}")))?;
+
+        if has_schedule {
+            self.routine_runner
+                .start_cron(routine, self.registry.clone(), self.trees.clone())
+                .map_err(|e| Status::invalid_argument(format!("invalid cron expression: {e}")))?;
+        }
+
+        info!(routine_id = %id, "routine created");
+        Ok(Response::new(CreateRoutineResponse { ok: true, error_message: String::new(), id }))
+    }
+
+    // ── UpdateRoutine ────────────────────────────────────────────────────────
+
+    async fn update_routine(
+        &self,
+        req: Request<UpdateRoutineRequest>,
+    ) -> Result<Response<UpdateRoutineResponse>, Status> {
+        let req = req.into_inner();
+
+        let mut routine = db::get_routine(&self.trees, &req.id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("routine {} not found", req.id)))?;
+
+        if !req.name.is_empty() {
+            routine.name = req.name;
+        }
+
+        let schedule_changed = !req.schedule.is_empty();
+        if schedule_changed {
+            routine.schedule = Some(req.schedule);
+        }
+
+        if !req.steps.is_empty() {
+            let steps: Result<Vec<_>, _> = req.steps
+                .into_iter()
+                .map(proto_routine_step_to_internal)
+                .collect();
+            routine.steps = steps?;
+        }
+
+        let id = routine.id.clone();
+
+        db::save_routine(&self.trees, &routine)
+            .map_err(|e| Status::internal(format!("persist routine: {e}")))?;
+
+        if schedule_changed {
+            self.routine_runner.stop_cron(&id);
+            if routine.schedule.is_some() {
+                self.routine_runner
+                    .start_cron(routine, self.registry.clone(), self.trees.clone())
+                    .map_err(|e| Status::invalid_argument(format!("invalid cron: {e}")))?;
+            }
+        }
+
+        info!(routine_id = %id, "routine updated");
+        Ok(Response::new(UpdateRoutineResponse { ok: true, error_message: String::new() }))
+    }
+
+    // ── DeleteRoutine ────────────────────────────────────────────────────────
+
+    async fn delete_routine(
+        &self,
+        req: Request<DeleteRoutineRequest>,
+    ) -> Result<Response<DeleteRoutineResponse>, Status> {
+        let id = req.into_inner().id;
+        self.routine_runner.stop_cron(&id);
+        self.routine_runner.cancel(&id);
+        db::remove_routine(&self.trees, &id)
+            .map_err(|e| Status::internal(format!("remove routine: {e}")))?;
+
+        info!(routine_id = %id, "routine deleted");
+        Ok(Response::new(DeleteRoutineResponse { ok: true, error_message: String::new() }))
+    }
+
+    // ── ListRoutines ─────────────────────────────────────────────────────────
+
+    async fn list_routines(
+        &self,
+        _req: Request<ListRoutinesRequest>,
+    ) -> Result<Response<ListRoutinesResponse>, Status> {
+        let routines = db::list_routines(&self.trees)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .map(routine_info_to_proto)
+            .collect();
+
+        Ok(Response::new(ListRoutinesResponse { routines }))
+    }
+
+    // ── GetRoutine ───────────────────────────────────────────────────────────
+
+    async fn get_routine(
+        &self,
+        req: Request<GetRoutineRequest>,
+    ) -> Result<Response<GetRoutineResponse>, Status> {
+        let id = req.into_inner().id;
+        let routine = db::get_routine(&self.trees, &id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("routine {id} not found")))?;
+
+        Ok(Response::new(GetRoutineResponse {
+            routine: Some(routine_info_to_proto(routine)),
+        }))
+    }
+
+    // ── TriggerRoutine ───────────────────────────────────────────────────────
+
+    async fn trigger_routine(
+        &self,
+        req: Request<TriggerRoutineRequest>,
+    ) -> Result<Response<TriggerRoutineResponse>, Status> {
+        let id = req.into_inner().id;
+        let routine = db::get_routine(&self.trees, &id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("routine {id} not found")))?;
+
+        self.routine_runner.trigger(routine, self.registry.clone(), self.trees.clone());
+
+        Ok(Response::new(TriggerRoutineResponse { ok: true, error_message: String::new() }))
+    }
+
+    // ── CancelRoutine ────────────────────────────────────────────────────────
+
+    async fn cancel_routine(
+        &self,
+        req: Request<CancelRoutineRequest>,
+    ) -> Result<Response<CancelRoutineResponse>, Status> {
+        let id = req.into_inner().id;
+        self.routine_runner.cancel(&id);
+        Ok(Response::new(CancelRoutineResponse { ok: true, error_message: String::new() }))
     }
 }

@@ -1,0 +1,11 @@
+# Android 15+ requires LOAD segments aligned to 16 KB (0x4000).
+# Without this flag the installer rejects the APK on devices with 16 KB page size.
+[target.aarch64-linux-android]
+rustflags = [
+  "-C", "link-arg=-Wl,-z,max-page-size=16384",
+]
+
+[target.x86_64-linux-android]
+rustflags = [
+  "-C", "link-arg=-Wl,-z,max-page-size=16384",
+]

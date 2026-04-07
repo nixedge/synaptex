@@ -30,3 +30,12 @@ bytes              = { workspace = true }
 clap               = { workspace = true }
 rand               = { workspace = true }
 uuid               = { version = "1", features = ["v4"] }
+axum               = { workspace = true }
+tower-http         = { workspace = true }
+reqwest            = { workspace = true }
+serde_json         = { workspace = true }
+hmac               = { workspace = true }
+sha2               = { workspace = true }
+hex                = { workspace = true }
+cron               = { workspace = true }
+chrono             = { workspace = true }

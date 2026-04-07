@@ -3,8 +3,11 @@ mod cache;
 mod db;
 mod group;
 mod plugin;
+mod rest;
 mod room;
+mod routine;
 mod rpc;
+mod tuya_cloud;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -30,6 +33,10 @@ struct Args {
     /// Path for the sled database directory.
     #[arg(long, default_value = "./db", env = "SYNAPTEX_DB")]
     db: PathBuf,
+
+    /// Port for the HTTP REST API.
+    #[arg(long, default_value_t = 8080u16, env = "SYNAPTEX_HTTP_PORT")]
+    http_port: u16,
 }
 
 #[tokio::main]
@@ -128,6 +135,40 @@ async fn main() -> Result<()> {
 
     info!(loaded = config_count, "plugin configs loaded");
 
+    // ── Routine runner + cron tasks ──────────────────────────────────────────
+    let routine_runner = Arc::new(routine::RoutineRunner::new());
+
+    let saved_routines = db::list_routines(&trees)
+        .context("load routines from sled")?;
+    for r in saved_routines {
+        if r.schedule.is_some() {
+            if let Err(e) = routine_runner.start_cron(r, registry.clone(), trees.clone()) {
+                tracing::warn!("failed to start cron task: {e}");
+            }
+        }
+    }
+
+    // ── HTTP REST API ────────────────────────────────────────────────────────
+    {
+        let app_state = rest::AppState {
+            cache:          cache.clone(),
+            registry:       registry.clone(),
+            trees:          trees.clone(),
+            bus_tx:         bus_tx.clone(),
+            routine_runner: routine_runner.clone(),
+        };
+        let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.http_port));
+        tokio::spawn(async move {
+            let tcp = tokio::net::TcpListener::bind(http_addr)
+                .await
+                .expect("bind HTTP port");
+            info!(addr = %http_addr, "HTTP API listening");
+            axum::serve(tcp, rest::mk_router(app_state))
+                .await
+                .expect("HTTP server error");
+        });
+    }
+
     // ── gRPC server on UDS ────────────────────────────────────────────────────
     if let Some(parent) = args.socket.parent() {
         std::fs::create_dir_all(parent).context("create socket directory")?;
@@ -144,6 +185,7 @@ async fn main() -> Result<()> {
         registry,
         trees,
         bus_tx,
+        routine_runner,
     };
 
     info!(socket = %args.socket.display(), "gRPC server listening");

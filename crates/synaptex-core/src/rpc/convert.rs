@@ -3,13 +3,22 @@ use std::{collections::HashMap, net::IpAddr, str::FromStr};
 
 use synaptex_proto::{
     Capability as ProtoCapability,
+    CommandStep,
     DeviceId as ProtoDeviceId,
     DeviceInfo as ProtoDeviceInfo,
     DeviceState as ProtoDeviceState,
     RegisterDeviceRequest,
     RgbValue,
+    RoutineInfo as ProtoRoutineInfo,
+    RoutineStep as ProtoRoutineStep,
     RoomInfo as ProtoRoomInfo,
+    SendIrCommand,
+    SetDpCommand,
+    SwitchCommand,
     TuyaConfig as ProtoTuyaConfig,
+    WaitStep,
+    command_step::{Command as CsCommand, Target as CsTarget},
+    routine_step::Step as ProtoStep,
     send_room_command_request::Command as ProtoRoomCommand,
     set_device_state_request::Command as ProtoCommand,
     set_dp_command::Value as ProtoDpValue,
@@ -22,7 +31,7 @@ use synaptex_types::{
 use synaptex_tuya::TuyaDeviceConfig;
 use tonic::Status;
 
-use crate::db::Room;
+use crate::db::{Room, Routine, RoutineStep, RoutineTarget};
 
 // ─── DeviceId ────────────────────────────────────────────────────────────────
 
@@ -195,6 +204,116 @@ pub fn proto_command_to_device_command(cmd: ProtoCommand) -> Result<DeviceComman
         },
         ProtoCommand::SetDp(dp)        => {
             let value = dp.value.ok_or_else(|| Status::invalid_argument("set_dp.value is required"))?;
+            match value {
+                ProtoDpValue::BoolVal(b)   => DeviceCommand::SetDpBool { dp: dp.dp as u16, value: b },
+                ProtoDpValue::IntVal(i)    => DeviceCommand::SetDpInt  { dp: dp.dp as u16, value: i },
+                ProtoDpValue::StringVal(s) => DeviceCommand::SetDpStr  { dp: dp.dp as u16, value: s },
+            }
+        }
+    };
+    Ok(dc)
+}
+
+// ─── Routine ──────────────────────────────────────────────────────────────────
+
+pub fn routine_info_to_proto(r: Routine) -> ProtoRoutineInfo {
+    ProtoRoutineInfo {
+        id:       r.id,
+        name:     r.name,
+        schedule: r.schedule.unwrap_or_default(),
+        steps:    r.steps.into_iter().map(routine_step_to_proto).collect(),
+    }
+}
+
+fn routine_step_to_proto(step: RoutineStep) -> ProtoRoutineStep {
+    let inner = match step {
+        RoutineStep::Wait { secs } => ProtoStep::Wait(WaitStep { secs }),
+        RoutineStep::Command { target, command } => {
+            ProtoStep::Command(command_step_to_proto(target, command))
+        }
+    };
+    ProtoRoutineStep { step: Some(inner) }
+}
+
+fn command_step_to_proto(target: RoutineTarget, command: DeviceCommand) -> CommandStep {
+    let proto_target = match target {
+        RoutineTarget::Room(id)        => CsTarget::RoomId(id),
+        RoutineTarget::Device(did)     => CsTarget::DeviceId(internal_id_to_proto(&did)),
+    };
+
+    let proto_command = match command {
+        DeviceCommand::SetPower(v)             => CsCommand::SetPower(v),
+        DeviceCommand::SetBrightness(v)        => CsCommand::SetBrightness(v as u32),
+        DeviceCommand::SetColorTemp(v)         => CsCommand::SetColorTempK(v as u32),
+        DeviceCommand::SetRgb(r, g, b)         => CsCommand::SetRgb(RgbValue {
+            r: r as u32, g: g as u32, b: b as u32,
+        }),
+        DeviceCommand::SetSwitch { index, state } => CsCommand::SetSwitch(SwitchCommand {
+            index: index as u32, state,
+        }),
+        DeviceCommand::SendIr { head, key }    => CsCommand::SendIr(SendIrCommand {
+            head: head.unwrap_or_default(), key,
+        }),
+        DeviceCommand::SetDpBool { dp, value } => CsCommand::SetDp(SetDpCommand {
+            dp: dp as u32, value: Some(ProtoDpValue::BoolVal(value)),
+        }),
+        DeviceCommand::SetDpInt  { dp, value } => CsCommand::SetDp(SetDpCommand {
+            dp: dp as u32, value: Some(ProtoDpValue::IntVal(value)),
+        }),
+        DeviceCommand::SetDpStr  { dp, value } => CsCommand::SetDp(SetDpCommand {
+            dp: dp as u32, value: Some(ProtoDpValue::StringVal(value)),
+        }),
+    };
+
+    CommandStep {
+        target:  Some(proto_target),
+        command: Some(proto_command),
+    }
+}
+
+/// Convert a proto `RoutineStep` to the internal representation.
+pub fn proto_routine_step_to_internal(step: ProtoRoutineStep) -> Result<RoutineStep, Status> {
+    let inner = step.step.ok_or_else(|| Status::invalid_argument("routine step is empty"))?;
+    match inner {
+        ProtoStep::Wait(w) => Ok(RoutineStep::Wait { secs: w.secs }),
+        ProtoStep::Command(cs) => {
+            let target = match cs
+                .target
+                .ok_or_else(|| Status::invalid_argument("command step target is required"))?
+            {
+                CsTarget::RoomId(id)   => RoutineTarget::Room(id),
+                CsTarget::DeviceId(did) => RoutineTarget::Device(proto_id_to_internal(&did)?),
+            };
+
+            let cmd_proto = cs
+                .command
+                .ok_or_else(|| Status::invalid_argument("command step command is required"))?;
+            let command = proto_command_step_to_device_command(cmd_proto)?;
+
+            Ok(RoutineStep::Command { target, command })
+        }
+    }
+}
+
+fn proto_command_step_to_device_command(cmd: CsCommand) -> Result<DeviceCommand, Status> {
+    let dc = match cmd {
+        CsCommand::SetPower(v)      => DeviceCommand::SetPower(v),
+        CsCommand::SetBrightness(v) => DeviceCommand::SetBrightness(v as u16),
+        CsCommand::SetColorTempK(v) => DeviceCommand::SetColorTemp(v as u16),
+        CsCommand::SetRgb(rgb)      => DeviceCommand::SetRgb(
+            rgb.r as u8, rgb.g as u8, rgb.b as u8,
+        ),
+        CsCommand::SetSwitch(sw)    => DeviceCommand::SetSwitch {
+            index: sw.index as u8, state: sw.state,
+        },
+        CsCommand::SendIr(ir)       => DeviceCommand::SendIr {
+            head: if ir.head.is_empty() { None } else { Some(ir.head) },
+            key:  ir.key,
+        },
+        CsCommand::SetDp(dp)        => {
+            let value = dp
+                .value
+                .ok_or_else(|| Status::invalid_argument("set_dp.value is required"))?;
             match value {
                 ProtoDpValue::BoolVal(b)   => DeviceCommand::SetDpBool { dp: dp.dp as u16, value: b },
                 ProtoDpValue::IntVal(i)    => DeviceCommand::SetDpInt  { dp: dp.dp as u16, value: i },

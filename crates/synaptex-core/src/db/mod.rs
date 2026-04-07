@@ -151,3 +151,115 @@ pub fn find_room_by_name(trees: &Trees, name: &str) -> Result<Option<Room>> {
     }
     Ok(None)
 }
+
+// ─── Routine types ────────────────────────────────────────────────────────────
+
+/// Target of a routine command step: either a room (by UUID) or a single device.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum RoutineTarget {
+    Room(String),       // room UUID
+    Device(synaptex_types::device::DeviceId),
+}
+
+/// A single step in a routine.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum RoutineStep {
+    Command {
+        target:  RoutineTarget,
+        command: synaptex_types::capability::DeviceCommand,
+    },
+    Wait { secs: u64 },
+}
+
+/// A named automation routine.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Routine {
+    pub id:       String,          // UUID v4
+    pub name:     String,
+    pub schedule: Option<String>,  // 6-field cron expression; None = manual only
+    pub steps:    Vec<RoutineStep>,
+}
+
+// ─── Routine helpers ──────────────────────────────────────────────────────────
+
+pub fn save_routine(trees: &Trees, routine: &Routine) -> Result<()> {
+    put_str(&trees.routines, &routine.id, routine)
+}
+
+pub fn get_routine(trees: &Trees, routine_id: &str) -> Result<Option<Routine>> {
+    get_str(&trees.routines, routine_id)
+}
+
+pub fn list_routines(trees: &Trees) -> Result<Vec<Routine>> {
+    let mut routines = Vec::new();
+    for item in trees.routines.iter() {
+        let (_k, v) = item?;
+        match from_bytes::<Routine>(&v) {
+            Ok(r)  => routines.push(r),
+            Err(e) => tracing::warn!("skipping corrupt routine entry: {e}"),
+        }
+    }
+    Ok(routines)
+}
+
+pub fn remove_routine(trees: &Trees, routine_id: &str) -> Result<()> {
+    trees.routines.remove(routine_id.as_bytes())?;
+    Ok(())
+}
+
+// ─── Global config helpers ─────────────────────────────────────────────────
+
+const KEY_TUYA_CLOUD: &str = "tuya_cloud";
+const KEY_API_KEY:    &str = "api_key";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum TuyaRegion { Us, Eu, Cn, In }
+
+impl TuyaRegion {
+    pub fn base_url(&self) -> &'static str {
+        match self {
+            TuyaRegion::Us => "https://openapi.tuyaus.com",
+            TuyaRegion::Eu => "https://openapi.tuyaeu.com",
+            TuyaRegion::Cn => "https://openapi.tuyacn.com",
+            TuyaRegion::In => "https://openapi.tuyain.com",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TuyaCloudConfig {
+    pub client_id:     String,
+    pub client_secret: String,
+    pub region:        TuyaRegion,
+    /// Account owner UID — resolved from any owned device at config-save time.
+    pub uid:           String,
+}
+
+pub fn save_tuya_cloud_config(trees: &Trees, cfg: &TuyaCloudConfig) -> Result<()> {
+    put_str(&trees.config, KEY_TUYA_CLOUD, cfg)
+}
+
+pub fn get_tuya_cloud_config(trees: &Trees) -> Result<Option<TuyaCloudConfig>> {
+    get_str(&trees.config, KEY_TUYA_CLOUD)
+}
+
+pub fn save_api_key(trees: &Trees, key: &str) -> Result<()> {
+    put_str(&trees.config, KEY_API_KEY, &key.to_string())
+}
+
+pub fn get_api_key(trees: &Trees) -> Result<Option<String>> {
+    get_str(&trees.config, KEY_API_KEY)
+}
+
+pub fn save_probe_result(trees: &Trees, product_id: &str, supported: bool) -> Result<()> {
+    let encoded = postcard::to_allocvec(&supported)?;
+    trees.probe_cache.insert(product_id.as_bytes(), encoded)?;
+    Ok(())
+}
+
+pub fn get_probe_result(trees: &Trees, product_id: &str) -> Result<Option<bool>> {
+    match trees.probe_cache.get(product_id.as_bytes())? {
+        Some(bytes) => Ok(Some(postcard::from_bytes(&bytes)?)),
+        None        => Ok(None),
+    }
+}

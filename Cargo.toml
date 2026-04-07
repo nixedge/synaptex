@@ -5,6 +5,7 @@ members = [
     "crates/synaptex-core",
     "crates/synaptex-tuya",
     "crates/synaptex-cli",
+    "crates/synaptex-app",
 ]
 resolver = "2"
 
@@ -50,6 +51,11 @@ hmac      = "0.12"
 sha2      = "0.10"
 rand      = "0.8"
 
+# ── HTTP ──────────────────────────────────────────────────────────────────────
+axum        = { version = "0.7", features = ["macros"] }
+tower-http  = { version = "0.5", features = ["cors", "trace"] }
+reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 clap  = { version = "4", features = ["derive", "env"] }
 tower = "0.4"
@@ -65,3 +71,5 @@ anyhow    = "1"
 # ── Misc ──────────────────────────────────────────────────────────────────────
 bytes = "1"
 uuid  = { version = "1", features = ["v4"] }
+cron   = "0.12"
+chrono = { version = "0.4", features = ["clock"] }
