@@ -16,6 +16,9 @@ edition     = "2021"
 license     = "Apache-2.0"
 repository  = "https://github.com/nixedge/synaptex"
 
+[workspace.metadata.crane]
+name        = "synaptex"
+
 [workspace.dependencies]
 # ── Internal ─────────────────────────────────────────────────────────────────
 synaptex-types        = { path = "crates/synaptex-types" }
