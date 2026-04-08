@@ -255,8 +255,11 @@ async fn list(groups_only: bool, http_url: &str, api_key: Option<&str>) -> Resul
         let name     = d["name"].as_str().unwrap_or("?");
         let ip       = d["ip"].as_str().unwrap_or("-");
         let protocol = d["protocol"].as_str().unwrap_or("?");
-        let version  = d["tuya_version"].as_str().unwrap_or("-");
-        println!("{mac}  {ip:15}  {:32}  {protocol:12}  v{version}", name);
+        let version  = match d["tuya_version"].as_str() {
+            Some(v) => format!("v{v}"),
+            None    => if protocol == "group" { "-".to_string() } else { "v-".to_string() },
+        };
+        println!("{mac}  {ip:15}  {:32}  {protocol:12}  {version}", name);
     }
     Ok(())
 }
