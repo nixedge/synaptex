@@ -25,11 +25,15 @@ pub async fn list_devices(
 
     let dtos = infos.iter().map(|info| {
         let st = state.cache.get(&info.id);
-        let ip = db::load_plugin_config(&state.trees, &info.id)
+        let (ip, tuya_version) = db::load_plugin_config(&state.trees, &info.id)
             .ok()
             .flatten()
-            .and_then(|cfg| if let PluginConfig::Tuya(t) = cfg { Some(t.ip.to_string()) } else { None });
-        device_dto(info, st, ip)
+            .map(|cfg| match cfg {
+                PluginConfig::Tuya(t) => (Some(t.ip.to_string()), t.protocol_hint),
+                PluginConfig::Group(_) => (None, None),
+            })
+            .unwrap_or((None, None));
+        device_dto(info, st, ip, tuya_version)
     }).collect();
 
     Ok(Json(dtos))
@@ -47,11 +51,15 @@ pub async fn get_device(
         .ok_or_else(|| ApiError::not_found(format!("device {mac} not found")))?;
 
     let st = state.cache.get(&id);
-    let ip = db::load_plugin_config(&state.trees, &id)
+    let (ip, tuya_version) = db::load_plugin_config(&state.trees, &id)
         .ok()
         .flatten()
-        .and_then(|cfg| if let PluginConfig::Tuya(t) = cfg { Some(t.ip.to_string()) } else { None });
-    Ok(Json(device_dto(&info, st, ip)))
+        .map(|cfg| match cfg {
+            PluginConfig::Tuya(t) => (Some(t.ip.to_string()), t.protocol_hint),
+            PluginConfig::Group(_) => (None, None),
+        })
+        .unwrap_or((None, None));
+    Ok(Json(device_dto(&info, st, ip, tuya_version)))
 }
 
 pub async fn register_device(

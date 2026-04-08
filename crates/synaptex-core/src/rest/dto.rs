@@ -21,6 +21,8 @@ pub struct DeviceDto {
     pub model:        String,
     pub protocol:     String,
     pub ip:           Option<String>,
+    /// Tuya local protocol version ("3.3" | "3.4" | "3.5"), None for group devices.
+    pub tuya_version: Option<String>,
     pub capabilities: Vec<CapabilityDto>,
     pub state:        Option<DeviceStateDto>,
 }
@@ -63,13 +65,14 @@ impl From<&Capability> for CapabilityDto {
     }
 }
 
-pub fn device_dto(info: &DeviceInfo, state: Option<DeviceState>, ip: Option<String>) -> DeviceDto {
+pub fn device_dto(info: &DeviceInfo, state: Option<DeviceState>, ip: Option<String>, tuya_version: Option<String>) -> DeviceDto {
     DeviceDto {
         mac:          info.id.to_string(),
         name:         info.name.clone(),
         model:        info.model.clone(),
         protocol:     info.protocol.clone(),
         ip,
+        tuya_version,
         capabilities: info.capabilities.iter().map(CapabilityDto::from).collect(),
         state:        state.map(|s| DeviceStateDto {
             online:        s.online,

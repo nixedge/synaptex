@@ -255,7 +255,8 @@ async fn list(groups_only: bool, http_url: &str, api_key: Option<&str>) -> Resul
         let name     = d["name"].as_str().unwrap_or("?");
         let ip       = d["ip"].as_str().unwrap_or("-");
         let protocol = d["protocol"].as_str().unwrap_or("?");
-        println!("{mac}  {ip:15}  {:32}  {protocol}", name);
+        let version  = d["tuya_version"].as_str().unwrap_or("-");
+        println!("{mac}  {ip:15}  {:32}  {protocol:12}  v{version}", name);
     }
     Ok(())
 }
