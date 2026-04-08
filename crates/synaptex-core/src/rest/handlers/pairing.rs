@@ -239,7 +239,7 @@ pub async fn import_cloud_devices(
         // Found via local UDP?
         if let Some(local) = discovery_map.get(&cloud_dev.id) {
             register_device_into_state(&state, &cloud_dev, local.ip, &local.mac,
-                &dp_profile, &mut registered)?;
+                &dp_profile, None, &mut registered)?;
             continue;
         }
 
@@ -247,13 +247,15 @@ pub async fn import_cloud_devices(
         // This covers the case where core is on a different subnet and cannot
         // broadcast-discover the device directly, but the router can.
         if let Some(router_dev) = state.router_devices.get(&cloud_dev.id) {
+            let hint = (!router_dev.version.is_empty()).then(|| router_dev.version.clone());
             tracing::info!(
                 tuya_id = %cloud_dev.id,
-                ip = %router_dev.ip,
+                ip      = %router_dev.ip,
+                version = ?hint,
                 "import: using router-discovered device",
             );
             register_device_into_state(&state, &cloud_dev, router_dev.ip, &router_dev.mac,
-                &dp_profile, &mut registered)?;
+                &dp_profile, hint, &mut registered)?;
             continue;
         }
 
@@ -268,24 +270,26 @@ pub async fn import_cloud_devices(
 
 /// Register a single device into sled + plugin registry and append to `registered`.
 fn register_device_into_state(
-    state:      &AppState,
-    cloud_dev:  &crate::tuya_cloud::CloudDevice,
-    ip:         Ipv4Addr,
-    mac:        &str,
-    dp_profile: &str,
-    registered: &mut Vec<ImportedDeviceDto>,
+    state:          &AppState,
+    cloud_dev:      &crate::tuya_cloud::CloudDevice,
+    ip:             Ipv4Addr,
+    mac:            &str,
+    dp_profile:     &str,
+    protocol_hint:  Option<String>,
+    registered:     &mut Vec<ImportedDeviceDto>,
 ) -> ApiResult<()> {
     let id = DeviceId::from_mac_str(mac)
         .map_err(|e| ApiError::bad_request(e))?;
 
     let tuya_cfg = TuyaDeviceConfig {
-        device_id:  id,
-        ip:         IpAddr::V4(ip),
-        port:       6668,
-        tuya_id:    cloud_dev.id.clone(),
-        local_key:  cloud_dev.local_key.clone(),
-        dp_profile: dp_profile.to_string(),
-        dp_map:     None,
+        device_id:     id,
+        ip:            IpAddr::V4(ip),
+        port:          6668,
+        tuya_id:       cloud_dev.id.clone(),
+        local_key:     cloud_dev.local_key.clone(),
+        dp_profile:    dp_profile.to_string(),
+        dp_map:        None,
+        protocol_hint: protocol_hint.clone(),
     };
     let info = DeviceInfo {
         id,
@@ -303,11 +307,12 @@ fn register_device_into_state(
     let plugin = TuyaPlugin::new(
         info,
         TuyaConfig {
-            ip:        tuya_cfg.ip,
-            port:      tuya_cfg.port,
-            tuya_id:   tuya_cfg.tuya_id.clone(),
-            local_key: tuya_cfg.local_key.clone(),
-            dp_map:    tuya_cfg.dp_map(),
+            ip:            tuya_cfg.ip,
+            port:          tuya_cfg.port,
+            tuya_id:       tuya_cfg.tuya_id.clone(),
+            local_key:     tuya_cfg.local_key.clone(),
+            dp_map:        tuya_cfg.dp_map(),
+            protocol_hint,
         },
         state.bus_tx.clone(),
     );

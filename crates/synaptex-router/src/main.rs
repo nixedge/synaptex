@@ -1,3 +1,4 @@
+mod db;
 mod dhcp;
 mod discovery;
 mod firewall;
@@ -40,6 +41,10 @@ struct Args {
     #[arg(long, env = "SYNAPTEX_ROUTER_CLIENT_CA")]
     client_ca: Option<PathBuf>,
 
+    /// Path for the sled database directory.
+    #[arg(long, default_value = "./router-db", env = "SYNAPTEX_ROUTER_DB")]
+    db: std::path::PathBuf,
+
     /// Network interface(s) to listen on for Tuya UDP broadcasts.
     /// Comma-separated, e.g. "br-iot,br-lan".  Omit to listen on all interfaces.
     #[arg(long, env = "SYNAPTEX_ROUTER_INTERFACES")]
@@ -77,6 +82,11 @@ async fn main() -> Result<()> {
         info!("mTLS disabled — set --client-ca to require client certificates");
     }
 
+    // ── Persistent device database ───────────────────────────────────────────
+    std::fs::create_dir_all(&args.db).context("create router db directory")?;
+    let sled_db = sled::open(&args.db).context("open router sled database")?;
+    let router_db = Arc::new(db::RouterDb::open(&sled_db).context("open router db trees")?);
+
     // ── Discovery broadcast channel ───────────────────────────────────────────
     // The discovery listener sends DiscoveredDevice events on this channel.
     // Each connected WatchDiscovery RPC stream subscribes to receive them.
@@ -87,10 +97,10 @@ async fn main() -> Result<()> {
     let interfaces = args.interfaces
         .as_deref()
         .map(|s| s.split(',').map(str::trim).map(str::to_string).collect::<Vec<_>>());
-    discovery::spawn(discovery_tx.clone(), interfaces);
+    discovery::spawn(discovery_tx.clone(), router_db.clone(), interfaces);
 
     // ── gRPC service ──────────────────────────────────────────────────────────
-    let service = rpc::RouterServiceImpl { discovery_tx };
+    let service = rpc::RouterServiceImpl { discovery_tx, db: router_db };
 
     info!(listen = %args.listen, "gRPC server listening");
 

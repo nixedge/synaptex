@@ -11,12 +11,13 @@ use synaptex_router_proto::{
     StatusRequest, StatusResponse,
 };
 
-use crate::{dhcp, firewall};
+use crate::{db::RouterDb, dhcp, firewall};
 
 // ─── Service implementation ───────────────────────────────────────────────────
 
 pub struct RouterServiceImpl {
     pub discovery_tx: Arc<broadcast::Sender<DiscoveredDevice>>,
+    pub db:           Arc<RouterDb>,
 }
 
 type BoxStream<T> = Pin<Box<dyn futures_core::Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -44,11 +45,27 @@ impl RouterService for RouterServiceImpl {
         &self,
         _req: Request<DiscoveryRequest>,
     ) -> Result<Response<Self::WatchDiscoveryStream>, Status> {
+        // Subscribe before reading the DB snapshot to avoid a race where a
+        // change fires between the list and the subscribe.
         let rx = self.discovery_tx.subscribe();
-        let stream = BroadcastStream::new(rx)
-            .filter_map(|item| item.ok()) // drop lagged events silently
+
+        // Send all currently-known devices as the initial burst.
+        let known = self.db.list_all()
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .map(|r| Ok(DiscoveredDevice {
+                tuya_id: r.tuya_id,
+                ip:      r.ip,
+                mac:     r.mac,
+                version: r.version,
+            }));
+
+        let initial = tokio_stream::iter(known);
+        let changes = BroadcastStream::new(rx)
+            .filter_map(|item| item.ok())
             .map(Ok);
-        Ok(Response::new(Box::pin(stream)))
+
+        Ok(Response::new(Box::pin(initial.chain(changes))))
     }
 
     // ── DHCP ──────────────────────────────────────────────────────────────────

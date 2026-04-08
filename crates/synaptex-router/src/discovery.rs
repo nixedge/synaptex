@@ -28,8 +28,8 @@
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
 
 use serde::Deserialize;
@@ -37,6 +37,8 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{net::UdpSocket, sync::broadcast};
 
 use synaptex_router_proto::DiscoveredDevice;
+
+use crate::db::{DeviceRecord, RouterDb};
 
 // ─── Crypto ───────────────────────────────────────────────────────────────────
 
@@ -308,21 +310,22 @@ async fn resolve_mac(ip: Ipv4Addr) -> String {
 
 // ─── Discovery daemon ─────────────────────────────────────────────────────────
 
-/// Per-device deduplication: tuya_id → last time it was forwarded to the channel.
-type SeenMap = Arc<Mutex<HashMap<String, Instant>>>;
-
-/// Minimum interval between forwarding the same device to the channel.
-const DEDUP_WINDOW: Duration = Duration::from_secs(30);
-
 /// How often to broadcast an active scan probe.
 const PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Spawn background tasks that listen for Tuya UDP broadcasts on ports 6666
 /// and 6667 and forward decoded `DiscoveredDevice` messages onto `tx`.
 ///
+/// Only pushes to the channel when a device is new or its record has changed
+/// (IP or version update), using `db` as the source of truth.
+///
 /// `interfaces` is reserved for future `SO_BINDTODEVICE` per-interface filtering;
 /// currently ignored — all interfaces are listened on.
-pub fn spawn(tx: Arc<broadcast::Sender<DiscoveredDevice>>, interfaces: Option<Vec<String>>) {
+pub fn spawn(
+    tx:         Arc<broadcast::Sender<DiscoveredDevice>>,
+    db:         Arc<RouterDb>,
+    interfaces: Option<Vec<String>>,
+) {
     if let Some(ref ifaces) = interfaces {
         tracing::info!(
             ?ifaces,
@@ -330,13 +333,11 @@ pub fn spawn(tx: Arc<broadcast::Sender<DiscoveredDevice>>, interfaces: Option<Ve
         );
     }
 
-    let seen: SeenMap = Arc::new(Mutex::new(HashMap::new()));
-
     for port in [6666u16, 6667] {
-        let tx   = tx.clone();
-        let seen = seen.clone();
+        let tx = tx.clone();
+        let db = db.clone();
         tokio::spawn(async move {
-            listen_loop(port, tx, seen).await;
+            listen_loop(port, tx, db).await;
         });
     }
 
@@ -345,7 +346,11 @@ pub fn spawn(tx: Arc<broadcast::Sender<DiscoveredDevice>>, interfaces: Option<Ve
     });
 }
 
-async fn listen_loop(port: u16, tx: Arc<broadcast::Sender<DiscoveredDevice>>, seen: SeenMap) {
+async fn listen_loop(
+    port: u16,
+    tx:   Arc<broadcast::Sender<DiscoveredDevice>>,
+    db:   Arc<RouterDb>,
+) {
     let sock = match bind_udp(port) {
         Ok(s)  => s,
         Err(e) => {
@@ -368,25 +373,33 @@ async fn listen_loop(port: u16, tx: Arc<broadcast::Sender<DiscoveredDevice>>, se
 
         let Some(parsed) = parse_broadcast(src_ip, &buf[..n]) else { continue };
 
-        // Skip if we already forwarded this device within the dedup window.
-        {
-            let mut map = seen.lock().unwrap();
-            let now = Instant::now();
-            if map.get(&parsed.tuya_id).map_or(false, |&t| now.duration_since(t) < DEDUP_WINDOW) {
-                continue;
-            }
-            map.insert(parsed.tuya_id.clone(), now);
-        }
-
         let ip  = parsed.payload_ip.unwrap_or(src_ip);
         let mac = resolve_mac(ip).await;
+
+        let record = DeviceRecord {
+            tuya_id: parsed.tuya_id.clone(),
+            mac:     mac.clone(),
+            ip:      ip.to_string(),
+            version: parsed.version.clone(),
+        };
+
+        // Persist and only forward if something changed.
+        let changed = match db.upsert(&record) {
+            Ok(c)  => c,
+            Err(e) => {
+                tracing::warn!(tuya_id = %parsed.tuya_id, "discovery: db upsert error: {e}");
+                true // forward anyway on db error
+            }
+        };
+
+        if !changed { continue; }
 
         tracing::debug!(
             tuya_id = %parsed.tuya_id,
             %ip,
             %mac,
             version = %parsed.version,
-            "discovery: device found",
+            "discovery: device changed",
         );
 
         // A send error just means no current subscribers — not fatal.

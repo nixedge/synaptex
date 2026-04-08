@@ -20,9 +20,13 @@ pub struct TuyaDeviceConfig {
     pub local_key:  String,
     /// Named DP profile: "bulb_a" | "bulb_b" | "switch" | "fan" | "ir1" | "ir2" | "custom".
     /// When "custom" (or empty), `dp_map_override` is used if present.
-    pub dp_profile: String,
+    pub dp_profile:     String,
     /// Per-device DP map override.  Takes precedence over `dp_profile` when `Some`.
-    pub dp_map:     Option<DpMap>,
+    pub dp_map:         Option<DpMap>,
+    /// Protocol version hint from discovery ("3.3" | "3.4" | "3.5").
+    /// When set, skips the dual-probe and connects with this version directly.
+    #[serde(default)]
+    pub protocol_hint:  Option<String>,
 }
 
 impl TuyaDeviceConfig {

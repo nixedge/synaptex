@@ -67,13 +67,14 @@ pub async fn register_device(
     let dp_profile = body.dp_profile.unwrap_or_else(|| "bulb_b".into());
 
     let tuya_cfg = synaptex_tuya::TuyaDeviceConfig {
-        device_id:  id,
+        device_id:     id,
         ip,
-        port:       body.port.unwrap_or(6668),
-        tuya_id:    body.tuya_id.clone(),
-        local_key:  body.local_key.clone(),
+        port:          body.port.unwrap_or(6668),
+        tuya_id:       body.tuya_id.clone(),
+        local_key:     body.local_key.clone(),
         dp_profile,
-        dp_map:     None,
+        dp_map:        None,
+        protocol_hint: None,
     };
 
     let info = DeviceInfo {
@@ -93,11 +94,12 @@ pub async fn register_device(
     let plugin = TuyaPlugin::new(
         info,
         TuyaConfig {
-            ip:        tuya_cfg.ip,
-            port:      tuya_cfg.port,
-            tuya_id:   tuya_cfg.tuya_id,
-            local_key: tuya_cfg.local_key,
+            ip:            tuya_cfg.ip,
+            port:          tuya_cfg.port,
+            tuya_id:       tuya_cfg.tuya_id,
+            local_key:     tuya_cfg.local_key,
             dp_map,
+            protocol_hint: None,
         },
         state.bus_tx.clone(),
     );

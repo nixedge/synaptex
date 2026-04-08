@@ -101,11 +101,12 @@ async fn main() -> Result<()> {
                 let plugin = TuyaPlugin::new(
                     info,
                     TuyaConfig {
-                        ip:        tuya_cfg.ip,
-                        port:      tuya_cfg.port,
-                        tuya_id:   tuya_cfg.tuya_id.clone(),
-                        local_key: tuya_cfg.local_key.clone(),
-                        dp_map:    tuya_cfg.dp_map(),
+                        ip:            tuya_cfg.ip,
+                        port:          tuya_cfg.port,
+                        tuya_id:       tuya_cfg.tuya_id.clone(),
+                        local_key:     tuya_cfg.local_key.clone(),
+                        dp_map:        tuya_cfg.dp_map(),
+                        protocol_hint: tuya_cfg.protocol_hint.clone(),
                     },
                     bus_tx.clone(),
                 );

@@ -42,14 +42,17 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct TuyaConfig {
-    pub ip:        IpAddr,
+    pub ip:            IpAddr,
     /// Usually 6668.
-    pub port:      u16,
+    pub port:          u16,
     /// Tuya cloud device ID — placed in the `"devId"` field of every payload.
-    pub tuya_id:   String,
+    pub tuya_id:       String,
     /// 16-character ASCII string from the Tuya API.
-    pub local_key: String,
-    pub dp_map:    DpMap,
+    pub local_key:     String,
+    pub dp_map:        DpMap,
+    /// Protocol version hint ("3.3" | "3.4" | "3.5").
+    /// When set, skips the dual-probe and connects directly with this version.
+    pub protocol_hint: Option<String>,
 }
 
 impl TuyaConfig {
@@ -119,14 +122,18 @@ impl TuyaPlugin {
         &self,
         stream: &mut TcpStream,
         key:    &[u8; 16],
+        hint:   Option<&str>,
     ) -> Result<(ProtocolResult, Vec<u8>), TuyaError> {
         let mut nonce35 = [0u8; 16];
         let mut nonce34 = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut nonce35);
         rand::thread_rng().fill_bytes(&mut nonce34);
 
+        let send_v35 = hint.map_or(true, |h| h == "3.5");
+        let send_v34 = hint.map_or(true, |h| h == "3.4");
+
         // ── v3.5 probe: 0x6699 GCM frame with nonce35 as payload ─────────────
-        {
+        if send_v35 {
             let iv35: &[u8; 12] = nonce35[..12].try_into().unwrap();
             let probe35 = protocol::build_frame_v35(
                 self.next_seq(),
@@ -139,7 +146,7 @@ impl TuyaPlugin {
         }
 
         // ── v3.4 probe: 0x55AA CRC32 frame with ECB(key, nonce34) ────────────
-        {
+        if send_v34 {
             let enc34   = cipher::ecb_encrypt_raw(key, &nonce34)?;
             let probe34 = protocol::build_frame(
                 self.next_seq(),
@@ -438,9 +445,10 @@ impl DevicePlugin for TuyaPlugin {
         *self.session_key.lock().await     = None;
         *self.session_key_v35.lock().await = None;
 
-        // ── Auto-detect protocol ──────────────────────────────────────────────
+        // ── Auto-detect protocol (or use hint from discovery) ─────────────────
+        let hint = self.config.protocol_hint.as_deref();
         let (proto_result, leftover) = self
-            .probe_protocol(&mut stream, &key)
+            .probe_protocol(&mut stream, &key, hint)
             .await
             .map_err(PluginError::from)?;
 
