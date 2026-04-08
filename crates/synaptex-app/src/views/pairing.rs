@@ -7,7 +7,8 @@ use dioxus::prelude::*;
 use serde_json::json;
 
 use crate::{
-    api::{CloudDevice, ProbeResult, RegisteredDevice, SynaptexClient},
+    AppSettings,
+    api::{CloudDevice, ProbeResult, RegisteredDevice},
     smartconfig::SmartConfigSession,
 };
 
@@ -31,15 +32,24 @@ enum PairingStep {
 
 /// Pairing wizard for a single cloud device.
 #[component]
-pub fn PairingView(client: SynaptexClient, device: CloudDevice) -> Element {
+pub fn PairingView(device: CloudDevice) -> Element {
+    let settings = use_context::<Signal<AppSettings>>();
+    let mut selected = use_context::<Signal<Option<CloudDevice>>>();
+
     let mut step  = use_signal(|| PairingStep::Idle);
     let mut ssid  = use_signal(|| String::new());
     let mut pass  = use_signal(|| String::new());
 
+    let client    = settings.read().client();
     let device_id = device.id.clone();
 
     rsx! {
         div {
+            button {
+                r#type: "button",
+                onclick: move |_| selected.set(None),
+                "← Back"
+            }
             h2 { "Pairing: {device.name}" }
             p { "Tuya ID: {device_id}" }
 

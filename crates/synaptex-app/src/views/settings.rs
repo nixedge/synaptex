@@ -1,17 +1,16 @@
 use dioxus::prelude::*;
 
-/// Settings screen: configure server URL and API key.
-/// Edits a local draft; Save writes back to the parent signals which
-/// causes App to rebuild the SynaptexClient with the new values.
+use crate::AppSettings;
+
 #[component]
-pub fn SettingsView(
-    server_url: Signal<String>,
-    api_key:    Signal<Option<String>>,
-) -> Element {
-    let mut url_draft = use_signal(|| server_url.read().clone());
+pub fn SettingsView() -> Element {
+    let mut settings = use_context::<Signal<AppSettings>>();
+
+    let mut url_draft = use_signal(|| settings.read().server_url.clone());
     let mut key_draft = use_signal(|| {
-        api_key.read().clone().unwrap_or_default()
+        settings.read().api_key.clone().unwrap_or_default()
     });
+    let mut saved = use_signal(|| false);
 
     rsx! {
         div {
@@ -21,23 +20,36 @@ pub fn SettingsView(
             input {
                 r#type: "text",
                 value: "{url_draft}",
-                oninput: move |e| url_draft.set(e.value()),
+                oninput: move |e| {
+                    url_draft.set(e.value());
+                    saved.set(false);
+                },
             }
 
             label { "API Key" }
             input {
                 r#type: "password",
                 value: "{key_draft}",
-                oninput: move |e| key_draft.set(e.value()),
+                oninput: move |e| {
+                    key_draft.set(e.value());
+                    saved.set(false);
+                },
             }
 
             button {
+                r#type: "button",
                 onclick: move |_| {
-                    server_url.clone().set(url_draft.read().clone());
-                    let k = key_draft.read().clone();
-                    api_key.clone().set(if k.is_empty() { None } else { Some(k) });
+                    let url = url_draft.read().clone();
+                    let key = key_draft.read().clone();
+                    settings.write().server_url = url;
+                    settings.write().api_key = if key.is_empty() { None } else { Some(key) };
+                    saved.set(true);
                 },
                 "Save"
+            }
+
+            if *saved.read() {
+                span { " ✓ Saved" }
             }
         }
     }

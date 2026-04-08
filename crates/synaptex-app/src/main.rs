@@ -4,12 +4,37 @@ mod views;
 
 use dioxus::prelude::*;
 
-use api::SynaptexClient;
+use api::CloudDevice;
 use views::{
     devices::DevicesView,
     pairing::PairingView,
     settings::SettingsView,
 };
+
+// ─── Global app settings ──────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppSettings {
+    pub server_url: String,
+    pub api_key:    Option<String>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            server_url: "http://192.168.1.1:8080".to_string(),
+            api_key:    None,
+        }
+    }
+}
+
+impl AppSettings {
+    pub fn client(&self) -> crate::api::SynaptexClient {
+        crate::api::SynaptexClient::new(self.server_url.clone(), self.api_key.clone())
+    }
+}
+
+// ─── Root component ───────────────────────────────────────────────────────────
 
 fn main() {
     dioxus::launch(App);
@@ -17,32 +42,18 @@ fn main() {
 
 #[component]
 fn App() -> Element {
-    let server_url = use_signal(|| "http://192.168.1.1:8080".to_string());
-    let api_key    = use_signal(|| Option::<String>::None);
-    let selected   = use_signal(|| Option::<api::CloudDevice>::None);
-
-    // Re-read signals every render so client stays in sync with saved settings.
-    let client = SynaptexClient::new(
-        server_url.read().clone(),
-        api_key.read().clone(),
-    );
+    let _settings: Signal<AppSettings> = use_context_provider(|| Signal::new(AppSettings::default()));
+    let selected:  Signal<Option<CloudDevice>> = use_context_provider(|| Signal::new(None));
 
     rsx! {
         div {
-            nav {
-                span { "Synaptex Pairing" }
-            }
+            nav { span { "Synaptex Pairing" } }
 
             match selected.read().clone() {
-                Some(dev) => rsx! {
-                    PairingView {
-                        client: client.clone(),
-                        device: dev,
-                    }
-                },
+                Some(dev) => rsx! { PairingView { device: dev } },
                 None => rsx! {
-                    SettingsView { server_url, api_key }
-                    DevicesView { client }
+                    SettingsView {}
+                    DevicesView {}
                 },
             }
         }
