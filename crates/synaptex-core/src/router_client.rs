@@ -24,6 +24,8 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig};
 
+use crate::db::{self, PluginConfig, Trees};
+
 use synaptex_router_proto::router_service_client::RouterServiceClient;
 
 /// Configuration for the router gRPC connection.
@@ -121,6 +123,29 @@ impl RouterClient {
 
 // ─── Discovery loop ───────────────────────────────────────────────────────────
 
+/// If the registered `TuyaDeviceConfig` for `tuya_id` has `protocol_hint == None`,
+/// set it to `version` and re-save.  No-op for unknown or already-hinted devices.
+fn backfill_protocol_hint(trees: &Trees, tuya_id: &str, version: &str) {
+    let result = (|| -> anyhow::Result<()> {
+        for item in trees.configs.iter() {
+            let (k, v) = item?;
+            if let Ok(PluginConfig::Tuya(mut cfg)) = postcard::from_bytes::<PluginConfig>(&v) {
+                if cfg.tuya_id == tuya_id && cfg.protocol_hint.is_none() {
+                    cfg.protocol_hint = Some(version.to_string());
+                    let new_bytes = postcard::to_allocvec(&PluginConfig::Tuya(cfg))?;
+                    trees.configs.insert(k, new_bytes)?;
+                    tracing::info!(tuya_id, version, "backfilled protocol_hint from router");
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        tracing::warn!(tuya_id, "failed to backfill protocol_hint: {e}");
+    }
+}
+
 /// Connect to synaptex-router and stream discovered devices indefinitely,
 /// reconnecting with exponential backoff on any failure.
 ///
@@ -131,6 +156,7 @@ impl RouterClient {
 pub async fn run_discovery_loop(
     cfg:   RouterClientConfig,
     cache: Arc<DashMap<String, RouterDiscoveredDevice>>,
+    trees: Arc<Trees>,
 ) {
     let mut backoff = Duration::from_secs(2);
 
@@ -165,6 +191,12 @@ pub async fn run_discovery_loop(
                                             mac:     device.mac.clone(),
                                             version: device.version.clone(),
                                         });
+                                    }
+
+                                    // Backfill protocol_hint for any registered device
+                                    // whose config still has None (e.g. migrated from old schema).
+                                    if !device.version.is_empty() {
+                                        backfill_protocol_hint(&trees, &device.tuya_id, &device.version);
                                     }
                                 }
                                 Ok(None) => {

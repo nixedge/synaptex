@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
                 endpoint:        url.clone(),
                 router_cert_pem: cert_pem,
             };
-            tokio::spawn(router_client::run_discovery_loop(cfg, router_devices.clone()));
+            tokio::spawn(router_client::run_discovery_loop(cfg, router_devices.clone(), trees.clone()));
             info!(endpoint = %url, "router client starting");
         }
         (Some(_), None) => anyhow::bail!("--router-cert is required when --router-url is set"),
