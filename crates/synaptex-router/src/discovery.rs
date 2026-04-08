@@ -253,15 +253,20 @@ fn parse_broadcast(src: Ipv4Addr, data: &[u8]) -> Option<ParsedDevice> {
 
 // ─── Socket helpers ───────────────────────────────────────────────────────────
 
-/// Bind a UDP socket with SO_REUSEPORT + SO_REUSEADDR + SO_BROADCAST so that
-/// the bind succeeds even if another process is already listening on the port.
-fn bind_udp(port: u16) -> anyhow::Result<UdpSocket> {
+/// Bind a UDP socket with SO_REUSEPORT + SO_REUSEADDR + SO_BROADCAST.
+/// When `iface` is `Some`, also sets SO_BINDTODEVICE to restrict traffic
+/// to that network interface.
+fn bind_udp(port: u16, iface: Option<&str>) -> anyhow::Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
     #[cfg(unix)]
     sock.set_reuse_port(true)?;
     sock.set_broadcast(true)?;
     sock.set_nonblocking(true)?;
+    #[cfg(target_os = "linux")]
+    if let Some(name) = iface {
+        sock.bind_device(Some(name.as_bytes()))?;
+    }
     sock.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
     let std_sock: std::net::UdpSocket = sock.into();
     Ok(UdpSocket::from_std(std_sock)?)
@@ -319,46 +324,53 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// Only pushes to the channel when a device is new or its record has changed
 /// (IP or version update), using `db` as the source of truth.
 ///
-/// `interfaces` is reserved for future `SO_BINDTODEVICE` per-interface filtering;
-/// currently ignored — all interfaces are listened on.
+/// When `interfaces` is `Some`, one socket per interface per port is bound
+/// via SO_BINDTODEVICE.  When `None`, a single unbound socket per port
+/// receives traffic from all interfaces.
 pub fn spawn(
     tx:         Arc<broadcast::Sender<DiscoveredDevice>>,
     db:         Arc<RouterDb>,
     interfaces: Option<Vec<String>>,
 ) {
-    if let Some(ref ifaces) = interfaces {
-        tracing::info!(
-            ?ifaces,
-            "discovery: interface filtering not yet implemented — listening on all interfaces"
-        );
-    }
+    // Build the list of (port, Option<iface>) pairs to listen on.
+    let iface_list: Vec<Option<String>> = match &interfaces {
+        Some(ifaces) if !ifaces.is_empty() => {
+            tracing::info!(?ifaces, "discovery: binding to specified interfaces");
+            ifaces.iter().map(|i| Some(i.clone())).collect()
+        }
+        _ => vec![None],
+    };
 
     for port in [6666u16, 6667] {
-        let tx = tx.clone();
-        let db = db.clone();
-        tokio::spawn(async move {
-            listen_loop(port, tx, db).await;
-        });
+        for iface in &iface_list {
+            let tx    = tx.clone();
+            let db    = db.clone();
+            let iface = iface.clone();
+            tokio::spawn(async move {
+                listen_loop(port, tx, db, iface).await;
+            });
+        }
     }
 
     tokio::spawn(async move {
-        active_scan_loop().await;
+        active_scan_loop(interfaces).await;
     });
 }
 
 async fn listen_loop(
-    port: u16,
-    tx:   Arc<broadcast::Sender<DiscoveredDevice>>,
-    db:   Arc<RouterDb>,
+    port:  u16,
+    tx:    Arc<broadcast::Sender<DiscoveredDevice>>,
+    db:    Arc<RouterDb>,
+    iface: Option<String>,
 ) {
-    let sock = match bind_udp(port) {
+    let sock = match bind_udp(port, iface.as_deref()) {
         Ok(s)  => s,
         Err(e) => {
-            tracing::warn!(%port, "discovery: cannot bind UDP port: {e}");
+            tracing::warn!(%port, iface = ?iface, "discovery: cannot bind UDP port: {e}");
             return;
         }
     };
-    tracing::info!(%port, "discovery: UDP listener started");
+    tracing::info!(%port, iface = ?iface, "discovery: UDP listener started");
 
     let mut buf = [0u8; 4096];
     loop {
@@ -412,22 +424,30 @@ async fn listen_loop(
     }
 }
 
-/// Periodically broadcast a Tuya scan probe to wake devices that don't
-/// announce themselves continuously.
-async fn active_scan_loop() {
+/// Periodically broadcast a Tuya scan probe on each monitored interface
+/// to wake devices that don't announce themselves continuously.
+async fn active_scan_loop(interfaces: Option<Vec<String>>) {
     let probe = build_scan_packet();
     let dst   = SocketAddr::from(([255, 255, 255, 255], 6666u16));
 
+    let iface_list: Vec<Option<String>> = match &interfaces {
+        Some(ifaces) if !ifaces.is_empty() =>
+            ifaces.iter().map(|i| Some(i.clone())).collect(),
+        _ => vec![None],
+    };
+
     loop {
-        match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(sock) => {
-                sock.set_broadcast(true).ok();
-                match sock.send_to(&probe, dst).await {
-                    Ok(_)  => tracing::debug!("discovery: active scan probe sent"),
-                    Err(e) => tracing::debug!("discovery: active scan probe failed (non-fatal): {e}"),
+        for iface in &iface_list {
+            match bind_udp(0, iface.as_deref()) {
+                Ok(sock) => {
+                    sock.set_broadcast(true).ok();
+                    match sock.send_to(&probe, dst).await {
+                        Ok(_)  => tracing::debug!(iface = ?iface, "discovery: active scan probe sent"),
+                        Err(e) => tracing::debug!(iface = ?iface, "discovery: active scan probe failed: {e}"),
+                    }
                 }
+                Err(e) => tracing::debug!(iface = ?iface, "discovery: bind for probe failed: {e}"),
             }
-            Err(e) => tracing::debug!("discovery: bind for probe failed: {e}"),
         }
         tokio::time::sleep(PROBE_INTERVAL).await;
     }
