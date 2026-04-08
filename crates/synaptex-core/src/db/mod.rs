@@ -90,15 +90,72 @@ pub fn load_plugin_config(trees: &Trees, id: &DeviceId) -> Result<Option<PluginC
     get(&trees.configs, id)
 }
 
+// ─── Legacy migration types ───────────────────────────────────────────────────
+
+/// `TuyaDeviceConfig` as it existed before the `protocol_hint` field was added.
+/// Used as a fallback deserializer for DB entries written by older builds.
+#[derive(serde::Deserialize)]
+struct TuyaDeviceConfigV0 {
+    device_id:      DeviceId,
+    ip:             std::net::IpAddr,
+    port:           u16,
+    tuya_id:        String,
+    local_key:      String,
+    dp_profile:     String,
+    dp_map:         Option<synaptex_tuya::dp_map::DpMap>,
+}
+
+#[derive(serde::Deserialize)]
+enum PluginConfigV0 {
+    Tuya(TuyaDeviceConfigV0),
+    Group(GroupConfig),
+}
+
+impl From<PluginConfigV0> for PluginConfig {
+    fn from(v0: PluginConfigV0) -> Self {
+        match v0 {
+            PluginConfigV0::Tuya(t) => PluginConfig::Tuya(TuyaDeviceConfig {
+                device_id:     t.device_id,
+                ip:            t.ip,
+                port:          t.port,
+                tuya_id:       t.tuya_id,
+                local_key:     t.local_key,
+                dp_profile:    t.dp_profile,
+                dp_map:        t.dp_map,
+                protocol_hint: None,
+            }),
+            PluginConfigV0::Group(g) => PluginConfig::Group(g),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Load all `PluginConfig` entries from the `configs` tree.
+/// Entries written by older builds (missing `protocol_hint`) are migrated
+/// in-place on first load.
 pub fn load_all_plugin_configs(trees: &Trees) -> Result<Vec<PluginConfig>> {
     let mut configs = Vec::new();
     for item in trees.configs.iter() {
-        let (_k, v) = item?;
-        match from_bytes::<PluginConfig>(&v) {
-            Ok(cfg) => configs.push(cfg),
-            Err(e)  => tracing::warn!("skipping corrupt config entry: {e}"),
-        }
+        let (k, v) = item?;
+        let cfg = match from_bytes::<PluginConfig>(&v) {
+            Ok(cfg) => cfg,
+            Err(_) => match from_bytes::<PluginConfigV0>(&v) {
+                Ok(v0) => {
+                    let migrated: PluginConfig = v0.into();
+                    // Re-save in the current format so we don't migrate again.
+                    let new_bytes = to_allocvec(&migrated)?;
+                    trees.configs.insert(k, new_bytes)?;
+                    tracing::info!("migrated config entry to current schema");
+                    migrated
+                }
+                Err(e) => {
+                    tracing::warn!("skipping corrupt config entry: {e}");
+                    continue;
+                }
+            },
+        };
+        configs.push(cfg);
     }
     Ok(configs)
 }
