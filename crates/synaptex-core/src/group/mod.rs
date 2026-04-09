@@ -59,6 +59,9 @@ pub fn compute_group_state(
         rgb:          primary.and_then(|s| s.rgb),
         switches:     primary.map(|s| s.switches.clone()).unwrap_or_default(),
         fan_speed:    primary.and_then(|s| s.fan_speed),
+        temp_current:     primary.and_then(|s| s.temp_current),
+        temp_set:         primary.and_then(|s| s.temp_set),
+        temp_calibration: primary.and_then(|s| s.temp_calibration),
     }
 }
 

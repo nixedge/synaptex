@@ -218,7 +218,7 @@ async fn set(
     http_url:   &str,
     api_key:    Option<&str>,
 ) -> Result<()> {
-    let cmd_json = build_command_json(power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, None)?;
+    let cmd_json = build_command_json(power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, None, None)?;
 
     let client = reqwest::Client::new();
     let mut req = client

@@ -69,6 +69,12 @@ pub struct DpMap {
     pub ir_send_dp:       Option<u16>,
     /// IR control type (1 = type-1 JSON blob, 2 = type-2 multi-DP).
     pub ir_control_type:  Option<u8>,
+    /// Read-only DP reporting the current ambient temperature.
+    pub temp_current_dp:     Option<u16>,
+    /// Writable DP for the target/set-point temperature.
+    pub temp_set_dp:         Option<u16>,
+    /// Writable DP for temperature calibration offset (signed integer).
+    pub temp_calibration_dp: Option<u16>,
 }
 
 // ─── Presets ──────────────────────────────────────────────────────────────────
@@ -94,6 +100,9 @@ impl DpMap {
             fan_speed_format: FanSpeedFormat::Named,
             ir_send_dp:       None,
             ir_control_type:  None,
+            temp_current_dp:     None,
+            temp_set_dp:         None,
+            temp_calibration_dp: None,
         }
     }
 
@@ -117,6 +126,9 @@ impl DpMap {
             fan_speed_format: FanSpeedFormat::Named,
             ir_send_dp:       None,
             ir_control_type:  None,
+            temp_current_dp:     None,
+            temp_set_dp:         None,
+            temp_calibration_dp: None,
         }
     }
 
@@ -139,6 +151,9 @@ impl DpMap {
             fan_speed_format: FanSpeedFormat::Named,
             ir_send_dp:       None,
             ir_control_type:  None,
+            temp_current_dp:     None,
+            temp_set_dp:         None,
+            temp_calibration_dp: None,
         }
     }
 
@@ -162,6 +177,36 @@ impl DpMap {
             fan_speed_format: FanSpeedFormat::Numeric,
             ir_send_dp:       None,
             ir_control_type:  None,
+            temp_current_dp:     None,
+            temp_set_dp:         None,
+            temp_calibration_dp: None,
+        }
+    }
+
+    /// Millivolt thermostat / fireplace remote (e.g. SH3002).
+    /// power=1, target_temp=14 (setpoint, writable).
+    /// DP 15 = ceiling temp limit, DP 20 = calibration offset — not tracked in state.
+    pub fn thermostat() -> Self {
+        Self {
+            power_dp:        1,
+            brightness_dp:   None,
+            color_temp_dp:   None,
+            color_dp:        None,
+            mode_dp:         None,
+            color_format:    ColorFormat::Hsv16,
+            brightness_min:  0,
+            brightness_max:  1000,
+            color_temp_min:  0,
+            color_temp_max:  1000,
+            fan_speed_dp:     None,
+            fan_mode_dp:      None,
+            light_power_dp:   None,
+            fan_speed_format: FanSpeedFormat::Named,
+            ir_send_dp:       None,
+            ir_control_type:  None,
+            temp_current_dp:     None,
+            temp_set_dp:         Some(14),
+            temp_calibration_dp: Some(20),
         }
     }
 
@@ -184,6 +229,9 @@ impl DpMap {
             fan_speed_format: FanSpeedFormat::Named,
             ir_send_dp:       Some(201),
             ir_control_type:  Some(1),
+            temp_current_dp:     None,
+            temp_set_dp:         None,
+            temp_calibration_dp: None,
         }
     }
 
@@ -206,6 +254,9 @@ impl DpMap {
             fan_speed_format: FanSpeedFormat::Named,
             ir_send_dp:       Some(1),
             ir_control_type:  Some(2),
+            temp_current_dp:     None,
+            temp_set_dp:         None,
+            temp_calibration_dp: None,
         }
     }
 
@@ -217,9 +268,10 @@ impl DpMap {
             "bulb_a"  => Self::tuya_bulb_a(),
             "bulb_b"  => Self::tuya_bulb_b(),
             "switch"  => Self::switch(),
-            "fan"     => Self::fan(),
-            "ir1"     => Self::ir_type1(),
-            "ir2"     => Self::ir_type2(),
+            "fan"        => Self::fan(),
+            "thermostat" => Self::thermostat(),
+            "ir1"        => Self::ir_type1(),
+            "ir2"        => Self::ir_type2(),
             _         => Self::default(),
         }
     }
@@ -284,6 +336,21 @@ impl DpMap {
                 });
             }
         }
+        if let Some(dp) = self.temp_current_dp {
+            if let Some(v) = dps.get(&dp.to_string()).and_then(Value::as_u64) {
+                state.temp_current = Some(v as u16);
+            }
+        }
+        if let Some(dp) = self.temp_set_dp {
+            if let Some(v) = dps.get(&dp.to_string()).and_then(Value::as_u64) {
+                state.temp_set = Some(v as u16);
+            }
+        }
+        if let Some(dp) = self.temp_calibration_dp {
+            if let Some(v) = dps.get(&dp.to_string()).and_then(Value::as_i64) {
+                state.temp_calibration = Some(v as i16);
+            }
+        }
     }
 
     /// Build a `dps` JSON value for `SetFanSpeed`.
@@ -310,6 +377,13 @@ impl DpMap {
                 speed_dp.to_string(): high,
             })),
         }
+    }
+
+    /// Build a `dps` JSON value for `SetTargetTemp`.
+    /// Returns `None` when no `temp_set_dp` is configured.
+    pub fn set_temp_dps(&self, temp: u16) -> Option<Value> {
+        let dp = self.temp_set_dp?;
+        Some(json!({ dp.to_string(): temp as i64 }))
     }
 
     /// Build a `(dp, native_value)` pair for a brightness command (0–1000 input).
@@ -470,6 +544,9 @@ impl DpMap {
         }
         if self.ir_send_dp.is_some() {
             caps.push(Capability::Ir);
+        }
+        if self.temp_set_dp.is_some() {
+            caps.push(Capability::Thermostat { min: 40, max: 90 });
         }
         caps
     }

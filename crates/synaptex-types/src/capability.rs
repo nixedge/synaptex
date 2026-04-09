@@ -24,6 +24,9 @@ pub enum Capability {
     /// Separately controlled on/off light component (e.g. fan+light combo).
     /// When present, `SetPower` targets this light rather than the main power DP.
     Light,
+    /// Thermostat: read current temp, set target temp.
+    /// Temperature values are in the device's native unit (usually °F or °C).
+    Thermostat { min: u16, max: u16 },
 }
 
 /// Commands the core may dispatch to a plugin.
@@ -45,6 +48,8 @@ pub enum DeviceCommand {
     SendIr { head: Option<String>, key: String },
     /// Set fan speed.  `Off` also cuts power to the fan.
     SetFanSpeed(FanSpeed),
+    /// Set the target/set-point temperature (device-native unit).
+    SetTargetTemp(u16),
     /// Patch any combination of light attributes in a single command.
     /// Fields that are `None` are left unchanged on the device.
     SetLight {
@@ -70,8 +75,9 @@ impl DeviceCommand {
             (DeviceCommand::SetSwitch { index, .. }, Capability::Switch { index: cap_idx }) => {
                 index == cap_idx
             }
-            (DeviceCommand::SendIr { .. },      Capability::Ir)  => true,
-            (DeviceCommand::SetFanSpeed(_),     Capability::Fan) => true,
+            (DeviceCommand::SendIr { .. },        Capability::Ir)  => true,
+            (DeviceCommand::SetFanSpeed(_),       Capability::Fan) => true,
+            (DeviceCommand::SetTargetTemp(_),     Capability::Thermostat { .. }) => true,
             // SetLight targets any device with a power or light DP.
             (DeviceCommand::SetLight { .. },    Capability::Power) => true,
             (DeviceCommand::SetLight { .. },    Capability::Light) => true,

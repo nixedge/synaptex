@@ -83,6 +83,9 @@ fn detect_profile_from_specs(
 
     if specs.dp_ids.contains(&201) { return "ir_type1"; }
 
+    // DP 14 = setpoint temp — must come before DP 5 check (thermostats also have DP 5)
+    if specs.dp_ids.contains(&14) { return "thermostat"; }
+
     if specs.dp_ids.contains(&20) { return "bulb_b"; }
     if specs.dp_ids.contains(&5)  { return "bulb_a"; }
 
@@ -95,13 +98,14 @@ fn detect_profile_from_specs(
 /// Used when the Cloud specs endpoint is unavailable or returns an error.
 fn category_to_dp_profile(category: &str) -> &'static str {
     match category {
-        "cz"           => "switch",    // smart plug
-        "dj"           => "bulb_b",    // smart bulb (colour)
-        "fsd"          => "fan",       // fan controller
-        "infrared_tv"  => "ir_type2",  // TV IR blaster
-        "wnykq"        => "ir_type1",  // universal remote
-        "qn"           => "switch",    // fireplace / generic switch
-        _              => "switch",    // safe default
+        "cz"           => "switch",      // smart plug
+        "dj"           => "bulb_b",      // smart bulb (colour)
+        "fsd"          => "fan",         // fan controller
+        "infrared_tv"  => "ir_type2",    // TV IR blaster
+        "wnykq"        => "ir_type1",    // universal remote
+        "wkq"          => "thermostat",  // thermostat / millivolt controller
+        "qn"           => "switch",      // fireplace / generic switch
+        _              => "switch",      // safe default
     }
 }
 

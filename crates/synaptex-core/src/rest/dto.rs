@@ -37,6 +37,9 @@ pub struct DeviceStateDto {
     pub rgb:           Option<[u8; 3]>,
     pub switches:      HashMap<u8, bool>,
     pub fan_speed:     Option<FanSpeed>,
+    pub temp_current:     Option<u16>,
+    pub temp_set:         Option<u16>,
+    pub temp_calibration: Option<i16>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -50,6 +53,7 @@ pub enum CapabilityDto {
     Switch   { index: u8 },
     Fan,
     Ir,
+    Thermostat { min: u16, max: u16 },
 }
 
 impl From<&Capability> for CapabilityDto {
@@ -64,6 +68,7 @@ impl From<&Capability> for CapabilityDto {
             Capability::Switch { index }         => CapabilityDto::Switch { index: *index },
             Capability::Fan                      => CapabilityDto::Fan,
             Capability::Ir                       => CapabilityDto::Ir,
+            Capability::Thermostat { min, max }  => CapabilityDto::Thermostat { min: *min, max: *max },
         }
     }
 }
@@ -86,6 +91,9 @@ pub fn device_dto(info: &DeviceInfo, state: Option<DeviceState>, ip: Option<Stri
             rgb:           s.rgb.map(|(r, g, b)| [r, g, b]),
             switches:      s.switches,
             fan_speed:     s.fan_speed,
+            temp_current:     s.temp_current,
+            temp_set:         s.temp_set,
+            temp_calibration: s.temp_calibration,
         }),
     }
 }
@@ -101,6 +109,7 @@ pub enum CommandDto {
     SetRgb        { r: u8, g: u8, b: u8 },
     SetSwitch     { index: u8, on: bool },
     SetFanSpeed   { speed: FanSpeed },
+    SetTargetTemp { temp: u16 },
     SendIr        { key: String, #[serde(default)] head: Option<String> },
     SetDp {
         dp:       u16,
@@ -134,7 +143,9 @@ impl TryFrom<CommandDto> for DeviceCommand {
             CommandDto::SetSwitch     { index, on }        =>
                 DeviceCommand::SetSwitch { index, state: on },
             CommandDto::SetFanSpeed   { speed }            => DeviceCommand::SetFanSpeed(speed),
+            CommandDto::SetTargetTemp { temp }             => DeviceCommand::SetTargetTemp(temp),
             CommandDto::SendIr        { key, head }        => DeviceCommand::SendIr { head, key },
+
             CommandDto::SetDp { dp, bool_val: Some(v), .. } =>
                 DeviceCommand::SetDpBool { dp, value: v },
             CommandDto::SetDp { dp, int_val:  Some(v), .. } =>
@@ -291,6 +302,7 @@ fn device_command_to_dto(cmd: &DeviceCommand) -> CommandDto {
         DeviceCommand::SetSwitch { index, state } =>
             CommandDto::SetSwitch { index: *index, on: *state },
         DeviceCommand::SetFanSpeed(speed)   => CommandDto::SetFanSpeed { speed: *speed },
+        DeviceCommand::SetTargetTemp(t)     => CommandDto::SetTargetTemp { temp: *t },
         DeviceCommand::SendIr { head, key } =>
             CommandDto::SendIr { key: key.clone(), head: head.clone() },
         DeviceCommand::SetDpBool { dp, value } =>

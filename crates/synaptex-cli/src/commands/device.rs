@@ -92,6 +92,10 @@ pub enum DeviceCmd {
         /// Set fan speed: off | low | medium | high.
         #[arg(long, value_name = "SPEED", group = "cmd")]
         fan_speed: Option<String>,
+
+        /// Set thermostat target temperature.
+        #[arg(long, value_name = "TEMP", group = "cmd")]
+        set_temp: Option<u16>,
     },
 
     /// List all registered devices.
@@ -131,7 +135,7 @@ pub enum DeviceCmd {
         #[arg(long, default_value_t = 6668u16)]
         port: u16,
 
-        /// DP profile preset: bulb_a | bulb_b | switch | fan | ir1 | ir2
+        /// DP profile preset: bulb_a | bulb_b | switch | fan | ir1 | ir2 | thermostat
         #[arg(long, default_value = "bulb_b")]
         dp_profile: String,
     },
@@ -159,7 +163,7 @@ pub enum DeviceCmd {
         #[arg(long, value_name = "MAC")]
         mac: String,
 
-        /// DP profile preset: bulb_a | bulb_b | switch | fan | ir1 | ir2
+        /// DP profile preset: bulb_a | bulb_b | switch | fan | ir1 | ir2 | thermostat
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
 
@@ -196,8 +200,8 @@ pub async fn run(cmd: DeviceCmd, http_url: &str, api_key: Option<&str>) -> Resul
     match cmd {
         DeviceCmd::Get { mac } =>
             get(mac, http_url, api_key).await,
-        DeviceCmd::Set { mac, power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed } =>
-            set(mac, power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, http_url, api_key).await,
+        DeviceCmd::Set { mac, power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, set_temp } =>
+            set(mac, power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, set_temp, http_url, api_key).await,
         DeviceCmd::List { groups } =>
             list(groups, http_url, api_key).await,
         DeviceCmd::Add { mac, name, ip, tuya_id, local_key, model, port, dp_profile } =>
@@ -258,6 +262,15 @@ async fn get(mac: String, http_url: &str, api_key: Option<&str>) -> Result<()> {
         if let Some(spd) = state["fan_speed"].as_str() {
             println!("fan_speed: {spd}");
         }
+        if let Some(t) = state["temp_current"].as_u64() {
+            println!("temp_cur:  {t}°");
+        }
+        if let Some(t) = state["temp_set"].as_u64() {
+            println!("temp_set:  {t}°");
+        }
+        if let Some(t) = state["temp_calibration"].as_i64() {
+            println!("temp_cal:  {t:+}°");
+        }
     }
     Ok(())
 }
@@ -273,6 +286,7 @@ async fn set(
     send_ir:    Option<String>,
     set_dp:     Option<String>,
     fan_speed:  Option<String>,
+    set_temp:   Option<u16>,
     http_url:   &str,
     api_key:    Option<&str>,
 ) -> Result<()> {
@@ -296,7 +310,7 @@ async fn set(
         }
     };
 
-    let cmd_json = build_command_json(power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, is_light)?;
+    let cmd_json = build_command_json(power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, set_temp, is_light)?;
 
     let client = reqwest::Client::new();
     let mut req = client
@@ -482,6 +496,9 @@ async fn watch(mac: Option<String>, http_url: &str, api_key: Option<&str>) -> Re
                 if rgb.len() == 3 { print!("  rgb=({},{},{})", rgb[0], rgb[1], rgb[2]); }
             }
             if let Some(spd) = v["fan_speed"].as_str()   { print!("  fan={spd}"); }
+            if let Some(t) = v["temp_current"].as_u64()    { print!("  temp_cur={t}°"); }
+            if let Some(t) = v["temp_set"].as_u64()        { print!("  temp_set={t}°"); }
+            if let Some(t) = v["temp_calibration"].as_i64(){ print!("  temp_cal={t:+}°"); }
             println!();
         }
     }
@@ -649,7 +666,10 @@ async fn probe(config_arg: Option<String>, set_dps: Vec<String>, _http_url: &str
         if let Some(v) = state.brightness   { println!("  brightness:   {v}"); }
         if let Some(v) = state.color_temp_k { println!("  color_temp_k: {v}"); }
         if let Some(v) = state.rgb          { println!("  rgb:          {:?}", v); }
-        if let Some(v) = state.fan_speed    { println!("  fan_speed:    {:?}", v); }
+        if let Some(v) = state.fan_speed        { println!("  fan_speed:    {:?}", v); }
+        if let Some(v) = state.temp_current     { println!("  temp_current: {v}°"); }
+        if let Some(v) = state.temp_set         { println!("  temp_set:     {v}°"); }
+        if let Some(v) = state.temp_calibration { println!("  temp_cal:     {v:+}°"); }
         for (idx, on) in &state.switches    { println!("  switch[{idx}]:   {on}"); }
     } else {
         // SET: parse DP=TYPE:VALUE pairs and send.
@@ -776,6 +796,7 @@ fn device_type(d: &serde_json::Value) -> String {
     let has_light = caps.contains(&"light");   // separate light DP
     let has_dim   = caps.contains(&"dimmer") || caps.contains(&"color_temp");
     let has_rgb   = caps.contains(&"rgb");
+    if caps.contains(&"thermostat")            { return "thermostat".to_string(); }
     if has_fan {
         return match (has_light || has_dim || has_rgb, has_rgb, has_dim) {
             (false, _, _)  => "fan".to_string(),
@@ -816,8 +837,13 @@ pub fn build_command_json(
     send_ir:    Option<String>,
     set_dp:     Option<String>,
     fan_speed:  Option<String>,
+    set_temp:   Option<u16>,
     is_light:   Option<bool>,
 ) -> Result<serde_json::Value> {
+    if let Some(temp) = set_temp {
+        return Ok(serde_json::json!({ "type": "set_target_temp", "temp": temp }));
+    }
+
     let has_light_attrs = brightness.is_some() || color_temp.is_some()
         || rgb.is_some() || color_mode.is_some();
     let has_exclusive = send_ir.is_some() || set_dp.is_some() || fan_speed.is_some();
@@ -907,6 +933,6 @@ pub fn build_command_json(
         }
     } else {
         bail!("provide at least one of --power, --brightness, --color-temp, --rgb, --color-mode, \
-               --send-ir, --set-dp, or --fan-speed");
+               --send-ir, --set-dp, --fan-speed, or --set-temp");
     }
 }

@@ -35,6 +35,9 @@ impl StateCache {
                 if let Some(v) = new.rgb          { s.rgb          = Some(v); }
                 if !new.switches.is_empty()       { s.switches     = new.switches.clone(); }
                 if let Some(v) = new.fan_speed    { s.fan_speed    = Some(v); }
+                if let Some(v) = new.temp_current     { s.temp_current     = Some(v); }
+                if let Some(v) = new.temp_set         { s.temp_set         = Some(v); }
+                if let Some(v) = new.temp_calibration { s.temp_calibration = Some(v); }
             })
             .or_insert(new);
     }

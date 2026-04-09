@@ -267,8 +267,11 @@ impl Connection {
                     brightness:   None,
                     color_temp_k: None,
                     rgb:          None,
-                    switches:     HashMap::new(),
-                    fan_speed:    None,
+                    switches:          HashMap::new(),
+                    fan_speed:         None,
+                    temp_current:      None,
+                    temp_set:          None,
+                    temp_calibration:  None,
                 };
                 dp_map.apply_dps(&dps, &mut state);
                 return Ok((state, dps));
@@ -582,7 +585,8 @@ impl TuyaPlugin {
                 dp.to_string(): value
             })),
             DeviceCommand::SendIr { head, key } => dm.ir_dps(head.as_deref(), key),
-            DeviceCommand::SetFanSpeed(speed)  => dm.fan_speed_dps(*speed),
+            DeviceCommand::SetFanSpeed(speed)   => dm.fan_speed_dps(*speed),
+            DeviceCommand::SetTargetTemp(temp)  => dm.set_temp_dps(*temp),
             DeviceCommand::SetLight { power, brightness, color_temp, rgb, color_mode } => {
                 let dps = dm.patch_light_dps(
                     *power,
@@ -785,5 +789,6 @@ fn offline_state(id: DeviceId) -> DeviceState {
             .as_millis() as u64,
         power: None, brightness: None, color_temp_k: None,
         rgb: None, switches: HashMap::new(), fan_speed: None,
+        temp_current: None, temp_set: None, temp_calibration: None,
     }
 }

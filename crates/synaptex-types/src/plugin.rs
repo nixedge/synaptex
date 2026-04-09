@@ -33,6 +33,12 @@ pub struct DeviceState {
     /// Multi-switch state: index → on/off.
     pub switches:     HashMap<u8, bool>,
     pub fan_speed:    Option<FanSpeed>,
+    /// Current ambient temperature reported by the device (device-native unit).
+    pub temp_current:     Option<u16>,
+    /// Target/set-point temperature (device-native unit).
+    pub temp_set:         Option<u16>,
+    /// Temperature calibration offset (signed, device-native unit).
+    pub temp_calibration: Option<i16>,
 }
 
 // ─── Event Bus ────────────────────────────────────────────────────────────────
