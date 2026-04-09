@@ -300,10 +300,10 @@ pub async fn import_cloud_devices(
             continue;
         }
 
-        // Online but not found anywhere.
-        if cloud_dev.online {
-            not_discovered.push(CloudDeviceDto::from(cloud_dev));
-        }
+        // Not found locally (online or offline) — surface for manual registration.
+        // IR blasters and smart remotes often appear offline in Tuya Cloud even
+        // when physically present, so we include them regardless of online status.
+        not_discovered.push(CloudDeviceDto::from(cloud_dev));
     }
 
     Ok(Json(ImportResultDto { registered, updated_registration, already_registered, not_discovered, skipped_virtual }))
