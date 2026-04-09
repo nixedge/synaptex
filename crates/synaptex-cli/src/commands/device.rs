@@ -3,6 +3,14 @@ use std::collections::HashMap;
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 
+pub fn parse_power(s: &str) -> std::result::Result<bool, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "on"  | "true"  | "1" | "yes" => Ok(true),
+        "off" | "false" | "0" | "no"  => Ok(false),
+        _ => Err(format!("expected 'on' or 'off', got '{s}'")),
+    }
+}
+
 // ─── Group subcommand ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Subcommand)]
@@ -53,8 +61,8 @@ pub enum DeviceCmd {
         #[arg(long, value_name = "MAC")]
         mac: String,
 
-        /// Turn on (true) or off (false).
-        #[arg(long, value_name = "BOOL")]
+        /// Turn on or off.
+        #[arg(long, value_name = "on|off", value_parser = parse_power)]
         power: Option<bool>,
 
         /// Set brightness 0–1000.
@@ -637,7 +645,7 @@ async fn probe(config_arg: Option<String>, set_dps: Vec<String>, _http_url: &str
         if !state.online {
             println!("  reason:       no DPS received within timeout (wrong credentials or protocol version?)");
         }
-        if let Some(v) = state.power        { println!("  power:        {v}"); }
+        if let Some(v) = state.power        { println!("  power:        {}", if v { "on" } else { "off" }); }
         if let Some(v) = state.brightness   { println!("  brightness:   {v}"); }
         if let Some(v) = state.color_temp_k { println!("  color_temp_k: {v}"); }
         if let Some(v) = state.rgb          { println!("  rgb:          {:?}", v); }

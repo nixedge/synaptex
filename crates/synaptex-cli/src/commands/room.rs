@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 
-use super::device::build_command_json;
+use super::device::{build_command_json, parse_power};
 
 // ─── Subcommands ─────────────────────────────────────────────────────────────
 
@@ -56,8 +56,8 @@ pub enum RoomCmd {
         #[arg(long)]
         id: String,
 
-        /// Turn on (true) or off (false).
-        #[arg(long, value_name = "BOOL")]
+        /// Turn on or off.
+        #[arg(long, value_name = "on|off", value_parser = parse_power)]
         power: Option<bool>,
 
         /// Set brightness 0–1000.
