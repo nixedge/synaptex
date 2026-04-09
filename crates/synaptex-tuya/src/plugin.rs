@@ -1,15 +1,12 @@
-/// `DevicePlugin` implementation for the Tuya local protocol.
+/// `DevicePlugin` implementation for the Tuya local protocol (on-demand connections).
 ///
-/// Protocol version is auto-detected on every `connect()`:
-/// - v3.5 (0x6699 GCM) and v3.4 (0x55AA HMAC) probes are sent simultaneously.
-/// - Whichever the device answers is used; timeout → v3.3 ECB.
+/// Every `poll_state()` and `execute_command()` opens a fresh TCP connection,
+/// negotiates the session key, does its work, and drops the socket.
+/// A periodic supervisor in the registry polls every ~60 s to keep the state cache fresh.
 use std::{
     collections::HashMap,
     net::IpAddr,
-    sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicU32, AtomicU8, Ordering},
     time::{Duration, SystemTime},
 };
 
@@ -19,10 +16,9 @@ use serde_json::{json, Value};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::Mutex,
     time::timeout,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 
 use synaptex_types::{
     capability::{Capability, DeviceCommand},
@@ -52,7 +48,7 @@ pub struct TuyaConfig {
     pub dp_map:        DpMap,
     /// Protocol version hint ("3.3" | "3.4" | "3.5").
     /// When set, skips the dual-probe and connects directly with this version.
-    pub protocol_hint: Option<String>,
+    pub protocol_version: Option<String>,
 }
 
 impl TuyaConfig {
@@ -67,21 +63,208 @@ impl TuyaConfig {
     }
 }
 
+// ─── Protocol detection result ────────────────────────────────────────────────
+
+enum ProtocolResult {
+    V33,
+    V34([u8; 16]),
+    V35([u8; 16]),
+}
+
+// ─── Ephemeral connection ─────────────────────────────────────────────────────
+
+/// A single open TCP session — created by `open_connection()`, used for one
+/// query or command, then dropped (closing the socket).
+struct Connection {
+    stream:   TcpStream,
+    proto:    ProtocolResult,
+    ecb_key:  [u8; 16],
+    leftover: Vec<u8>,
+    seq_no:   u32,
+}
+
+impl Connection {
+    /// Returns the appropriate DP-set command word for the negotiated protocol.
+    ///
+    /// v3.4 and v3.5 devices use `ControlNew` (0x0D); v3.3 devices use `Control` (0x07).
+    fn control_cmd(&self) -> CommandWord {
+        match &self.proto {
+            ProtocolResult::V34(_) | ProtocolResult::V35(_) => CommandWord::ControlNew,
+            ProtocolResult::V33                              => CommandWord::Control,
+        }
+    }
+
+    /// Build and write one command frame using the negotiated protocol.
+    async fn send(&mut self, cmd: CommandWord, payload: &[u8]) -> Result<(), TuyaError> {
+        let seq = self.seq_no;
+        self.seq_no += 1;
+
+        let frame = {
+            // Borrow proto / ecb_key in a block so they're released before write_all.
+            match &self.proto {
+                ProtocolResult::V35(sk) => {
+                    let sk = *sk;
+                    let mut iv = [0u8; 12];
+                    rand::thread_rng().fill_bytes(&mut iv);
+                    protocol::build_frame_v35(seq, cmd, payload, &sk, &iv)?
+                }
+                ProtocolResult::V34(sk) => {
+                    let sk = *sk;
+                    // ControlNew (0x0D) is the v3.4 data-frame command.
+                    // Prepend the 15-byte version prefix for data frames.
+                    let plaintext: Vec<u8> = if cmd == CommandWord::ControlNew {
+                        let mut p = protocol::V34_DATA_PREFIX.to_vec();
+                        p.extend_from_slice(payload);
+                        p
+                    } else {
+                        payload.to_vec()
+                    };
+                    let encrypted = cipher::encrypt(&sk, &plaintext);
+                    protocol::build_frame(seq, cmd, &encrypted, TrailerKind::Hmac(&sk))
+                }
+                ProtocolResult::V33 => {
+                    let ct = cipher::encrypt(&self.ecb_key, payload);
+                    let ct = if protocol::v33_needs_prefix(cmd) {
+                        protocol::v33_prepend_version(&ct)
+                    } else {
+                        ct
+                    };
+                    protocol::build_frame(seq, cmd, &ct, TrailerKind::Crc32)
+                }
+            }
+        };
+
+        debug!(cmd = ?cmd, seq, payload_len = payload.len(), "→ tx");
+        self.stream.write_all(&frame).await?;
+        Ok(())
+    }
+
+    /// Read frames from the socket (processing any leftover bytes first) until
+    /// one contains a `"dps"` object.  The caller is responsible for wrapping
+    /// this in a `timeout`.
+    async fn recv_state(
+        &mut self,
+        dp_map:    &DpMap,
+        device_id: DeviceId,
+    ) -> Result<(DeviceState, HashMap<String, Value>), TuyaError> {
+        let mut buf = [0u8; 4096];
+        let is_v35  = matches!(self.proto, ProtocolResult::V35(_));
+
+        loop {
+            // ── Process whatever bytes are already buffered ────────────────────
+            loop {
+                let result = {
+                    match &self.proto {
+                        ProtocolResult::V35(sk) =>
+                            protocol::parse_frame_any(&self.leftover, Some((sk, TrailerKind::Crc32))),
+                        ProtocolResult::V34(sk) =>
+                            protocol::parse_frame_any(&self.leftover, Some((sk, TrailerKind::Hmac(sk)))),
+                        ProtocolResult::V33 =>
+                            protocol::parse_frame_any(&self.leftover, None),
+                    }
+                }?; // borrows of self.proto / self.leftover end here
+
+                let (frame, consumed) = match result {
+                    None => break, // need more data from socket
+                    Some(pair) => pair,
+                };
+                self.leftover.drain(..consumed);
+
+                debug!(
+                    device = %device_id,
+                    seq    = frame.seq_no,
+                    cmd    = ?frame.command,
+                    "← rx"
+                );
+
+                // ── Decrypt payload ───────────────────────────────────────────
+                let plain: Vec<u8> = if is_v35 {
+                    if frame.payload.is_empty() { continue; }
+                    frame.payload.to_vec()
+                } else {
+                    if frame.payload.len() <= 4 { continue; }
+                    let rc = u32::from_be_bytes(frame.payload[0..4].try_into().unwrap());
+                    if rc != 0 {
+                        debug!(device = %device_id, return_code = rc, "non-zero return code");
+                    }
+                    let after_rc = &frame.payload[4..];
+                    let enc = if after_rc.len() >= 15
+                        && (after_rc.starts_with(b"3.3") || after_rc.starts_with(b"3.4"))
+                    {
+                        &after_rc[15..]
+                    } else {
+                        after_rc
+                    };
+                    if enc.is_empty() { continue; }
+                    if enc.len() % 16 != 0 {
+                        debug!(device = %device_id, len = enc.len(), "ciphertext not block-aligned, skipping");
+                        continue;
+                    }
+                    match &self.proto {
+                        ProtocolResult::V34(sk) => {
+                            let sk = *sk;
+                            match cipher::decrypt(&sk, enc) {
+                                Ok(p)  => p,
+                                Err(e) => { debug!(device = %device_id, "decrypt failed ({e})"); continue; }
+                            }
+                        }
+                        _ => match cipher::decrypt(&self.ecb_key, enc) {
+                            Ok(p)  => p,
+                            Err(e) => { debug!(device = %device_id, "decrypt failed ({e})"); continue; }
+                        },
+                    }
+                };
+
+                // ── Parse DPS ────────────────────────────────────────────────
+                let Ok(val) = serde_json::from_slice::<Value>(&plain) else {
+                    debug!(device = %device_id, "non-JSON payload");
+                    continue;
+                };
+                let Some(dps_obj) = val.get("dps").and_then(Value::as_object) else {
+                    debug!(device = %device_id, payload = %val, "JSON without dps");
+                    continue;
+                };
+                let dps: HashMap<String, Value> = dps_obj.clone().into_iter().collect();
+
+                debug!(device = %device_id, dps = %val["dps"], "← dps update");
+
+                let mut state = DeviceState {
+                    device_id,
+                    online:        true,
+                    updated_at_ms: SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    power:        None,
+                    brightness:   None,
+                    color_temp_k: None,
+                    rgb:          None,
+                    switches:     HashMap::new(),
+                    fan_speed:    None,
+                };
+                dp_map.apply_dps(&dps, &mut state);
+                return Ok((state, dps));
+            }
+
+            // ── Read more bytes from the socket ───────────────────────────────
+            let n = self.stream.read(&mut buf).await?;
+            if n == 0 {
+                return Err(TuyaError::Protocol("connection closed while awaiting state".into()));
+            }
+            self.leftover.extend_from_slice(&buf[..n]);
+        }
+    }
+}
+
 // ─── Plugin ──────────────────────────────────────────────────────────────────
 
 pub struct TuyaPlugin {
-    info:              DeviceInfo,
-    config:            TuyaConfig,
-    bus_tx:            StateBusSender,
-    seq_no:            AtomicU32,
-    connected:         Arc<AtomicBool>,
-    detected_as_v34:   AtomicBool,
-    detected_as_v35:   AtomicBool,
-    writer:            Arc<Mutex<Option<tokio::net::tcp::OwnedWriteHalf>>>,
-    /// Active v3.4 session key (`None` when using v3.3 or v3.5).
-    session_key:       Arc<Mutex<Option<[u8; 16]>>>,
-    /// Active v3.5 session key (`None` when using v3.3 or v3.4).
-    session_key_v35:   Arc<Mutex<Option<[u8; 16]>>>,
+    info:         DeviceInfo,
+    config:       TuyaConfig,
+    bus_tx:       StateBusSender,
+    seq_no:       AtomicU32,
+    /// Last detected protocol version: 0=unknown, 3=v3.3, 4=v3.4, 5=v3.5.
+    last_version: AtomicU8,
 }
 
 impl TuyaPlugin {
@@ -90,13 +273,8 @@ impl TuyaPlugin {
             info,
             config,
             bus_tx,
-            seq_no:            AtomicU32::new(1),
-            connected:         Arc::new(AtomicBool::new(false)),
-            detected_as_v34:   AtomicBool::new(false),
-            detected_as_v35:   AtomicBool::new(false),
-            writer:            Arc::new(Mutex::new(None)),
-            session_key:       Arc::new(Mutex::new(None)),
-            session_key_v35:   Arc::new(Mutex::new(None)),
+            seq_no:       AtomicU32::new(1),
+            last_version: AtomicU8::new(0),
         }
     }
 
@@ -111,13 +289,35 @@ impl TuyaPlugin {
             .as_millis() as u64
     }
 
+    // ── Open an ephemeral connection ──────────────────────────────────────────
+
+    async fn open_connection(&self) -> Result<Connection, TuyaError> {
+        let addr = format!("{}:{}", self.config.ip, self.config.port);
+        let mut stream = TcpStream::connect(&addr).await?;
+        stream.set_nodelay(true)?;
+
+        let key  = self.config.key_bytes()?;
+        let hint = self.config.protocol_version.as_deref();
+        let (proto, leftover) = self.probe_protocol(&mut stream, &key, hint).await?;
+
+        let version_byte = match &proto {
+            ProtocolResult::V33    => 3u8,
+            ProtocolResult::V34(_) => 4u8,
+            ProtocolResult::V35(_) => 5u8,
+        };
+        self.last_version.store(version_byte, Ordering::Release);
+
+        // Continue sequence numbering from where the negotiation left off so
+        // data frames don't reuse seq numbers the device already saw.
+        let seq_no = self.next_seq();
+
+        Ok(Connection { stream, proto, ecb_key: key, leftover, seq_no })
+    }
+
     // ── Protocol detection & negotiation ─────────────────────────────────────
 
     /// Probe the device by sending simultaneous v3.5 and v3.4 handshake
     /// frames, then wait up to 500 ms for a response.
-    ///
-    /// Returns the detected session key (or `None` for v3.3) plus any
-    /// leftover bytes already read past the first frame.
     async fn probe_protocol(
         &self,
         stream: &mut TcpStream,
@@ -132,7 +332,7 @@ impl TuyaPlugin {
         let send_v35 = hint.map_or(true, |h| h == "3.5");
         let send_v34 = hint.map_or(true, |h| h == "3.4");
 
-        // ── v3.5 probe: 0x6699 GCM frame with nonce35 as payload ─────────────
+        // ── v3.5 probe ────────────────────────────────────────────────────────
         if send_v35 {
             let iv35: &[u8; 12] = nonce35[..12].try_into().unwrap();
             let probe35 = protocol::build_frame_v35(
@@ -145,16 +345,20 @@ impl TuyaPlugin {
             stream.write_all(&probe35).await?;
         }
 
-        // ── v3.4 probe: 0x55AA CRC32 frame with ECB(key, nonce34) ────────────
+        // ── v3.4 probe ────────────────────────────────────────────────────────
         if send_v34 {
-            let enc34   = cipher::ecb_encrypt_raw(key, &nonce34)?;
+            let enc34   = cipher::encrypt(key, &nonce34);
             let probe34 = protocol::build_frame(
                 self.next_seq(),
                 CommandWord::SessKeyNegStart,
                 &enc34,
-                TrailerKind::Crc32,
+                TrailerKind::Hmac(key),
             );
             stream.write_all(&probe34).await?;
+        }
+
+        if !send_v35 && !send_v34 {
+            return Ok((ProtocolResult::V33, vec![]));
         }
 
         // ── Wait up to 500 ms for any response ────────────────────────────────
@@ -171,12 +375,13 @@ impl TuyaPlugin {
                 }
                 ring.extend_from_slice(&tmp[..n]);
 
-                // Peek at the prefix to pick the right parser.
                 if ring.len() < 4 { continue; }
-                let result = protocol::parse_frame_any(
-                    &ring,
-                    Some((key, TrailerKind::Crc32)),
-                )?;
+                let trailer = if ring.starts_with(&protocol::PREFIX_6699) {
+                    TrailerKind::Crc32
+                } else {
+                    TrailerKind::Hmac(key)
+                };
+                let result = protocol::parse_frame_any(&ring, Some((key, trailer)))?;
                 if let Some((frame, consumed)) = result {
                     let is_v35 = ring.starts_with(&protocol::PREFIX_6699);
                     ring.drain(..consumed);
@@ -189,24 +394,31 @@ impl TuyaPlugin {
         match probe_result {
             Ok(Ok((frame, is_v35, nonce34, nonce35))) => {
                 if is_v35 {
-                    let sk = self.finish_v35_negotiation(
-                        stream, key, &nonce35, frame,
-                    ).await?;
+                    let sk = self.finish_v35_negotiation(stream, key, &nonce35, frame).await?;
                     Ok((ProtocolResult::V35(sk), ring))
                 } else {
-                    let sk = self.finish_v34_negotiation(
-                        stream, key, &nonce34, frame,
-                    ).await?;
+                    let sk = self.finish_v34_negotiation(stream, key, &nonce34, frame).await?;
                     Ok((ProtocolResult::V34(sk), ring))
                 }
             }
             Ok(Err(e)) => {
-                debug!("probe error ({e}), falling back to v3.3");
-                Ok((ProtocolResult::V33, ring))
+                if hint.is_some() {
+                    Err(e)
+                } else {
+                    debug!("probe error ({e}), falling back to v3.3");
+                    Ok((ProtocolResult::V33, ring))
+                }
             }
             Err(_elapsed) => {
-                debug!("probe timed out, falling back to v3.3");
-                Ok((ProtocolResult::V33, ring))
+                if hint.is_some() {
+                    Err(TuyaError::Protocol(format!(
+                        "protocol probe timed out for explicit hint {:?}",
+                        hint
+                    )))
+                } else {
+                    debug!("probe timed out, falling back to v3.3");
+                    Ok((ProtocolResult::V33, ring))
+                }
             }
         }
     }
@@ -214,10 +426,10 @@ impl TuyaPlugin {
     /// Complete v3.4 negotiation after receiving the 0x04 response frame.
     async fn finish_v34_negotiation(
         &self,
-        stream:    &mut TcpStream,
-        key:       &[u8; 16],
-        nonce34:   &[u8; 16],
-        resp:      protocol::TuyaFrame,
+        stream:  &mut TcpStream,
+        key:     &[u8; 16],
+        nonce34: &[u8; 16],
+        resp:    protocol::TuyaFrame,
     ) -> Result<[u8; 16], TuyaError> {
         if resp.command != CommandWord::SessKeyNegResp {
             return Err(TuyaError::Protocol(format!(
@@ -225,9 +437,13 @@ impl TuyaPlugin {
                 resp.command
             )));
         }
-
-        // Decrypt response: remote_nonce[16] || HMAC-SHA256(key, local_nonce)[32]
-        let decrypted = cipher::ecb_decrypt_raw(key, &resp.payload)?;
+        if resp.payload.len() < 4 {
+            return Err(TuyaError::Protocol(format!(
+                "SessKeyNegResp payload too short: {} bytes",
+                resp.payload.len()
+            )));
+        }
+        let decrypted = cipher::decrypt(key, &resp.payload[4..])?;
         if decrypted.len() < 48 {
             return Err(TuyaError::Protocol(format!(
                 "SessKeyNegResp decrypted length {} < 48",
@@ -242,8 +458,6 @@ impl TuyaPlugin {
                 "v3.4 session key HMAC verification failed".into(),
             ));
         }
-
-        // Derive session key: ECB_encrypt(key, local_nonce XOR remote_nonce)
         let mut xor_nonces = [0u8; 16];
         for i in 0..16 {
             xor_nonces[i] = nonce34[i] ^ remote_nonce[i];
@@ -251,16 +465,15 @@ impl TuyaPlugin {
         let sk_bytes = cipher::ecb_encrypt_raw(key, &xor_nonces)?;
         let session_key: [u8; 16] = sk_bytes.try_into().unwrap();
 
-        // Send 0x05: HMAC-SHA256(key, remote_nonce), CRC32 trailer
-        let step5_payload = cipher::hmac_sha256(key, &remote_nonce);
+        let step5_hmac = cipher::hmac_sha256(key, &remote_nonce);
+        let enc5 = cipher::encrypt(key, &step5_hmac);
         let finish = protocol::build_frame(
             self.next_seq(),
             CommandWord::SessKeyNegFinish,
-            &step5_payload,
-            TrailerKind::Crc32,
+            &enc5,
+            TrailerKind::Hmac(key),
         );
         stream.write_all(&finish).await?;
-
         Ok(session_key)
     }
 
@@ -278,8 +491,6 @@ impl TuyaPlugin {
                 resp.command
             )));
         }
-
-        // payload is already GCM-decrypted; first 16 bytes = remote_nonce
         if resp.payload.len() < 16 {
             return Err(TuyaError::Protocol(format!(
                 "v3.5 SessKeyNegResp payload too short: {} bytes",
@@ -287,20 +498,14 @@ impl TuyaPlugin {
             )));
         }
         let remote_nonce: [u8; 16] = resp.payload[..16].try_into().unwrap();
-
-        // XOR nonces
         let mut xor_nonces = [0u8; 16];
         for i in 0..16 {
             xor_nonces[i] = nonce35[i] ^ remote_nonce[i];
         }
-
-        // Derive session key: gcm_encrypt(key, nonce35[..12], &[], xor_nonces)[12..28]
-        // (take ciphertext portion = bytes 12–27 of the output)
         let iv35: &[u8; 12] = nonce35[..12].try_into().unwrap();
         let gcm_out     = cipher::gcm_encrypt(key, iv35, &[], &xor_nonces);
         let session_key: [u8; 16] = gcm_out[12..28].try_into().unwrap();
 
-        // Send 0x05: HMAC-SHA256(key, remote_nonce) in a 0x6699 frame
         let step5_payload = cipher::hmac_sha256(key, &remote_nonce);
         let mut rng_iv = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut rng_iv);
@@ -312,68 +517,18 @@ impl TuyaPlugin {
             &rng_iv,
         )?;
         stream.write_all(&finish).await?;
-
         Ok(session_key)
     }
 
-    // ── Data transmission ─────────────────────────────────────────────────────
-
-    async fn send_raw(&self, payload: &[u8], cmd: CommandWord) -> Result<(), TuyaError> {
-        let ecb_key = self.config.key_bytes()?;
-        let seq     = self.next_seq();
-
-        // Hold the lock to read the session keys and build the frame atomically.
-        let frame = {
-            let sk_v35_guard = self.session_key_v35.lock().await;
-            let sk_v34_guard = self.session_key.lock().await;
-
-            if let Some(sk35) = sk_v35_guard.as_ref() {
-                // v3.5: GCM encrypt
-                let mut iv = [0u8; 12];
-                rand::thread_rng().fill_bytes(&mut iv);
-                drop(sk_v34_guard);
-                protocol::build_frame_v35(seq, cmd, payload, sk35, &iv)?
-            } else if let Some(sk34) = sk_v34_guard.as_ref() {
-                // v3.4: CBC encrypt + HMAC trailer
-                let encrypted = cipher::cbc_encrypt(sk34, &[0u8; 16], payload);
-                drop(sk_v35_guard);
-                protocol::build_frame(seq, cmd, &encrypted, TrailerKind::Hmac(sk34))
-            } else {
-                // v3.3: ECB encrypt + CRC32 trailer
-                drop(sk_v35_guard);
-                let ct = cipher::encrypt(&ecb_key, payload);
-                let ct = if protocol::v33_needs_prefix(cmd) {
-                    protocol::v33_prepend_version(&ct)
-                } else {
-                    ct
-                };
-                protocol::build_frame(seq, cmd, &ct, TrailerKind::Crc32)
-            }
-        };
-
-        debug!(
-            device = %self.info.id,
-            seq,
-            cmd = ?cmd,
-            payload_len = payload.len(),
-            "→ tx"
-        );
-
-        let mut guard = self.writer.lock().await;
-        if let Some(w) = guard.as_mut() {
-            w.write_all(&frame).await?;
-        } else {
-            return Err(TuyaError::Offline);
-        }
-        Ok(())
-    }
+    // ── Command → DPS mapping ─────────────────────────────────────────────────
 
     fn command_to_dps(&self, cmd: &DeviceCommand) -> Option<Value> {
         let dm = &self.config.dp_map;
         match cmd {
-            DeviceCommand::SetPower(on) => Some(json!({
-                dm.power_dp.to_string(): on
-            })),
+            DeviceCommand::SetPower(on) => {
+                let target_dp = dm.light_power_dp.unwrap_or(dm.power_dp);
+                Some(json!({ target_dp.to_string(): on }))
+            }
             DeviceCommand::SetBrightness(v) => {
                 let (dp, val) = dm.brightness_dp_value(*v);
                 Some(json!({ dp.to_string(): val }))
@@ -398,16 +553,55 @@ impl TuyaPlugin {
                 dp.to_string(): value
             })),
             DeviceCommand::SendIr { head, key } => dm.ir_dps(head.as_deref(), key),
+            DeviceCommand::SetFanSpeed(speed)  => dm.fan_speed_dps(*speed),
+            DeviceCommand::SetLight { power, brightness, color_temp, rgb, color_mode } => {
+                let dps = dm.patch_light_dps(
+                    *power,
+                    *brightness,
+                    *color_temp,
+                    *rgb,
+                    color_mode.as_deref(),
+                );
+                // If nothing was set (all None), return None to skip the command.
+                if dps.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+                    None
+                } else {
+                    Some(dps)
+                }
+            }
         }
     }
-}
 
-// ─── Protocol detection result ────────────────────────────────────────────────
+    // ── Diagnostic helper ─────────────────────────────────────────────────────
 
-enum ProtocolResult {
-    V33,
-    V34([u8; 16]),
-    V35([u8; 16]),
+    /// Send a raw DP map directly to the device.  Used by the probe tool.
+    pub async fn send_dps(&self, dps: &HashMap<String, Value>) -> PluginResult<()> {
+        let t = (Self::epoch_ms() / 1000).to_string();
+        let payload = json!({
+            "devId": self.config.tuya_id,
+            "uid":   self.config.tuya_id,
+            "t":     t,
+            "dps":   dps,
+        })
+        .to_string();
+
+        let id = self.info.id;
+        let mut conn = self.open_connection().await.map_err(PluginError::from)?;
+        let ctrl = conn.control_cmd();
+        conn.send(ctrl, payload.as_bytes())
+            .await
+            .map_err(PluginError::from)?;
+
+        // Best-effort: receive the echo-back and push to bus.
+        let dp_map = self.config.dp_map.clone();
+        let bus_tx = self.bus_tx.clone();
+        if let Ok(Ok((state, raw_dps))) =
+            timeout(Duration::from_secs(1), conn.recv_state(&dp_map, id)).await
+        {
+            let _ = bus_tx.send(StateChangeEvent { device_id: id, state, raw_dps });
+        }
+        Ok(())
+    }
 }
 
 // ─── DevicePlugin impl ────────────────────────────────────────────────────────
@@ -419,245 +613,32 @@ impl DevicePlugin for TuyaPlugin {
     fn capabilities(&self) -> &[Capability] { &self.info.capabilities }
 
     fn protocol(&self) -> &str {
-        if self.detected_as_v35.load(Ordering::Acquire) {
-            "tuya_local_3.5"
-        } else if self.detected_as_v34.load(Ordering::Acquire) {
-            "tuya_local_3.4"
-        } else {
-            "tuya_local_3.3"
+        match self.last_version.load(Ordering::Acquire) {
+            5 => "tuya_local_3.5",
+            4 => "tuya_local_3.4",
+            3 => "tuya_local_3.3",
+            _ => "tuya_local",
         }
     }
 
-    async fn connect(&self) -> PluginResult<()> {
-        let addr = format!("{}:{}", self.config.ip, self.config.port);
-        debug!(device = %self.info.id, %addr, "connecting");
+    /// No-op — connections are opened on demand per operation.
+    async fn connect(&self) -> PluginResult<()> { Ok(()) }
 
-        let mut stream = TcpStream::connect(&addr)
-            .await
-            .map_err(|e| PluginError::Unreachable(e.to_string()))?;
-        stream.set_nodelay(true)?;
+    /// Always reports connected — the registry supervisor uses `poll_state` health instead.
+    fn is_connected(&self) -> bool { true }
 
-        let key = self.config.key_bytes().map_err(PluginError::from)?;
-
-        // Reset state from any previous connection.
-        self.detected_as_v34.store(false, Ordering::Release);
-        self.detected_as_v35.store(false, Ordering::Release);
-        *self.session_key.lock().await     = None;
-        *self.session_key_v35.lock().await = None;
-
-        // ── Auto-detect protocol (or use hint from discovery) ─────────────────
-        let hint = self.config.protocol_hint.as_deref();
-        let (proto_result, leftover) = self
-            .probe_protocol(&mut stream, &key, hint)
-            .await
-            .map_err(PluginError::from)?;
-
-        // Session key values captured for the reader task (by value, not Arc).
-        let session_key_v34_opt: Option<[u8; 16]>;
-        let session_key_v35_opt: Option<[u8; 16]>;
-        let is_v35: bool;
-
-        match proto_result {
-            ProtocolResult::V35(sk) => {
-                info!(device = %self.info.id, "detected v3.5");
-                *self.session_key_v35.lock().await = Some(sk);
-                self.detected_as_v35.store(true, Ordering::Release);
-                session_key_v34_opt = None;
-                session_key_v35_opt = Some(sk);
-                is_v35 = true;
-            }
-            ProtocolResult::V34(sk) => {
-                info!(device = %self.info.id, "detected v3.4");
-                *self.session_key.lock().await = Some(sk);
-                self.detected_as_v34.store(true, Ordering::Release);
-                session_key_v34_opt = Some(sk);
-                session_key_v35_opt = None;
-                is_v35 = false;
-            }
-            ProtocolResult::V33 => {
-                debug!(device = %self.info.id, "using v3.3");
-                session_key_v34_opt = None;
-                session_key_v35_opt = None;
-                is_v35 = false;
-            }
-        }
-
-        let (mut reader, writer) = stream.into_split();
-        *self.writer.lock().await = Some(writer);
-        self.connected.store(true, Ordering::Release);
-
-        // ── Spawn reader task ─────────────────────────────────────────────────
-        let plugin_id     = self.info.id;
-        let bus_tx        = self.bus_tx.clone();
-        let writer_ref    = self.writer.clone();
-        let connected_ref = self.connected.clone();
-        let dp_map        = self.config.dp_map.clone();
-        let ecb_key       = key; // Copy — used for v3.3 decryption
-
-        tokio::spawn(async move {
-            let mut buf:  Vec<u8> = vec![0u8; 4096];
-            let mut ring: Vec<u8> = leftover; // start with any bytes read during probe
-
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => {
-                        warn!(device = %plugin_id, "connection closed by device");
-                        *writer_ref.lock().await = None;
-                        connected_ref.store(false, Ordering::Release);
-                        break;
-                    }
-                    Ok(n) => {
-                        ring.extend_from_slice(&buf[..n]);
-                        loop {
-                            let parse_result = if is_v35 {
-                                if let Some(sk) = &session_key_v35_opt {
-                                    protocol::parse_frame_any(&ring, Some((sk, TrailerKind::Crc32)))
-                                } else {
-                                    break;
-                                }
-                            } else if let Some(sk) = &session_key_v34_opt {
-                                protocol::parse_frame_any(&ring, Some((sk, TrailerKind::Hmac(sk))))
-                            } else {
-                                protocol::parse_frame_any(&ring, None)
-                            };
-
-                            match parse_result {
-                                Ok(Some((frame, consumed))) => {
-                                    ring.drain(..consumed);
-
-                                    debug!(
-                                        device = %plugin_id,
-                                        seq = frame.seq_no,
-                                        cmd = ?frame.command,
-                                        payload_len = frame.payload.len(),
-                                        "← rx"
-                                    );
-
-                                    // v3.5 frames: payload is already GCM-decrypted JSON.
-                                    // v3.3/v3.4 frames: payload = retcode(4) [+ version header] + ciphertext.
-                                    let plain: Vec<u8> = if is_v35 {
-                                        if frame.payload.is_empty() { continue; }
-                                        frame.payload.to_vec()
-                                    } else {
-                                        if frame.payload.len() <= 4 { continue; }
-                                        let rc = u32::from_be_bytes(
-                                            frame.payload[0..4].try_into().unwrap()
-                                        );
-                                        if rc != 0 {
-                                            debug!(device = %plugin_id, return_code = rc, "non-zero return code");
-                                        }
-                                        let after_rc = &frame.payload[4..];
-
-                                        // Strip optional v3.3 version header.
-                                        let enc = if after_rc.len() >= 15
-                                            && after_rc.starts_with(b"3.3")
-                                        {
-                                            &after_rc[15..]
-                                        } else {
-                                            after_rc
-                                        };
-
-                                        if enc.is_empty() { continue; }
-                                        if enc.len() % 16 != 0 {
-                                            debug!(device = %plugin_id, len = enc.len(), "ciphertext not block-aligned, skipping");
-                                            continue;
-                                        }
-
-                                        match session_key_v34_opt {
-                                            Some(sk) => match cipher::cbc_decrypt(&sk, &[0u8; 16], enc) {
-                                                Ok(p)  => p,
-                                                Err(e) => {
-                                                    debug!(device = %plugin_id, "cbc decrypt failed ({e})");
-                                                    enc.to_vec()
-                                                }
-                                            },
-                                            None => match cipher::decrypt(&ecb_key, enc) {
-                                                Ok(p)  => p,
-                                                Err(e) => {
-                                                    debug!(device = %plugin_id, "ecb decrypt failed ({e})");
-                                                    enc.to_vec()
-                                                }
-                                            },
-                                        }
-                                    };
-
-                                    match serde_json::from_slice::<Value>(&plain) {
-                                        Err(_) => {
-                                            debug!(device = %plugin_id, cmd = ?frame.command, "← non-JSON payload");
-                                        }
-                                        Ok(val) => {
-                                            match val.get("dps").and_then(Value::as_object) {
-                                                None => {
-                                                    debug!(device = %plugin_id, payload = %val, "← JSON without dps");
-                                                }
-                                                Some(dps_obj) => {
-                                                    let dps: HashMap<String, Value> =
-                                                        dps_obj.clone().into_iter().collect();
-
-                                                    debug!(device = %plugin_id, dps = %val["dps"], "← dps update");
-
-                                                    let mut state = DeviceState {
-                                                        device_id:     plugin_id,
-                                                        online:        true,
-                                                        updated_at_ms: SystemTime::now()
-                                                            .duration_since(SystemTime::UNIX_EPOCH)
-                                                            .unwrap_or_default()
-                                                            .as_millis() as u64,
-                                                        power:        None,
-                                                        brightness:   None,
-                                                        color_temp_k: None,
-                                                        rgb:          None,
-                                                        switches:     HashMap::new(),
-                                                    };
-                                                    dp_map.apply_dps(&dps, &mut state);
-                                                    let _ = bus_tx.send(StateChangeEvent {
-                                                        device_id: plugin_id,
-                                                        state,
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(None) => break,
-                                Err(e) => {
-                                    error!(device = %plugin_id, "frame parse error: {e}");
-                                    ring.clear();
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!(device = %plugin_id, "read error: {e}");
-                        *writer_ref.lock().await = None;
-                        connected_ref.store(false, Ordering::Release);
-                        break;
-                    }
-                }
-            }
-        });
-
-        debug!(device = %self.info.id, "connected");
-        Ok(())
-    }
-
-    fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Acquire)
-    }
-
-    async fn disconnect(&self) {
-        self.connected.store(false, Ordering::Release);
-        *self.writer.lock().await        = None;
-        *self.session_key.lock().await   = None;
-        *self.session_key_v35.lock().await = None;
-        self.detected_as_v34.store(false, Ordering::Release);
-        self.detected_as_v35.store(false, Ordering::Release);
-        info!(device = %self.info.id, "disconnected");
-    }
+    /// No-op — ephemeral connections close themselves on drop.
+    async fn disconnect(&self) {}
 
     async fn poll_state(&self) -> PluginResult<DeviceState> {
-        let mut rx = self.bus_tx.subscribe();
+        let id = self.info.id;
+        let mut conn = match self.open_connection().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(device = %id, "open_connection failed: {e}");
+                return Ok(offline_state(id));
+            }
+        };
 
         let t = (Self::epoch_ms() / 1000).to_string();
         let payload = json!({
@@ -668,34 +649,38 @@ impl DevicePlugin for TuyaPlugin {
         })
         .to_string();
 
-        // v3.4+ devices prefer DpQueryNew (0x0D) for status queries.
-        let cmd = if self.detected_as_v34.load(Ordering::Acquire)
-            || self.detected_as_v35.load(Ordering::Acquire)
-        {
-            CommandWord::DpQueryNew
-        } else {
-            CommandWord::DpQuery
+        // v3.5 uses DpQueryNew (0x10); v3.3 and v3.4 use DpQuery (0x0A).
+        let cmd = match &conn.proto {
+            ProtocolResult::V35(_) => CommandWord::DpQueryNew,
+            _                      => CommandWord::DpQuery,
         };
 
-        self.send_raw(payload.as_bytes(), cmd)
-            .await
-            .map_err(PluginError::from)?;
+        if let Err(e) = conn.send(cmd, payload.as_bytes()).await {
+            debug!(device = %id, "send failed: {e}");
+            return Ok(offline_state(id));
+        }
 
-        let id    = self.info.id;
-        let state = timeout(Duration::from_secs(2), async move {
-            loop {
-                match rx.recv().await {
-                    Ok(ev) if ev.device_id == id => return ev.state,
-                    Ok(_)                        => continue,
-                    Err(_)                       => break,
-                }
+        let dp_map = self.config.dp_map.clone();
+        let bus_tx = self.bus_tx.clone();
+
+        match timeout(Duration::from_secs(2), conn.recv_state(&dp_map, id)).await {
+            Ok(Ok((state, raw_dps))) => {
+                let _ = bus_tx.send(StateChangeEvent {
+                    device_id: id,
+                    state: state.clone(),
+                    raw_dps,
+                });
+                Ok(state)
             }
-            offline_state(id)
-        })
-        .await
-        .unwrap_or_else(|_| offline_state(id));
-
-        Ok(state)
+            Ok(Err(e)) => {
+                tracing::error!(device = %id, "recv_state error: {e}");
+                Ok(offline_state(id))
+            }
+            Err(_elapsed) => {
+                debug!(device = %id, "poll_state timeout");
+                Ok(offline_state(id))
+            }
+        }
     }
 
     async fn execute_command(&self, cmd: DeviceCommand) -> PluginResult<()> {
@@ -714,9 +699,22 @@ impl DevicePlugin for TuyaPlugin {
 
         info!(device = %self.info.id, cmd = ?cmd, dps = %dps, "→ control");
 
-        self.send_raw(payload.as_bytes(), CommandWord::Control)
+        let id = self.info.id;
+        let mut conn = self.open_connection().await.map_err(PluginError::from)?;
+        let ctrl = conn.control_cmd();
+        conn.send(ctrl, payload.as_bytes())
             .await
-            .map_err(PluginError::from)
+            .map_err(PluginError::from)?;
+
+        // Best-effort: receive the state echo-back and push to bus.
+        let dp_map = self.config.dp_map.clone();
+        let bus_tx = self.bus_tx.clone();
+        if let Ok(Ok((state, raw_dps))) =
+            timeout(Duration::from_secs(1), conn.recv_state(&dp_map, id)).await
+        {
+            let _ = bus_tx.send(StateChangeEvent { device_id: id, state, raw_dps });
+        }
+        Ok(())
     }
 }
 
@@ -730,6 +728,6 @@ fn offline_state(id: DeviceId) -> DeviceState {
             .unwrap_or_default()
             .as_millis() as u64,
         power: None, brightness: None, color_temp_k: None,
-        rgb: None, switches: HashMap::new(),
+        rgb: None, switches: HashMap::new(), fan_speed: None,
     }
 }

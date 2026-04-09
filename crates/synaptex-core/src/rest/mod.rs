@@ -52,7 +52,7 @@ pub fn mk_router(state: AppState) -> Router {
 fn api_router(state: AppState) -> Router {
     // The api-key bootstrap endpoint is always unauthenticated.
     let open = Router::new()
-        .route("/config/api-key", put(config::put_api_key))
+        .route("/config/api-key", put(config::put_api_key).delete(config::delete_api_key))
         .with_state(state.clone());
 
     // All other endpoints go through the bearer-auth middleware.
@@ -62,8 +62,9 @@ fn api_router(state: AppState) -> Router {
         .route("/config/tuya-cloud", put(config::put_tuya_cloud))
         // Devices
         .route("/devices",           get(devices::list_devices).post(devices::register_device))
-        .route("/devices/:mac",      get(devices::get_device).delete(devices::unregister_device))
-        .route("/devices/:mac/command", post(devices::device_command))
+        .route("/devices/:mac",      get(devices::get_device).patch(devices::patch_device).delete(devices::unregister_device))
+        .route("/devices/:mac/command",      post(devices::device_command))
+        .route("/devices/:mac/debug-config", get(devices::device_debug_config))
         // Groups
         .route("/groups",            get(groups::list_groups).post(groups::create_group))
         .route("/groups/:mac",       patch(groups::patch_group).delete(groups::delete_group))
@@ -89,10 +90,6 @@ fn api_router(state: AppState) -> Router {
             get(pairing::list_cloud_devices))
         .route("/pairing/cloud-devices/:tuya_id",
             get(pairing::get_cloud_device))
-        .route("/pairing/cloud-devices/:tuya_id/probe",
-            post(pairing::probe_device))
-        .route("/pairing/cloud-devices/:tuya_id/reset",
-            post(pairing::reset_device))
         .route("/pairing/import",
             post(pairing::import_cloud_devices))
         .route_layer(middleware::from_fn_with_state(

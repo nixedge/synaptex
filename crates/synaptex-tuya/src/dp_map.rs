@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use synaptex_types::plugin::DeviceState;
+use synaptex_types::{capability::FanSpeed, plugin::DeviceState};
 
 // ─── Color format ─────────────────────────────────────────────────────────────
 
@@ -17,6 +17,17 @@ pub enum ColorFormat {
     /// 12-char hex: `hhhhssssvvvv`
     /// H 0–360 in 4-char hex; S/V 0–1000 in 4-char hex.
     Hsv16,
+}
+
+// ─── Fan speed format ─────────────────────────────────────────────────────────
+
+/// String encoding used by the device's fan_speed DP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FanSpeedFormat {
+    /// String names: `"low"` / `"middle"` / `"high"`.
+    Named,
+    /// Numeric strings: `"1"` (low) / `"2"` (medium) / `"3"` (high).
+    Numeric,
 }
 
 // ─── DpMap ────────────────────────────────────────────────────────────────────
@@ -45,10 +56,15 @@ pub struct DpMap {
     pub color_temp_min:   u16,
     /// Native colour-temp range (device maximum, warmer).
     pub color_temp_max:   u16,
-    /// Fan speed DP (string enum: "auto" | "low" | "middle" | "high").
+    /// Fan speed DP (string enum, see `fan_speed_format` for encoding).
     pub fan_speed_dp:     Option<u16>,
     /// Fan mode DP (string enum: "cold" | "hot" | "dehumidify").
     pub fan_mode_dp:      Option<u16>,
+    /// Separate light on/off DP for fan+light combos.
+    /// When `Some`, `SetPower` targets this DP (the light) and `power_dp` is the fan's on/off.
+    pub light_power_dp:   Option<u16>,
+    /// String encoding for `fan_speed_dp` values.
+    pub fan_speed_format: FanSpeedFormat,
     /// IR transceiver send DP.
     pub ir_send_dp:       Option<u16>,
     /// IR control type (1 = type-1 JSON blob, 2 = type-2 multi-DP).
@@ -72,10 +88,12 @@ impl DpMap {
             brightness_max:  255,
             color_temp_min:  0,
             color_temp_max:  255,
-            fan_speed_dp:    None,
-            fan_mode_dp:     None,
-            ir_send_dp:      None,
-            ir_control_type: None,
+            fan_speed_dp:     None,
+            fan_mode_dp:      None,
+            light_power_dp:   None,
+            fan_speed_format: FanSpeedFormat::Named,
+            ir_send_dp:       None,
+            ir_control_type:  None,
         }
     }
 
@@ -93,10 +111,12 @@ impl DpMap {
             brightness_max:  1000,
             color_temp_min:  0,
             color_temp_max:  1000,
-            fan_speed_dp:    None,
-            fan_mode_dp:     None,
-            ir_send_dp:      None,
-            ir_control_type: None,
+            fan_speed_dp:     None,
+            fan_mode_dp:      None,
+            light_power_dp:   None,
+            fan_speed_format: FanSpeedFormat::Named,
+            ir_send_dp:       None,
+            ir_control_type:  None,
         }
     }
 
@@ -113,10 +133,12 @@ impl DpMap {
             brightness_max:  1000,
             color_temp_min:  0,
             color_temp_max:  1000,
-            fan_speed_dp:    None,
-            fan_mode_dp:     None,
-            ir_send_dp:      None,
-            ir_control_type: None,
+            fan_speed_dp:     None,
+            fan_mode_dp:      None,
+            light_power_dp:   None,
+            fan_speed_format: FanSpeedFormat::Named,
+            ir_send_dp:       None,
+            ir_control_type:  None,
         }
     }
 
@@ -133,10 +155,59 @@ impl DpMap {
             brightness_max:  1000,
             color_temp_min:  0,
             color_temp_max:  1000,
-            fan_speed_dp:    Some(3),
-            fan_mode_dp:     Some(4),
-            ir_send_dp:      None,
-            ir_control_type: None,
+            fan_speed_dp:     Some(3),
+            fan_mode_dp:      Some(4),
+            light_power_dp:   None,
+            fan_speed_format: FanSpeedFormat::Named,
+            ir_send_dp:       None,
+            ir_control_type:  None,
+        }
+    }
+
+    /// Ceiling fan with dimmable CCT light (most common Tuya layout).
+    /// fan_power=1, fan_speed=3 (str), fan_mode=4 (str),
+    /// light_power=9 (bool), brightness=22 (10–1000), color_temp=23 (0–1000).
+    pub fn fan_light() -> Self {
+        Self {
+            power_dp:        1,
+            brightness_dp:   Some(22),
+            color_temp_dp:   Some(23),
+            color_dp:        None,
+            mode_dp:         None,
+            color_format:    ColorFormat::Hsv16,
+            brightness_min:  10,
+            brightness_max:  1000,
+            color_temp_min:  0,
+            color_temp_max:  1000,
+            fan_speed_dp:     Some(3),
+            fan_mode_dp:      Some(4),
+            light_power_dp:   Some(9),
+            fan_speed_format: FanSpeedFormat::Named,
+            ir_send_dp:       None,
+            ir_control_type:  None,
+        }
+    }
+
+    /// Ceiling fan with on/off-only light (no dimmer).
+    /// fan_power=1, fan_speed=3 (str), fan_mode=4 (str), light_power=9 (bool).
+    pub fn fan_light_simple() -> Self {
+        Self {
+            power_dp:        1,
+            brightness_dp:   None,
+            color_temp_dp:   None,
+            color_dp:        None,
+            mode_dp:         None,
+            color_format:    ColorFormat::Hsv16,
+            brightness_min:  0,
+            brightness_max:  1000,
+            color_temp_min:  0,
+            color_temp_max:  1000,
+            fan_speed_dp:     Some(3),
+            fan_mode_dp:      Some(4),
+            light_power_dp:   Some(9),
+            fan_speed_format: FanSpeedFormat::Named,
+            ir_send_dp:       None,
+            ir_control_type:  None,
         }
     }
 
@@ -153,10 +224,12 @@ impl DpMap {
             brightness_max:  1000,
             color_temp_min:  0,
             color_temp_max:  1000,
-            fan_speed_dp:    None,
-            fan_mode_dp:     None,
-            ir_send_dp:      Some(201),
-            ir_control_type: Some(1),
+            fan_speed_dp:     None,
+            fan_mode_dp:      None,
+            light_power_dp:   None,
+            fan_speed_format: FanSpeedFormat::Named,
+            ir_send_dp:       Some(201),
+            ir_control_type:  Some(1),
         }
     }
 
@@ -173,10 +246,35 @@ impl DpMap {
             brightness_max:  1000,
             color_temp_min:  0,
             color_temp_max:  1000,
-            fan_speed_dp:    None,
-            fan_mode_dp:     None,
-            ir_send_dp:      Some(1),
-            ir_control_type: Some(2),
+            fan_speed_dp:     None,
+            fan_mode_dp:      None,
+            light_power_dp:   None,
+            fan_speed_format: FanSpeedFormat::Named,
+            ir_send_dp:       Some(1),
+            ir_control_type:  Some(2),
+        }
+    }
+
+    /// Ceiling fan with on/off-only light, numeric speed encoding ("1"/"2"/"3").
+    /// fan_power=1, fan_speed=3 (numeric str), fan_mode=4 (str), light_power=9 (bool).
+    pub fn fan_light_numeric() -> Self {
+        Self {
+            power_dp:        1,
+            brightness_dp:   None,
+            color_temp_dp:   None,
+            color_dp:        None,
+            mode_dp:         None,
+            color_format:    ColorFormat::Hsv16,
+            brightness_min:  0,
+            brightness_max:  1000,
+            color_temp_min:  0,
+            color_temp_max:  1000,
+            fan_speed_dp:     Some(3),
+            fan_mode_dp:      Some(4),
+            light_power_dp:   Some(9),
+            fan_speed_format: FanSpeedFormat::Numeric,
+            ir_send_dp:       None,
+            ir_control_type:  None,
         }
     }
 
@@ -186,8 +284,11 @@ impl DpMap {
             "bulb_a"  => Self::tuya_bulb_a(),
             "bulb_b"  => Self::tuya_bulb_b(),
             "switch"  => Self::switch(),
-            "fan"     => Self::fan(),
-            "ir1"     => Self::ir_type1(),
+            "fan"                => Self::fan(),
+            "fan_light"          => Self::fan_light(),
+            "fan_light_simple"   => Self::fan_light_simple(),
+            "fan_light_numeric"  => Self::fan_light_numeric(),
+            "ir1"              => Self::ir_type1(),
             "ir2"     => Self::ir_type2(),
             _         => Self::default(),
         }
@@ -206,7 +307,19 @@ impl DpMap {
     /// Merge a JSON `dps` object into `DeviceState`.
     pub fn apply_dps(&self, dps: &HashMap<String, Value>, state: &mut DeviceState) {
         if let Some(v) = dps.get(&self.power_dp.to_string()) {
-            state.power = v.as_bool();
+            // power_dp is the light when no separate light_power_dp; otherwise it's the fan main power.
+            if self.light_power_dp.is_none() {
+                state.power = v.as_bool();
+            }
+            // Fan off when fan power cut.
+            if self.fan_speed_dp.is_some() && v.as_bool() == Some(false) {
+                state.fan_speed = Some(FanSpeed::Off);
+            }
+        }
+        if let Some(dp) = self.light_power_dp {
+            if let Some(v) = dps.get(&dp.to_string()) {
+                state.power = v.as_bool();
+            }
         }
         if let Some(dp) = self.brightness_dp {
             if let Some(v) = dps.get(&dp.to_string()).and_then(Value::as_u64) {
@@ -222,6 +335,50 @@ impl DpMap {
             if let Some(hex) = dps.get(&dp.to_string()).and_then(Value::as_str) {
                 state.rgb = parse_color_hex(hex, self.color_format);
             }
+        }
+        if let Some(dp) = self.fan_speed_dp {
+            if let Some(s) = dps.get(&dp.to_string()).and_then(Value::as_str) {
+                state.fan_speed = Some(match self.fan_speed_format {
+                    FanSpeedFormat::Named => match s {
+                        "low"    => FanSpeed::Low,
+                        "middle" => FanSpeed::Medium,
+                        "high"   => FanSpeed::High,
+                        _        => FanSpeed::Low,
+                    },
+                    FanSpeedFormat::Numeric => match s {
+                        "1" => FanSpeed::Low,
+                        "2" => FanSpeed::Medium,
+                        "3" => FanSpeed::High,
+                        _   => FanSpeed::Low,
+                    },
+                });
+            }
+        }
+    }
+
+    /// Build a `dps` JSON value for `SetFanSpeed`.
+    /// `Off` cuts power; other speeds set power on and the speed DP.
+    /// Returns `None` when no `fan_speed_dp` is configured.
+    pub fn fan_speed_dps(&self, speed: FanSpeed) -> Option<Value> {
+        let speed_dp = self.fan_speed_dp?;
+        let (low, medium, high) = match self.fan_speed_format {
+            FanSpeedFormat::Named   => ("low", "middle", "high"),
+            FanSpeedFormat::Numeric => ("1",   "2",      "3"),
+        };
+        match speed {
+            FanSpeed::Off    => Some(json!({ self.power_dp.to_string(): false })),
+            FanSpeed::Low    => Some(json!({
+                self.power_dp.to_string(): true,
+                speed_dp.to_string(): low,
+            })),
+            FanSpeed::Medium => Some(json!({
+                self.power_dp.to_string(): true,
+                speed_dp.to_string(): medium,
+            })),
+            FanSpeed::High   => Some(json!({
+                self.power_dp.to_string(): true,
+                speed_dp.to_string(): high,
+            })),
         }
     }
 
@@ -251,6 +408,80 @@ impl DpMap {
             map.insert(mode.to_string(), Value::String("colour".into()));
         }
         Some(Value::Object(map))
+    }
+
+    /// Build a `dps` JSON value for `SetLight` — a patch-style command that
+    /// only writes DPs for the fields that are `Some`.
+    ///
+    /// Auto-derived mode: if `rgb` is `Some` and `color_mode` is `None`, the
+    /// mode DP is set to `"colour"`.  If only brightness/color_temp are `Some`
+    /// and `color_mode` is `None`, the mode DP is set to `"white"`.
+    /// An explicit `color_mode` overrides auto-derivation.
+    pub fn patch_light_dps(
+        &self,
+        power:      Option<bool>,
+        brightness: Option<u16>,
+        color_temp: Option<u16>,
+        rgb:        Option<(u8, u8, u8)>,
+        color_mode: Option<&str>,
+    ) -> Value {
+        let mut map = serde_json::Map::new();
+
+        // Power (use light_power_dp for fan+light combos, power_dp for plain bulbs).
+        if let Some(on) = power {
+            let target_dp = self.light_power_dp.unwrap_or(self.power_dp);
+            map.insert(target_dp.to_string(), Value::Bool(on));
+        }
+
+        // RGB color
+        if let Some((r, g, b)) = rgb {
+            if let Some(color_dp) = self.color_dp {
+                let hex = match self.color_format {
+                    ColorFormat::Rgb8  => rgb_to_hex_rgb8(r, g, b),
+                    ColorFormat::Hsv16 => rgb_to_hex_hsv16(r, g, b),
+                };
+                map.insert(color_dp.to_string(), Value::String(hex));
+            }
+            // Auto-set mode to "colour" when setting RGB (unless overridden).
+            if color_mode.is_none() {
+                if let Some(mode_dp) = self.mode_dp {
+                    map.insert(mode_dp.to_string(), Value::String("colour".into()));
+                }
+            }
+        }
+
+        // Brightness
+        if let Some(bri) = brightness {
+            let (dp, val) = self.brightness_dp_value(bri);
+            map.insert(dp.to_string(), Value::Number(val.into()));
+            // Auto-set mode to "white" when setting brightness (no rgb, no override).
+            if color_mode.is_none() && rgb.is_none() {
+                if let Some(mode_dp) = self.mode_dp {
+                    map.insert(mode_dp.to_string(), Value::String("white".into()));
+                }
+            }
+        }
+
+        // Color temperature
+        if let Some(k) = color_temp {
+            let (dp, val) = self.color_temp_dp_value(k);
+            map.insert(dp.to_string(), Value::Number(val.into()));
+            // Auto-set mode to "white" when setting color_temp (no rgb, no override).
+            if color_mode.is_none() && rgb.is_none() {
+                if let Some(mode_dp) = self.mode_dp {
+                    map.insert(mode_dp.to_string(), Value::String("white".into()));
+                }
+            }
+        }
+
+        // Explicit color_mode always wins.
+        if let Some(mode) = color_mode {
+            if let Some(mode_dp) = self.mode_dp {
+                map.insert(mode_dp.to_string(), Value::String(mode.into()));
+            }
+        }
+
+        Value::Object(map)
     }
 
     /// Build a `dps` JSON value for `SendIr`.
@@ -292,6 +523,9 @@ impl DpMap {
     pub fn capabilities(&self) -> Vec<synaptex_types::capability::Capability> {
         use synaptex_types::capability::Capability;
         let mut caps = vec![Capability::Power];
+        if self.light_power_dp.is_some() {
+            caps.push(Capability::Light);
+        }
         if self.brightness_dp.is_some() {
             caps.push(Capability::Dimmer { min: 0, max: 1000 });
         }

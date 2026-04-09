@@ -123,26 +123,45 @@ impl RouterClient {
 
 // ─── Discovery loop ───────────────────────────────────────────────────────────
 
-/// If the registered `TuyaDeviceConfig` for `tuya_id` has `protocol_hint == None`,
-/// set it to `version` and re-save.  No-op for unknown or already-hinted devices.
-fn backfill_protocol_hint(trees: &Trees, tuya_id: &str, version: &str) {
+/// Sync router-observed fields back into the stored `TuyaDeviceConfig`:
+/// - `protocol_version` is set when it was previously `None`
+/// - `ip` is updated whenever it differs from the router-observed IP
+///
+/// No-op for unknown tuya_ids.
+fn sync_device_from_router(trees: &Trees, tuya_id: &str, version: &str, new_ip: std::net::Ipv4Addr) {
     let result = (|| -> anyhow::Result<()> {
+        let new_ip_addr = std::net::IpAddr::V4(new_ip);
         for item in trees.configs.iter() {
             let (k, v) = item?;
             if let Ok(PluginConfig::Tuya(mut cfg)) = postcard::from_bytes::<PluginConfig>(&v) {
-                if cfg.tuya_id == tuya_id && cfg.protocol_hint.is_none() {
-                    cfg.protocol_hint = Some(version.to_string());
+                if cfg.tuya_id != tuya_id {
+                    continue;
+                }
+                let mut changed = false;
+
+                if cfg.protocol_version.is_none() && !version.is_empty() {
+                    cfg.protocol_version = Some(version.to_string());
+                    changed = true;
+                    tracing::info!(tuya_id, version, "backfilled protocol_version from router");
+                }
+
+                if cfg.ip != new_ip_addr {
+                    tracing::info!(tuya_id, old_ip = %cfg.ip, new_ip = %new_ip_addr, "updating device IP from router");
+                    cfg.ip = new_ip_addr;
+                    changed = true;
+                }
+
+                if changed {
                     let new_bytes = postcard::to_allocvec(&PluginConfig::Tuya(cfg))?;
                     trees.configs.insert(k, new_bytes)?;
-                    tracing::info!(tuya_id, version, "backfilled protocol_hint from router");
-                    return Ok(());
                 }
+                return Ok(());
             }
         }
         Ok(())
     })();
     if let Err(e) = result {
-        tracing::warn!(tuya_id, "failed to backfill protocol_hint: {e}");
+        tracing::warn!(tuya_id, "failed to sync device from router: {e}");
     }
 }
 
@@ -185,18 +204,15 @@ pub async fn run_discovery_loop(
                                         "router: device discovered",
                                     );
                                     // Parse the IP — skip on failure rather than crashing.
-                                    if let Ok(ip) = device.ip.parse() {
+                                    if let Ok(ip) = device.ip.parse::<std::net::Ipv4Addr>() {
                                         cache.insert(device.tuya_id.clone(), RouterDiscoveredDevice {
                                             ip,
                                             mac:     device.mac.clone(),
                                             version: device.version.clone(),
                                         });
-                                    }
 
-                                    // Backfill protocol_hint for any registered device
-                                    // whose config still has None (e.g. migrated from old schema).
-                                    if !device.version.is_empty() {
-                                        backfill_protocol_hint(&trees, &device.tuya_id, &device.version);
+                                        // Sync IP + protocol_version back to stored config.
+                                        sync_device_from_router(&trees, &device.tuya_id, &device.version, ip);
                                     }
                                 }
                                 Ok(None) => {

@@ -226,19 +226,8 @@ impl TuyaCloudClient {
         Ok(CloudDevice::from(raw))
     }
 
-    /// Soft reset — returns `Ok(false)` if firmware doesn't support it (error 1106).
-    pub async fn soft_reset(&self, device_id: &str) -> Result<bool> {
-        let path = format!("/v1.0/devices/{device_id}/reset");
-        match self.request::<serde_json::Value>(Method::POST, &path, None::<&()>).await {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                let s = e.to_string();
-                if s.contains("code=1106") { Ok(false) } else { Err(e) }
-            }
-        }
-    }
-
-    /// Full de-registration.
+    /// Cloud de-registration — removes device from cloud account without
+    /// necessarily physically resetting the device hardware.
     pub async fn factory_reset(&self, device_id: &str) -> Result<()> {
         let path = format!("/v1.0/devices/{device_id}");
         self.request::<serde_json::Value>(Method::DELETE, &path, None::<&()>).await?;

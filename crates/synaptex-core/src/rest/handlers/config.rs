@@ -80,6 +80,14 @@ pub async fn put_api_key(
     Json(serde_json::json!({ "key": key })).into_response()
 }
 
+pub async fn delete_api_key(
+    State(state): State<AppState>,
+) -> ApiResult<StatusCode> {
+    db::remove_api_key(&state.trees)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn region_str(r: &TuyaRegion) -> &'static str {
     match r {
         TuyaRegion::Us => "us",

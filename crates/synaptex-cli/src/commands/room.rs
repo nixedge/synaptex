@@ -57,20 +57,24 @@ pub enum RoomCmd {
         id: String,
 
         /// Turn on (true) or off (false).
-        #[arg(long, value_name = "BOOL", group = "cmd")]
+        #[arg(long, value_name = "BOOL")]
         power: Option<bool>,
 
         /// Set brightness 0–1000.
-        #[arg(long, value_name = "0-1000", group = "cmd")]
+        #[arg(long, value_name = "0-1000")]
         brightness: Option<u32>,
 
         /// Set colour temperature in Kelvin.
-        #[arg(long, value_name = "KELVIN", group = "cmd")]
+        #[arg(long, value_name = "KELVIN")]
         color_temp: Option<u32>,
 
         /// Set RGB colour, e.g. `255,128,0`.
-        #[arg(long, value_name = "R,G,B", group = "cmd")]
+        #[arg(long, value_name = "R,G,B")]
         rgb: Option<String>,
+
+        /// Override colour mode: white | colour.
+        #[arg(long, value_name = "MODE")]
+        color_mode: Option<String>,
 
         /// Send an IR code. Format: `HEAD:KEY`.
         #[arg(long, value_name = "HEAD:KEY", group = "cmd")]
@@ -79,6 +83,10 @@ pub enum RoomCmd {
         /// Write a raw DP. Format: `DP:TYPE:VALUE`.
         #[arg(long, value_name = "DP:TYPE:VALUE", group = "cmd")]
         set_dp: Option<String>,
+
+        /// Set fan speed: off | low | medium | high.
+        #[arg(long, value_name = "SPEED", group = "cmd")]
+        fan_speed: Option<String>,
     },
 }
 
@@ -91,8 +99,8 @@ pub async fn run(cmd: RoomCmd, http_url: &str, api_key: Option<&str>) -> Result<
         RoomCmd::Delete { id }                                                    => delete(id, http_url, api_key).await,
         RoomCmd::List                                                             => list(http_url, api_key).await,
         RoomCmd::Get { id }                                                       => get(id, http_url, api_key).await,
-        RoomCmd::Set { id, power, brightness, color_temp, rgb, send_ir, set_dp } =>
-            set(id, power, brightness, color_temp, rgb, send_ir, set_dp, http_url, api_key).await,
+        RoomCmd::Set { id, power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed } =>
+            set(id, power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, http_url, api_key).await,
     }
 }
 
@@ -203,12 +211,14 @@ async fn set(
     brightness: Option<u32>,
     color_temp: Option<u32>,
     rgb:        Option<String>,
+    color_mode: Option<String>,
     send_ir:    Option<String>,
     set_dp:     Option<String>,
+    fan_speed:  Option<String>,
     http_url:   &str,
     api_key:    Option<&str>,
 ) -> Result<()> {
-    let cmd_json = build_command_json(power, brightness, color_temp, rgb, send_ir, set_dp)?;
+    let cmd_json = build_command_json(power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, None)?;
 
     let client = reqwest::Client::new();
     let mut req = client

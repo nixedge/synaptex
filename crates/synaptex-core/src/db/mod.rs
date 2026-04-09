@@ -92,7 +92,7 @@ pub fn load_plugin_config(trees: &Trees, id: &DeviceId) -> Result<Option<PluginC
 
 // ─── Legacy migration types ───────────────────────────────────────────────────
 
-/// `TuyaDeviceConfig` as it existed before the `protocol_hint` field was added.
+/// `TuyaDeviceConfig` as it existed before the `protocol_version` field was added.
 /// Used as a fallback deserializer for DB entries written by older builds.
 #[derive(serde::Deserialize)]
 struct TuyaDeviceConfigV0 {
@@ -122,7 +122,7 @@ impl From<PluginConfigV0> for PluginConfig {
                 local_key:     t.local_key,
                 dp_profile:    t.dp_profile,
                 dp_map:        t.dp_map,
-                protocol_hint: None,
+                protocol_version: None,
             }),
             PluginConfigV0::Group(g) => PluginConfig::Group(g),
         }
@@ -132,7 +132,7 @@ impl From<PluginConfigV0> for PluginConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Load all `PluginConfig` entries from the `configs` tree.
-/// Entries written by older builds (missing `protocol_hint`) are migrated
+/// Entries written by older builds (missing `protocol_version`) are migrated
 /// in-place on first load.
 pub fn load_all_plugin_configs(trees: &Trees) -> Result<Vec<PluginConfig>> {
     let mut configs = Vec::new();
@@ -313,15 +313,7 @@ pub fn get_api_key(trees: &Trees) -> Result<Option<String>> {
     get_str(&trees.config, KEY_API_KEY)
 }
 
-pub fn save_probe_result(trees: &Trees, product_id: &str, supported: bool) -> Result<()> {
-    let encoded = postcard::to_allocvec(&supported)?;
-    trees.probe_cache.insert(product_id.as_bytes(), encoded)?;
+pub fn remove_api_key(trees: &Trees) -> Result<()> {
+    trees.config.remove(KEY_API_KEY)?;
     Ok(())
-}
-
-pub fn get_probe_result(trees: &Trees, product_id: &str) -> Result<Option<bool>> {
-    match trees.probe_cache.get(product_id.as_bytes())? {
-        Some(bytes) => Ok(Some(postcard::from_bytes(&bytes)?)),
-        None        => Ok(None),
-    }
 }

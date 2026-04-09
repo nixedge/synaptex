@@ -14,6 +14,9 @@ pub enum ConfigCmd {
         key: Option<String>,
     },
 
+    /// Clear the REST API key, reverting to open/dev mode.
+    UnsetApiKey,
+
     /// Configure Tuya Cloud credentials.
     SetTuyaCloud {
         #[arg(long)]
@@ -67,6 +70,19 @@ pub async fn run(cmd: ConfigCmd, http_url: &str, api_key: Option<&str>) -> Resul
             let val: serde_json::Value = serde_json::from_str(&text)
                 .unwrap_or(serde_json::Value::String(text.clone()));
             println!("{}", serde_json::to_string_pretty(&val)?);
+        }
+
+        ConfigCmd::UnsetApiKey => {
+            let resp = auth!(client.delete(format!("{http_url}/api/v1/config/api-key")))
+                .send()
+                .await
+                .context("DELETE /api/v1/config/api-key")?;
+            if resp.status().is_success() {
+                println!("API key cleared — daemon is now in open/dev mode.");
+            } else {
+                let text = resp.text().await?;
+                anyhow::bail!("server error: {text}");
+            }
         }
 
         ConfigCmd::SetTuyaCloud { client_id, client_secret, region, seed_device_id } => {

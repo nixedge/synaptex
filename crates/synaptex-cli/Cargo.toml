@@ -9,8 +9,11 @@ name = "synaptex-cli"
 path = "src/main.rs"
 
 [dependencies]
-tokio      = { workspace = true }
-clap       = { workspace = true }
-anyhow     = { workspace = true }
-reqwest    = { workspace = true }
-serde_json = { workspace = true }
+tokio          = { workspace = true }
+clap           = { workspace = true }
+anyhow         = { workspace = true }
+reqwest        = { workspace = true }
+serde_json     = { workspace = true }
+synaptex-types      = { path = "../synaptex-types" }
+synaptex-tuya       = { path = "../synaptex-tuya" }
+tracing-subscriber  = { workspace = true }

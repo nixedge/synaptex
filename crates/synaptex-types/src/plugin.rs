@@ -6,7 +6,7 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 
 use crate::{
-    capability::{Capability, DeviceCommand},
+    capability::{Capability, DeviceCommand, FanSpeed},
     device::DeviceId,
 };
 
@@ -32,6 +32,7 @@ pub struct DeviceState {
     pub rgb:          Option<(u8, u8, u8)>,
     /// Multi-switch state: index → on/off.
     pub switches:     HashMap<u8, bool>,
+    pub fan_speed:    Option<FanSpeed>,
 }
 
 // ─── Event Bus ────────────────────────────────────────────────────────────────
@@ -42,6 +43,9 @@ pub struct DeviceState {
 pub struct StateChangeEvent {
     pub device_id: DeviceId,
     pub state:     DeviceState,
+    /// Raw DP key→value map as received from the device.
+    /// Empty for synthetic events (e.g. group aggregation).
+    pub raw_dps:   std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Sender half of the internal state broadcast bus.

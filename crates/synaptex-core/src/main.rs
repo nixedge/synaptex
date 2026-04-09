@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
                         tuya_id:       tuya_cfg.tuya_id.clone(),
                         local_key:     tuya_cfg.local_key.clone(),
                         dp_map:        tuya_cfg.dp_map(),
-                        protocol_hint: tuya_cfg.protocol_hint.clone(),
+                        protocol_version: tuya_cfg.protocol_version.clone(),
                     },
                     bus_tx.clone(),
                 );

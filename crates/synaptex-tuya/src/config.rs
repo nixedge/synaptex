@@ -26,7 +26,7 @@ pub struct TuyaDeviceConfig {
     /// Protocol version hint from discovery ("3.3" | "3.4" | "3.5").
     /// When set, skips the dual-probe and connects with this version directly.
     #[serde(default)]
-    pub protocol_hint:  Option<String>,
+    pub protocol_version:  Option<String>,
 }
 
 impl TuyaDeviceConfig {

@@ -129,7 +129,7 @@ pub async fn room_command(
 
     room::execute_room_command(&room, cmd, &state.registry)
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .map_err(ApiError::from)?;
 
     Ok(StatusCode::NO_CONTENT)
 }

@@ -4626,7 +4626,10 @@ dependencies = [
  "clap",
  "reqwest",
  "serde_json",
+ "synaptex-tuya",
+ "synaptex-types",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4732,6 +4735,7 @@ dependencies = [
  "async-trait",
  "postcard",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
 ]

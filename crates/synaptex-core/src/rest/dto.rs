@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use synaptex_types::{
-    capability::{Capability, DeviceCommand},
+    capability::{Capability, DeviceCommand, FanSpeed},
     device::DeviceInfo,
     plugin::DeviceState,
 };
@@ -36,12 +36,14 @@ pub struct DeviceStateDto {
     pub color_temp_k:  Option<u16>,
     pub rgb:           Option<[u8; 3]>,
     pub switches:      HashMap<u8, bool>,
+    pub fan_speed:     Option<FanSpeed>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CapabilityDto {
     Power,
+    Light,
     Dimmer   { min: u16, max: u16 },
     ColorTemp { min_k: u16, max_k: u16 },
     Rgb,
@@ -54,6 +56,7 @@ impl From<&Capability> for CapabilityDto {
     fn from(c: &Capability) -> Self {
         match c {
             Capability::Power                    => CapabilityDto::Power,
+            Capability::Light                    => CapabilityDto::Light,
             Capability::Dimmer { min, max }      => CapabilityDto::Dimmer { min: *min, max: *max },
             Capability::ColorTemp { min_k, max_k } =>
                 CapabilityDto::ColorTemp { min_k: *min_k, max_k: *max_k },
@@ -82,6 +85,7 @@ pub fn device_dto(info: &DeviceInfo, state: Option<DeviceState>, ip: Option<Stri
             color_temp_k:  s.color_temp_k,
             rgb:           s.rgb.map(|(r, g, b)| [r, g, b]),
             switches:      s.switches,
+            fan_speed:     s.fan_speed,
         }),
     }
 }
@@ -96,12 +100,25 @@ pub enum CommandDto {
     SetColorTemp  { kelvin: u16 },
     SetRgb        { r: u8, g: u8, b: u8 },
     SetSwitch     { index: u8, on: bool },
+    SetFanSpeed   { speed: FanSpeed },
     SendIr        { key: String, #[serde(default)] head: Option<String> },
     SetDp {
         dp:       u16,
         bool_val: Option<bool>,
         int_val:  Option<i64>,
         str_val:  Option<String>,
+    },
+    /// Patch-style light command — only the `Some` fields are applied.
+    SetLight {
+        #[serde(default)] power:      Option<bool>,
+        #[serde(default)] brightness: Option<u16>,
+        /// Colour temperature in Kelvin.
+        #[serde(default)] color_temp: Option<u16>,
+        #[serde(default)] r:          Option<u8>,
+        #[serde(default)] g:          Option<u8>,
+        #[serde(default)] b:          Option<u8>,
+        /// Mode override: `"white"` | `"colour"`.
+        #[serde(default)] color_mode: Option<String>,
     },
 }
 
@@ -116,6 +133,7 @@ impl TryFrom<CommandDto> for DeviceCommand {
             CommandDto::SetRgb        { r, g, b }          => DeviceCommand::SetRgb(r, g, b),
             CommandDto::SetSwitch     { index, on }        =>
                 DeviceCommand::SetSwitch { index, state: on },
+            CommandDto::SetFanSpeed   { speed }            => DeviceCommand::SetFanSpeed(speed),
             CommandDto::SendIr        { key, head }        => DeviceCommand::SendIr { head, key },
             CommandDto::SetDp { dp, bool_val: Some(v), .. } =>
                 DeviceCommand::SetDpBool { dp, value: v },
@@ -125,6 +143,13 @@ impl TryFrom<CommandDto> for DeviceCommand {
                 DeviceCommand::SetDpStr  { dp, value: v },
             CommandDto::SetDp { .. } =>
                 return Err("set_dp requires exactly one of bool_val, int_val, str_val"),
+            CommandDto::SetLight { power, brightness, color_temp, r, g, b, color_mode } => {
+                let rgb = match (r, g, b) {
+                    (Some(r), Some(g), Some(b)) => Some((r, g, b)),
+                    _                           => None,
+                };
+                DeviceCommand::SetLight { power, brightness, color_temp, rgb, color_mode }
+            }
         })
     }
 }
@@ -265,6 +290,7 @@ fn device_command_to_dto(cmd: &DeviceCommand) -> CommandDto {
         DeviceCommand::SetRgb(r, g, b)      => CommandDto::SetRgb { r: *r, g: *g, b: *b },
         DeviceCommand::SetSwitch { index, state } =>
             CommandDto::SetSwitch { index: *index, on: *state },
+        DeviceCommand::SetFanSpeed(speed)   => CommandDto::SetFanSpeed { speed: *speed },
         DeviceCommand::SendIr { head, key } =>
             CommandDto::SendIr { key: key.clone(), head: head.clone() },
         DeviceCommand::SetDpBool { dp, value } =>
@@ -273,6 +299,16 @@ fn device_command_to_dto(cmd: &DeviceCommand) -> CommandDto {
             CommandDto::SetDp { dp: *dp, bool_val: None, int_val: Some(*value), str_val: None },
         DeviceCommand::SetDpStr { dp, value } =>
             CommandDto::SetDp { dp: *dp, bool_val: None, int_val: None, str_val: Some(value.clone()) },
+        DeviceCommand::SetLight { power, brightness, color_temp, rgb, color_mode } =>
+            CommandDto::SetLight {
+                power:      *power,
+                brightness: *brightness,
+                color_temp: *color_temp,
+                r:          rgb.map(|(r, _, _)| r),
+                g:          rgb.map(|(_, g, _)| g),
+                b:          rgb.map(|(_, _, b)| b),
+                color_mode: color_mode.clone(),
+            },
     }
 }
 
@@ -340,24 +376,6 @@ impl From<CloudDevice> for CloudDeviceDto {
     }
 }
 
-#[derive(Debug, Serialize)]
-pub struct ProbeResultDto {
-    pub supported: Option<bool>,
-    pub cached:    bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ResetBody {
-    pub mode: ResetMode,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResetMode {
-    Soft,
-    Full,
-}
-
 // ─── Import ───────────────────────────────────────────────────────────────────
 
 /// Summary of a single successfully imported device.
@@ -374,12 +392,14 @@ pub struct ImportedDeviceDto {
 #[derive(Debug, Serialize)]
 pub struct ImportResultDto {
     /// Devices discovered on the local network and registered.
-    pub registered:         Vec<ImportedDeviceDto>,
-    /// Devices already registered (skipped).
-    pub already_registered: Vec<ImportedDeviceDto>,
+    pub registered:           Vec<ImportedDeviceDto>,
+    /// Already-registered devices whose name or local_key changed and were synced.
+    pub updated_registration: Vec<ImportedDeviceDto>,
+    /// Devices already registered with no changes.
+    pub already_registered:   Vec<ImportedDeviceDto>,
     /// Online cloud devices that could not be found or resolved locally.
-    pub not_discovered:     Vec<CloudDeviceDto>,
+    pub not_discovered:       Vec<CloudDeviceDto>,
     /// Cloud-only virtual devices skipped (vdevo* IDs, gateway sub-devices with
     /// non-hex suffixes like *mu29/*ayps — these have no local TCP endpoint).
-    pub skipped_virtual:    Vec<CloudDeviceDto>,
+    pub skipped_virtual:      Vec<CloudDeviceDto>,
 }

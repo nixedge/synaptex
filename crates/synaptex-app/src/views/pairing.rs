@@ -8,7 +8,7 @@ use serde_json::json;
 
 use crate::{
     AppSettings,
-    api::{CloudDevice, ProbeResult, RegisteredDevice},
+    api::{CloudDevice, RegisteredDevice},
     smartconfig::SmartConfigSession,
 };
 
@@ -17,9 +17,6 @@ use crate::{
 #[derive(Clone, Debug)]
 enum PairingStep {
     Idle,
-    Probing,
-    ProbeDone { supported: bool },
-    Resetting,
     WifiEntry,
     Broadcasting { started_at: Instant },
     Acked { ip: Ipv4Addr, tuya_id: String },
@@ -55,69 +52,16 @@ pub fn PairingView(device: CloudDevice) -> Element {
 
             match &*step.read() {
                 PairingStep::Idle => rsx! {
+                    p {
+                        "Put the device in pairing mode first: hold the button until the LED \
+                        flashes rapidly (4–5 times per second), then press Start."
+                    }
                     button {
-                        onclick: {
-                            let mut step   = step.clone();
-                            let client     = client.clone();
-                            let device_id  = device_id.clone();
-                            move |_| {
-                                let mut step  = step.clone();
-                                let client    = client.clone();
-                                let did       = device_id.clone();
-                                step.set(PairingStep::Probing);
-                                spawn(async move {
-                                    let path = format!("/pairing/cloud-devices/{did}/probe");
-                                    match client.post_no_body(&path).await {
-                                        Ok(()) => {}
-                                        Err(_) => {}
-                                    }
-                                    // Re-fetch probe result.
-                                    match client.get::<ProbeResult>(&format!("/pairing/cloud-devices/{did}/probe")).await {
-                                        Ok(r) => step.set(PairingStep::ProbeDone {
-                                            supported: r.supported.unwrap_or(false),
-                                        }),
-                                        Err(e) => step.set(PairingStep::Error(e.to_string())),
-                                    }
-                                });
-                            }
-                        },
+                        r#type: "button",
+                        onclick: move |_| step.set(PairingStep::WifiEntry),
                         "Start Pairing"
                     }
                 },
-
-                PairingStep::Probing => rsx! {
-                    p { "Probing device reset support…" }
-                },
-
-                PairingStep::ProbeDone { supported } => {
-                    let supported = *supported;
-                    rsx! {
-                        p { "Soft reset supported: {supported}" }
-                        button {
-                            onclick: {
-                                let mut step  = step.clone();
-                                let client    = client.clone();
-                                let did       = device_id.clone();
-                                move |_| {
-                                    let mut step = step.clone();
-                                    let client   = client.clone();
-                                    let did      = did.clone();
-                                    step.set(PairingStep::Resetting);
-                                    spawn(async move {
-                                        let path = format!("/pairing/cloud-devices/{did}/reset");
-                                        let body = json!({ "mode": if supported { "soft" } else { "full" } });
-                                        match client.post::<_, serde_json::Value>(&path, &body).await {
-                                            Ok(_) | Err(_) => step.set(PairingStep::WifiEntry),
-                                        }
-                                    });
-                                }
-                            },
-                            "Reset Device & Continue"
-                        }
-                    }
-                },
-
-                PairingStep::Resetting => rsx! { p { "Resetting device…" } },
 
                 PairingStep::WifiEntry => rsx! {
                     div {
@@ -134,6 +78,7 @@ pub fn PairingView(device: CloudDevice) -> Element {
                             oninput: move |e| pass.set(e.value()),
                         }
                         button {
+                            r#type: "button",
                             onclick: {
                                 let mut step = step.clone();
                                 let ssid_val = ssid.read().clone();
@@ -205,11 +150,17 @@ pub fn PairingView(device: CloudDevice) -> Element {
                 PairingStep::Done { mac } => rsx! {
                     p { "✓ Device paired successfully!" }
                     p { "MAC address: {mac}" }
+                    button {
+                        r#type: "button",
+                        onclick: move |_| selected.set(None),
+                        "← Back to devices"
+                    }
                 },
 
                 PairingStep::Error(e) => rsx! {
                     p { "Error: {e}" }
                     button {
+                        r#type: "button",
                         onclick: move |_| step.set(PairingStep::Idle),
                         "Retry"
                     }

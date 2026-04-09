@@ -1,8 +1,7 @@
-use std::{collections::HashMap, net::{IpAddr, Ipv4Addr}, sync::Arc, time::Duration};
+use std::{net::{IpAddr, Ipv4Addr}, sync::Arc};
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
     Json,
 };
 use serde::Deserialize;
@@ -12,14 +11,11 @@ use synaptex_tuya::{plugin::TuyaConfig, TuyaDeviceConfig, TuyaPlugin};
 use crate::{
     db::{self, PluginConfig},
     rest::{
-        dto::{
-            CloudDeviceDto, ImportResultDto, ImportedDeviceDto,
-            ProbeResultDto, ResetBody, ResetMode,
-        },
+        dto::{CloudDeviceDto, ImportResultDto, ImportedDeviceDto},
         error::{ApiError, ApiResult},
         AppState,
     },
-    tuya_cloud::{discovery, TuyaCloudClient},
+    tuya_cloud::TuyaCloudClient,
 };
 
 fn get_client(state: &AppState) -> ApiResult<TuyaCloudClient> {
@@ -58,73 +54,6 @@ pub async fn get_cloud_device(
     let device = client.get_device(&tuya_id).await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(CloudDeviceDto::from(device)))
-}
-
-pub async fn probe_device(
-    State(state):  State<AppState>,
-    Path(tuya_id): Path<String>,
-) -> ApiResult<Json<ProbeResultDto>> {
-    // Check per-device cache first.
-    let device_cached = db::get_probe_result(&state.trees, &tuya_id)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    if let Some(supported) = device_cached {
-        return Ok(Json(ProbeResultDto { supported: Some(supported), cached: true }));
-    }
-
-    let client = get_client(&state)?;
-
-    // Get product_id to check product-level cache.
-    let device = client.get_device(&tuya_id).await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-
-    if let Some(supported) = db::get_probe_result(&state.trees, &device.product_id)
-        .map_err(|e| ApiError::internal(e.to_string()))?
-    {
-        return Ok(Json(ProbeResultDto { supported: Some(supported), cached: true }));
-    }
-
-    // Probe = attempt soft reset; cache result by product_id.
-    let supported = client.soft_reset(&tuya_id).await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-
-    if supported {
-        tracing::warn!(
-            tuya_id = %tuya_id,
-            "probe triggered an actual soft reset — device is now in pairing mode"
-        );
-    }
-
-    db::save_probe_result(&state.trees, &device.product_id, supported)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    // Also cache by device ID for quick future lookups.
-    db::save_probe_result(&state.trees, &tuya_id, supported)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-
-    Ok(Json(ProbeResultDto { supported: Some(supported), cached: false }))
-}
-
-pub async fn reset_device(
-    State(state):  State<AppState>,
-    Path(tuya_id): Path<String>,
-    Json(body):    Json<ResetBody>,
-) -> ApiResult<StatusCode> {
-    let client = get_client(&state)?;
-
-    match body.mode {
-        ResetMode::Soft => {
-            let ok = client.soft_reset(&tuya_id).await
-                .map_err(|e| ApiError::internal(e.to_string()))?;
-            if !ok {
-                return Err(ApiError::soft_reset_unsupported());
-            }
-        }
-        ResetMode::Full => {
-            client.factory_reset(&tuya_id).await
-                .map_err(|e| ApiError::internal(e.to_string()))?;
-        }
-    }
-
-    Ok(StatusCode::NO_CONTENT)
 }
 
 // ─── Import ───────────────────────────────────────────────────────────────────
@@ -181,14 +110,6 @@ pub async fn import_cloud_devices(
     let client = get_client(&state)?;
     let cloud_devices = fetch_all_cloud_devices(&client).await?;
 
-    // Run local UDP discovery.
-    let discovered = discovery::discover(Duration::from_secs(5)).await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-
-    // Build tuya_id → discovered device map.
-    let discovery_map: HashMap<String, &discovery::DiscoveredDevice> =
-        discovered.iter().map(|d| (d.tuya_id.clone(), d)).collect();
-
     // Load existing plugin configs to detect already-registered devices.
     let existing_configs = db::load_all_plugin_configs(&state.trees)
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -199,34 +120,99 @@ pub async fn import_cloud_devices(
         })
         .collect();
 
-    let mut registered         = Vec::new();
-    let mut already_registered = Vec::new();
-    let mut not_discovered     = Vec::new();
-    let mut skipped_virtual    = Vec::new();
+    let mut registered           = Vec::new();
+    let mut updated_registration = Vec::new();
+    let mut already_registered   = Vec::new();
+    let mut not_discovered       = Vec::new();
+    let mut skipped_virtual      = Vec::new();
 
     // Devices that are online, not registered, not found via UDP, but have a
     // cloud-reported IP — we'll try ARP-probing them in a second pass.
     for cloud_dev in cloud_devices {
         let dp_profile = category_to_dp_profile(&cloud_dev.category).to_string();
 
-        // Already registered? Check before virtual filter so a previously
-        // registered device always appears in already_registered, not skipped.
+        // Already registered? Sync name + local_key from cloud, then skip re-registration.
         if registered_tuya_ids.contains(&cloud_dev.id) {
-            let mac = existing_configs.iter().find_map(|cfg| {
+            let existing_cfg = existing_configs.iter().find_map(|cfg| {
                 if let PluginConfig::Tuya(t) = cfg {
-                    if t.tuya_id == cloud_dev.id {
-                        return Some(t.device_id.to_string());
-                    }
+                    if t.tuya_id == cloud_dev.id { return Some(t.clone()); }
                 }
                 None
-            }).unwrap_or_default();
-            already_registered.push(ImportedDeviceDto {
-                mac,
-                name:       cloud_dev.name.clone(),
-                tuya_id:    cloud_dev.id.clone(),
-                ip:         String::new(),
-                dp_profile,
             });
+
+            if let Some(mut cfg) = existing_cfg {
+                let id = cfg.device_id;
+                let mut key_changed  = false;
+                let mut name_changed = false;
+
+                // Sync name in registry (list_devices reads sled, so this is immediately live).
+                if let Ok(Some(mut info)) = db::get::<DeviceInfo>(&state.trees.registry, &id) {
+                    if info.name != cloud_dev.name {
+                        tracing::info!(
+                            tuya_id = %cloud_dev.id,
+                            old_name = %info.name,
+                            new_name = %cloud_dev.name,
+                            "import: syncing device name from cloud",
+                        );
+                        info.name = cloud_dev.name.clone();
+                        match db::register_device(&state.trees, &info) {
+                            Ok(()) => name_changed = true,
+                            Err(e) => tracing::warn!(tuya_id = %cloud_dev.id, "import: failed to sync name: {e}"),
+                        }
+                    }
+                }
+
+                // Sync local_key — update sled and flag for plugin reconnect.
+                tracing::debug!(
+                    tuya_id     = %cloud_dev.id,
+                    key_empty   = cloud_dev.local_key.is_empty(),
+                    key_changed = (cfg.local_key != cloud_dev.local_key),
+                    "import: local_key check for already-registered device",
+                );
+                if !cloud_dev.local_key.is_empty() && cfg.local_key != cloud_dev.local_key {
+                    tracing::info!(tuya_id = %cloud_dev.id, "import: syncing local_key from cloud");
+                    cfg.local_key = cloud_dev.local_key.clone();
+                    match db::save_plugin_config(&state.trees, &id, &PluginConfig::Tuya(cfg.clone())) {
+                        Ok(()) => key_changed = true,
+                        Err(e) => tracing::warn!(tuya_id = %cloud_dev.id, "import: failed to sync local_key: {e}"),
+                    }
+                }
+
+                // If the local_key changed, rebuild the plugin so it reconnects with the new key.
+                if key_changed {
+                    // Re-read the current DeviceInfo (may have just had its name updated).
+                    if let Ok(Some(info)) = db::get::<DeviceInfo>(&state.trees.registry, &id) {
+                        let dp_map = cfg.dp_map();
+                        let new_plugin = TuyaPlugin::new(
+                            info,
+                            TuyaConfig {
+                                ip:            cfg.ip,
+                                port:          cfg.port,
+                                tuya_id:       cfg.tuya_id.clone(),
+                                local_key:     cfg.local_key.clone(),
+                                dp_map,
+                                protocol_version: cfg.protocol_version.clone(),
+                            },
+                            state.bus_tx.clone(),
+                        );
+                        state.registry.deregister(&id).await;
+                        state.registry.register(Arc::new(new_plugin));
+                    }
+                }
+
+                let dto = ImportedDeviceDto {
+                    mac:     id.to_string(),
+                    name:    cloud_dev.name.clone(),
+                    tuya_id: cloud_dev.id.clone(),
+                    ip:      String::new(),
+                    dp_profile,
+                };
+                if key_changed || name_changed {
+                    updated_registration.push(dto);
+                } else {
+                    already_registered.push(dto);
+                }
+            }
             continue;
         }
 
@@ -236,16 +222,7 @@ pub async fn import_cloud_devices(
             continue;
         }
 
-        // Found via local UDP?
-        if let Some(local) = discovery_map.get(&cloud_dev.id) {
-            register_device_into_state(&state, &cloud_dev, local.ip, &local.mac,
-                &dp_profile, None, &mut registered)?;
-            continue;
-        }
-
-        // Not found locally — check the router discovery cache as fallback.
-        // This covers the case where core is on a different subnet and cannot
-        // broadcast-discover the device directly, but the router can.
+        // Look up this device in the router's continuously-updated discovery map.
         if let Some(router_dev) = state.router_devices.get(&cloud_dev.id) {
             let hint = (!router_dev.version.is_empty()).then(|| router_dev.version.clone());
             tracing::info!(
@@ -265,7 +242,7 @@ pub async fn import_cloud_devices(
         }
     }
 
-    Ok(Json(ImportResultDto { registered, already_registered, not_discovered, skipped_virtual }))
+    Ok(Json(ImportResultDto { registered, updated_registration, already_registered, not_discovered, skipped_virtual }))
 }
 
 /// Register a single device into sled + plugin registry and append to `registered`.
@@ -275,7 +252,7 @@ fn register_device_into_state(
     ip:             Ipv4Addr,
     mac:            &str,
     dp_profile:     &str,
-    protocol_hint:  Option<String>,
+    protocol_version:  Option<String>,
     registered:     &mut Vec<ImportedDeviceDto>,
 ) -> ApiResult<()> {
     let id = DeviceId::from_mac_str(mac)
@@ -289,7 +266,7 @@ fn register_device_into_state(
         local_key:     cloud_dev.local_key.clone(),
         dp_profile:    dp_profile.to_string(),
         dp_map:        None,
-        protocol_hint: protocol_hint.clone(),
+        protocol_version: protocol_version.clone(),
     };
     let info = DeviceInfo {
         id,
@@ -312,7 +289,7 @@ fn register_device_into_state(
             tuya_id:       tuya_cfg.tuya_id.clone(),
             local_key:     tuya_cfg.local_key.clone(),
             dp_map:        tuya_cfg.dp_map(),
-            protocol_hint,
+            protocol_version,
         },
         state.bus_tx.clone(),
     );

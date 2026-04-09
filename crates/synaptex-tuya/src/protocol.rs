@@ -14,13 +14,17 @@
 ///
 /// ## v3.5 (0x6699) frame layout:
 /// ```text
-/// ┌───────────┬────────┬────────┬────────┬────────┬──────────────────┬─────────┐
-/// │ Prefix    │ Unk    │ Seq    │ Cmd    │ Len    │ Data             │ Suffix  │
-/// │ 0x006699  │ 0x0000 │ (4 B)  │ (4 B)  │ (4 B)  │ retcode(4) +     │ 0x9966  │
-/// │ (4 B)     │ (2 B)  │        │        │        │ IV(12) + CT + T  │ (4 B)   │
-/// └───────────┴────────┴────────┴────────┴────────┴──────────────────┴─────────┘
+/// ┌───────────┬────────┬────────┬────────┬────────┬──────────────────────────────┬─────────┐
+/// │ Prefix    │ Unk    │ Seq    │ Cmd    │ Len    │ Data                         │ Suffix  │
+/// │ 0x006699  │ 0x0000 │ (4 B)  │ (4 B)  │ (4 B)  │ IV(12) + GCM_CT + tag(16)   │ 0x9966  │
+/// │ (4 B)     │ (2 B)  │        │        │        │                              │ (4 B)   │
+/// └───────────┴────────┴────────┴────────┴────────┴──────────────────────────────┴─────────┘
 /// ```
-/// Total frame = 18 + Len + 4.  Len = 4 + 12 + N + 16 = N + 32.
+/// Total frame = 18 + Len + 4.  Len = 12 + N + 16 = N + 28.
+///
+/// For **client→device** frames (commands we send): GCM plaintext = raw payload only.
+/// For **device→client** frames (responses we receive): GCM plaintext = retcode(4) + payload;
+/// the retcode is stripped from the decrypted payload by `parse_frame_v35`.
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crc32fast::Hasher as Crc32Hasher;
 
@@ -46,6 +50,10 @@ pub const SUFFIX_6699: [u8; 4] = [0x00, 0x00, 0x99, 0x66];
 pub const V33_DATA_PREFIX: &[u8; 15] =
     b"3.3\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 
+/// v3.4 command data prefix (15 bytes): `"3.4"` + 12 null bytes.
+pub const V34_DATA_PREFIX: &[u8; 15] =
+    b"3.4\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+
 // ─── Trailer kind ─────────────────────────────────────────────────────────────
 
 /// Selects which trailer format to use when building or verifying 0x55AA frames.
@@ -62,12 +70,15 @@ pub enum TrailerKind<'a> {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandWord {
+    /// v3.3 DP-set command.
     Control          = 0x07,
     StatusPush       = 0x08,
     Heartbeat        = 0x09,
     DpQuery          = 0x0A,
-    /// v3.4+ preferred DP-query command.
-    DpQueryNew       = 0x0D,
+    /// v3.4/v3.5 DP-set command (replaces `Control` for newer protocol versions).
+    ControlNew       = 0x0D,
+    /// v3.4+ preferred DP-query command (FRM_QUERY_STAT_NEW).
+    DpQueryNew       = 0x10,
     // v3.4 session-key negotiation
     SessKeyNegStart  = 0x03,
     SessKeyNegResp   = 0x04,
@@ -85,7 +96,8 @@ impl TryFrom<u32> for CommandWord {
             0x08 => Ok(Self::StatusPush),
             0x09 => Ok(Self::Heartbeat),
             0x0A => Ok(Self::DpQuery),
-            0x0D => Ok(Self::DpQueryNew),
+            0x0D => Ok(Self::ControlNew),
+            0x10 => Ok(Self::DpQueryNew),
             other => Err(TuyaError::Protocol(format!("unknown command word: 0x{other:02X}"))),
         }
     }
@@ -207,14 +219,16 @@ pub fn parse_frame(buf: &[u8], trailer: TrailerKind) -> Result<Option<(TuyaFrame
 
 // ─── Build v3.5 (0x6699) frame ────────────────────────────────────────────────
 
-/// Build a v3.5 (0x6699) AES-128-GCM frame.
+/// Build a v3.5 (0x6699) AES-128-GCM frame (client→device direction).
 ///
 /// `session_key` is the AES-128-GCM key.  `iv` is the 12-byte nonce (caller
 /// must ensure uniqueness; for data frames use a fresh random nonce per call).
 /// AAD = header bytes `[4..18]` (0u16 + seqno + cmd + len).
 ///
 /// Wire layout: `PREFIX_6699(4) | 0u16(2) | seq(4) | cmd(4) | len(4) |`
-///              `0u32_retcode(4) | gcm_encrypt(payload)(IV+CT+tag) | SUFFIX_6699(4)`
+///              `gcm_encrypt(payload)(IV(12)+CT+tag(16)) | SUFFIX_6699(4)`
+///
+/// No retcode is included for client→device frames.  Len = IV(12) + CT + tag(16).
 pub fn build_frame_v35(
     seq_no:      u32,
     cmd:         CommandWord,
@@ -222,8 +236,8 @@ pub fn build_frame_v35(
     session_key: &[u8; 16],
     iv:          &[u8; 12],
 ) -> Result<Bytes, TuyaError> {
-    // data_len = retcode(4) + gcm_out = retcode + IV(12) + ciphertext + tag(16)
-    let data_len = 4u32 + 12u32 + payload.len() as u32 + 16u32;
+    // data_len = IV(12) + ciphertext + tag(16); no retcode for client→device
+    let data_len = 12u32 + payload.len() as u32 + 16u32;
 
     // AAD = header[4..18]: 0u16(2) + seq(4) + cmd(4) + data_len(4) = 14 bytes
     let mut aad = [0u8; 14];
@@ -233,7 +247,7 @@ pub fn build_frame_v35(
     aad[10..14].copy_from_slice(&data_len.to_be_bytes());
 
     // gcm_encrypt returns IV(12) ++ ciphertext ++ tag(16)
-    let gcm_out = cipher::gcm_encrypt(session_key, &iv, &aad, payload);
+    let gcm_out = cipher::gcm_encrypt(session_key, iv, &aad, payload);
 
     let total = 22 + data_len as usize; // header(18) + data + suffix(4)
     let mut buf = BytesMut::with_capacity(total);
@@ -242,7 +256,6 @@ pub fn build_frame_v35(
     buf.put_u32(seq_no);
     buf.put_u32(cmd as u32);
     buf.put_u32(data_len);
-    buf.put_u32(0u32); // retcode = 0 for commands
     buf.put_slice(&gcm_out); // IV(12) + ciphertext + tag(16)
     buf.put_slice(&SUFFIX_6699);
     Ok(buf.freeze())
@@ -308,19 +321,19 @@ fn parse_frame_v35(
     }
 
     let data = &buf[18..18 + data_len];
-    // data = retcode(4) + IV(12) + ciphertext(N) + tag(16)
-    if data.len() < 4 + 12 + 16 {
+    // data = IV(12) + GCM_ciphertext(retcode(4) + payload)(N) + tag(16)
+    // The retcode is inside the GCM ciphertext for device→client frames.
+    if data.len() < 12 + 16 {
         return Err(TuyaError::Protocol(format!(
             "v3.5 data too short: {} bytes",
             data.len()
         )));
     }
 
-    let _retcode   = u32::from_be_bytes(data[0..4].try_into().unwrap());
-    let iv: &[u8; 12] = data[4..16].try_into().unwrap();
-    let rest          = &data[16..]; // ciphertext + tag
-    let ct_len        = rest.len().saturating_sub(16);
-    let ciphertext    = &rest[..ct_len];
+    let iv: &[u8; 12] = data[0..12].try_into().unwrap();
+    let rest           = &data[12..]; // ciphertext + tag
+    let ct_len         = rest.len().saturating_sub(16);
+    let ciphertext     = &rest[..ct_len];
     let tag: &[u8; 16] = rest[ct_len..].try_into().unwrap();
 
     // AAD = buf[4..18]
@@ -331,9 +344,18 @@ fn parse_frame_v35(
     })?;
 
     let plaintext = cipher::gcm_decrypt(key, iv, aad, ciphertext, tag)?;
-    let command   = CommandWord::try_from(cmd_raw)?;
+
+    // Strip 4-byte retcode from the front of the decrypted plaintext.
+    // Device→client frames always include a retcode as the first 4 bytes inside GCM.
+    let payload = if plaintext.len() >= 4 {
+        Bytes::from(plaintext[4..].to_vec())
+    } else {
+        Bytes::from(plaintext)
+    };
+
+    let command = CommandWord::try_from(cmd_raw)?;
     Ok(Some((
-        TuyaFrame { seq_no, command, payload: Bytes::from(plaintext) },
+        TuyaFrame { seq_no, command, payload },
         total_frame,
     )))
 }

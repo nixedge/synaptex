@@ -58,6 +58,7 @@ pub fn compute_group_state(
         color_temp_k: primary.and_then(|s| s.color_temp_k),
         rgb:          primary.and_then(|s| s.rgb),
         switches:     primary.map(|s| s.switches.clone()).unwrap_or_default(),
+        fan_speed:    primary.and_then(|s| s.fan_speed),
     }
 }
 
@@ -121,6 +122,7 @@ impl DevicePlugin for GroupPlugin {
                             let _ = bus_tx.send(synaptex_types::plugin::StateChangeEvent {
                                 device_id: group_id,
                                 state,
+                                raw_dps: std::collections::HashMap::new(),
                             });
                         }
                     }
