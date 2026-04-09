@@ -2,6 +2,7 @@ mod db;
 mod dhcp;
 mod discovery;
 mod firewall;
+mod kea;
 mod rpc;
 mod tls;
 
@@ -49,6 +50,17 @@ struct Args {
     /// Comma-separated, e.g. "br-iot,br-lan".  Omit to listen on all interfaces.
     #[arg(long, env = "SYNAPTEX_ROUTER_INTERFACES")]
     interfaces: Option<String>,
+
+    /// Unix domain socket path for the Kea hook shim.
+    /// Omit to disable the Kea classifier.
+    #[arg(long, env = "SYNAPTEX_ROUTER_KEA_SOCKET")]
+    kea_socket: Option<std::path::PathBuf>,
+
+    /// Relay agent IP(s) for the IoT VLAN, comma-separated.
+    /// Only DHCP requests arriving via these giaddrs are classified.
+    /// e.g. "10.10.20.1" or "10.10.20.1,10.10.21.1"
+    #[arg(long, env = "SYNAPTEX_ROUTER_KEA_IOT_RELAY", value_delimiter = ',')]
+    kea_iot_relay: Vec<std::net::Ipv4Addr>,
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -92,6 +104,19 @@ async fn main() -> Result<()> {
     // Each connected WatchDiscovery RPC stream subscribes to receive them.
     let (discovery_tx, _) = broadcast::channel::<synaptex_router_proto::DiscoveredDevice>(64);
     let discovery_tx = Arc::new(discovery_tx);
+
+    // ── Kea hook domain socket ───────────────────────────────────────────────
+    if let Some(socket_path) = args.kea_socket {
+        if args.kea_iot_relay.is_empty() {
+            anyhow::bail!("--kea-iot-relay must be set when --kea-socket is configured");
+        }
+        info!(
+            path   = %socket_path.display(),
+            relays = ?args.kea_iot_relay,
+            "kea: starting hook listener",
+        );
+        kea::spawn(socket_path, args.kea_iot_relay);
+    }
 
     // ── Spawn UDP discovery listener ─────────────────────────────────────────
     let interfaces = args.interfaces
