@@ -93,12 +93,6 @@ pub struct CloudDevice {
     pub local_key:  String,
 }
 
-#[derive(serde::Deserialize, Clone, Debug, PartialEq)]
-pub struct ProbeResult {
-    pub supported: Option<bool>,
-    pub cached:    bool,
-}
-
 #[derive(serde::Deserialize, Clone, Debug)]
 pub struct RegisteredDevice {
     pub mac: String,

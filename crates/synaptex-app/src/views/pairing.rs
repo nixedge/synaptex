@@ -80,7 +80,7 @@ pub fn PairingView(device: CloudDevice) -> Element {
                         button {
                             r#type: "button",
                             onclick: {
-                                let mut step = step.clone();
+                                let step = step.clone();
                                 let ssid_val = ssid.read().clone();
                                 let pass_val = pass.read().clone();
                                 let client   = client.clone();

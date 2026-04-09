@@ -1,4 +1,4 @@
-use synaptex_types::plugin::{StateChangeEvent, StateBusSender};
+use synaptex_types::plugin::StateBusSender;
 
 /// Broadcast channel capacity.  Events are dropped for lagging consumers.
 const BUS_CAPACITY: usize = 256;

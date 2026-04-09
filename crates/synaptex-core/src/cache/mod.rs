@@ -43,6 +43,7 @@ impl StateCache {
         self.0.get(id).map(|r| r.clone())
     }
 
+    #[allow(dead_code)]
     pub fn all(&self) -> Vec<DeviceState> {
         self.0.iter().map(|r| r.value().clone()).collect()
     }

@@ -202,18 +202,6 @@ pub fn remove_room(trees: &Trees, room_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn find_room_by_name(trees: &Trees, name: &str) -> Result<Option<Room>> {
-    for item in trees.rooms.iter() {
-        let (_k, v) = item?;
-        if let Ok(r) = from_bytes::<Room>(&v) {
-            if r.name == name {
-                return Ok(Some(r));
-            }
-        }
-    }
-    Ok(None)
-}
-
 // ─── Routine types ────────────────────────────────────────────────────────────
 
 /// Target of a routine command step: either a room (by UUID) or a single device.

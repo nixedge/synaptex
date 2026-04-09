@@ -1,5 +1,3 @@
-pub mod discovery;
-
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};

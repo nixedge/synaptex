@@ -31,6 +31,7 @@ struct Entry {
 pub struct PluginRegistry {
     entries: DashMap<DeviceId, Entry>,
     cache:   Arc<StateCache>,
+    #[allow(dead_code)]
     bus_tx:  StateBusSender,
 }
 
@@ -94,9 +95,6 @@ impl PluginRegistry {
         }
     }
 
-    pub fn bus_sender(&self) -> &StateBusSender {
-        &self.bus_tx
-    }
 
     // ── Supervisor ────────────────────────────────────────────────────────────
 

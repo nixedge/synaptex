@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig};
 
-use crate::db::{self, PluginConfig, Trees};
+use crate::db::{PluginConfig, Trees};
 
 use synaptex_router_proto::router_service_client::RouterServiceClient;
 
@@ -78,6 +78,7 @@ impl RouterClient {
         Ok(stream)
     }
 
+    #[allow(dead_code)]
     pub async fn add_dhcp_reservation(
         &mut self,
         reservation: synaptex_router_proto::DhcpReservation,
@@ -93,6 +94,7 @@ impl RouterClient {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn upsert_firewall_rule(
         &mut self,
         rule: synaptex_router_proto::FirewallRule,
@@ -108,6 +110,7 @@ impl RouterClient {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn remove_firewall_rule(&mut self, id: String) -> Result<()> {
         let ack = self.inner
             .remove_firewall_rule(synaptex_router_proto::RuleId { id })
