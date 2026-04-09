@@ -123,7 +123,7 @@ pub enum DeviceCmd {
         #[arg(long, default_value_t = 6668u16)]
         port: u16,
 
-        /// DP profile preset: bulb_a | bulb_b | switch | fan | fan_light | fan_light_simple | fan_light_numeric | ir1 | ir2
+        /// DP profile preset: bulb_a | bulb_b | switch | fan | ir1 | ir2
         #[arg(long, default_value = "bulb_b")]
         dp_profile: String,
     },
@@ -151,7 +151,7 @@ pub enum DeviceCmd {
         #[arg(long, value_name = "MAC")]
         mac: String,
 
-        /// DP profile preset: bulb_a | bulb_b | switch | fan | fan_light | fan_light_simple | fan_light_numeric | ir1 | ir2
+        /// DP profile preset: bulb_a | bulb_b | switch | fan | ir1 | ir2
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
 
@@ -246,6 +246,9 @@ async fn get(mac: String, http_url: &str, api_key: Option<&str>) -> Result<()> {
             if rgb.len() == 3 {
                 println!("rgb:       ({},{},{})", rgb[0], rgb[1], rgb[2]);
             }
+        }
+        if let Some(spd) = state["fan_speed"].as_str() {
+            println!("fan_speed: {spd}");
         }
     }
     Ok(())

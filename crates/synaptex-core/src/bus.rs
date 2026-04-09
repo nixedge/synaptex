@@ -22,7 +22,7 @@ pub fn spawn_persist_task(
         loop {
             match rx.recv().await {
                 Ok(event) => {
-                    cache.insert(event.state.clone());
+                    cache.merge(event.state.clone());
                     if let Err(e) = crate::db::put(&trees.state, &event.device_id, &event.state) {
                         tracing::error!(device = %event.device_id, "failed to persist state: {e}");
                     }

@@ -58,7 +58,41 @@ pub async fn get_cloud_device(
 
 // ─── Import ───────────────────────────────────────────────────────────────────
 
-/// Derive a dp_profile from a Tuya category code.
+/// Derive a dp_profile from actual device DP specifications.
+///
+/// Priority (highest specificity first):
+/// 1. IR blasters → use category as the primary signal (DP patterns overlap with switches)
+/// 2. IR type-1   → DP 201 present
+/// 3. Bulb type B → DP 20 present (newer bulbs: 20=power, 24=colour)
+/// 4. Bulb type A → DP 5 present  (older bulbs: 1=power, 5=colour)
+/// 5. Fan+light (dimmable) → DP 3 (speed) + DP 9 (light) + DP 22 (brightness)
+/// 6. Fan+light (simple)   → DP 3 (speed) + DP 9 (light)
+/// 7. Fan (numeric speed)  → DP 3 present, enum values contain "1"/"2"/"3"
+/// 8. Fan (named speed)    → DP 3 present
+/// 9. Switch (safe default)
+fn detect_profile_from_specs(
+    specs:    &crate::tuya_cloud::DeviceSpecs,
+    category: &str,
+) -> &'static str {
+    // IR devices are best identified by category — their DP patterns overlap with switches.
+    match category {
+        "infrared_tv" => return "ir_type2",
+        "wnykq"       => return "ir_type1",
+        _ => {}
+    }
+
+    if specs.dp_ids.contains(&201) { return "ir_type1"; }
+
+    if specs.dp_ids.contains(&20) { return "bulb_b"; }
+    if specs.dp_ids.contains(&5)  { return "bulb_a"; }
+
+    if specs.dp_ids.contains(&3) { return "fan"; }
+
+    "switch"
+}
+
+/// Fallback: derive a dp_profile from the Tuya category code alone.
+/// Used when the Cloud specs endpoint is unavailable or returns an error.
 fn category_to_dp_profile(category: &str) -> &'static str {
     match category {
         "cz"           => "switch",    // smart plug
@@ -126,11 +160,7 @@ pub async fn import_cloud_devices(
     let mut not_discovered       = Vec::new();
     let mut skipped_virtual      = Vec::new();
 
-    // Devices that are online, not registered, not found via UDP, but have a
-    // cloud-reported IP — we'll try ARP-probing them in a second pass.
     for cloud_dev in cloud_devices {
-        let dp_profile = category_to_dp_profile(&cloud_dev.category).to_string();
-
         // Already registered? Sync name + local_key from cloud, then skip re-registration.
         if registered_tuya_ids.contains(&cloud_dev.id) {
             let existing_cfg = existing_configs.iter().find_map(|cfg| {
@@ -200,6 +230,9 @@ pub async fn import_cloud_devices(
                     }
                 }
 
+                // For already-registered devices the existing profile is preserved; the
+                // category-based guess is shown in the DTO for informational purposes only.
+                let dp_profile = category_to_dp_profile(&cloud_dev.category).to_string();
                 let dto = ImportedDeviceDto {
                     mac:     id.to_string(),
                     name:    cloud_dev.name.clone(),
@@ -221,6 +254,33 @@ pub async fn import_cloud_devices(
             skipped_virtual.push(CloudDeviceDto::from(cloud_dev));
             continue;
         }
+
+        // For new devices, try to detect the most accurate profile from actual DPs.
+        // Falls back to category-based detection when the API call fails.
+        let dp_profile = match client.get_device_specs(&cloud_dev.id).await {
+            Ok(specs) => {
+                let detected = detect_profile_from_specs(&specs, &cloud_dev.category);
+                let category_guess = category_to_dp_profile(&cloud_dev.category);
+                if detected != category_guess {
+                    tracing::info!(
+                        tuya_id          = %cloud_dev.id,
+                        category         = %cloud_dev.category,
+                        category_profile = %category_guess,
+                        detected_profile = %detected,
+                        "import: DP spec detection overrides category guess",
+                    );
+                }
+                detected.to_string()
+            }
+            Err(e) => {
+                tracing::debug!(
+                    tuya_id  = %cloud_dev.id,
+                    category = %cloud_dev.category,
+                    "import: DP spec fetch failed ({e}), falling back to category profile",
+                );
+                category_to_dp_profile(&cloud_dev.category).to_string()
+            }
+        };
 
         // Look up this device in the router's continuously-updated discovery map.
         if let Some(router_dev) = state.router_devices.get(&cloud_dev.id) {

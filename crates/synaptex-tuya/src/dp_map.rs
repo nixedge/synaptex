@@ -142,7 +142,8 @@ impl DpMap {
         }
     }
 
-    /// Fan device: power=1, speed=3 (str), mode=4 (str).
+    /// Tuya ceiling fan: fan_power=1, fan_speed=3 ("1"/"2"/"3"), light_power=9.
+    /// This covers the most common Tuya fan layout.
     pub fn fan() -> Self {
         Self {
             power_dp:        1,
@@ -156,56 +157,9 @@ impl DpMap {
             color_temp_min:  0,
             color_temp_max:  1000,
             fan_speed_dp:     Some(3),
-            fan_mode_dp:      Some(4),
-            light_power_dp:   None,
-            fan_speed_format: FanSpeedFormat::Named,
-            ir_send_dp:       None,
-            ir_control_type:  None,
-        }
-    }
-
-    /// Ceiling fan with dimmable CCT light (most common Tuya layout).
-    /// fan_power=1, fan_speed=3 (str), fan_mode=4 (str),
-    /// light_power=9 (bool), brightness=22 (10–1000), color_temp=23 (0–1000).
-    pub fn fan_light() -> Self {
-        Self {
-            power_dp:        1,
-            brightness_dp:   Some(22),
-            color_temp_dp:   Some(23),
-            color_dp:        None,
-            mode_dp:         None,
-            color_format:    ColorFormat::Hsv16,
-            brightness_min:  10,
-            brightness_max:  1000,
-            color_temp_min:  0,
-            color_temp_max:  1000,
-            fan_speed_dp:     Some(3),
-            fan_mode_dp:      Some(4),
+            fan_mode_dp:      None,
             light_power_dp:   Some(9),
-            fan_speed_format: FanSpeedFormat::Named,
-            ir_send_dp:       None,
-            ir_control_type:  None,
-        }
-    }
-
-    /// Ceiling fan with on/off-only light (no dimmer).
-    /// fan_power=1, fan_speed=3 (str), fan_mode=4 (str), light_power=9 (bool).
-    pub fn fan_light_simple() -> Self {
-        Self {
-            power_dp:        1,
-            brightness_dp:   None,
-            color_temp_dp:   None,
-            color_dp:        None,
-            mode_dp:         None,
-            color_format:    ColorFormat::Hsv16,
-            brightness_min:  0,
-            brightness_max:  1000,
-            color_temp_min:  0,
-            color_temp_max:  1000,
-            fan_speed_dp:     Some(3),
-            fan_mode_dp:      Some(4),
-            light_power_dp:   Some(9),
-            fan_speed_format: FanSpeedFormat::Named,
+            fan_speed_format: FanSpeedFormat::Numeric,
             ir_send_dp:       None,
             ir_control_type:  None,
         }
@@ -255,40 +209,16 @@ impl DpMap {
         }
     }
 
-    /// Ceiling fan with on/off-only light, numeric speed encoding ("1"/"2"/"3").
-    /// fan_power=1, fan_speed=3 (numeric str), fan_mode=4 (str), light_power=9 (bool).
-    pub fn fan_light_numeric() -> Self {
-        Self {
-            power_dp:        1,
-            brightness_dp:   None,
-            color_temp_dp:   None,
-            color_dp:        None,
-            mode_dp:         None,
-            color_format:    ColorFormat::Hsv16,
-            brightness_min:  0,
-            brightness_max:  1000,
-            color_temp_min:  0,
-            color_temp_max:  1000,
-            fan_speed_dp:     Some(3),
-            fan_mode_dp:      Some(4),
-            light_power_dp:   Some(9),
-            fan_speed_format: FanSpeedFormat::Numeric,
-            ir_send_dp:       None,
-            ir_control_type:  None,
-        }
-    }
-
     /// Resolve a string profile name to a preset (falls back to `tuya_bulb_b`).
+    ///
+    /// Legacy fan variant names all map to the single `fan` preset.
     pub fn from_profile(profile: &str) -> Self {
         match profile {
             "bulb_a"  => Self::tuya_bulb_a(),
             "bulb_b"  => Self::tuya_bulb_b(),
             "switch"  => Self::switch(),
-            "fan"                => Self::fan(),
-            "fan_light"          => Self::fan_light(),
-            "fan_light_simple"   => Self::fan_light_simple(),
-            "fan_light_numeric"  => Self::fan_light_numeric(),
-            "ir1"              => Self::ir_type1(),
+            "fan"     => Self::fan(),
+            "ir1"     => Self::ir_type1(),
             "ir2"     => Self::ir_type2(),
             _         => Self::default(),
         }

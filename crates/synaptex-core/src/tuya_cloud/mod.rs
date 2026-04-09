@@ -226,6 +226,18 @@ impl TuyaCloudClient {
         Ok(CloudDevice::from(raw))
     }
 
+    /// Fetch the DP function / status schema for a device.
+    /// Returns `DeviceSpecs` with all DP IDs and their raw value descriptors.
+    pub async fn get_device_specs(&self, device_id: &str) -> Result<DeviceSpecs> {
+        let path = format!("/v1.0/devices/{device_id}/specifications");
+        let raw: DeviceSpecsRaw = self.request(Method::GET, &path, None::<&()>).await?;
+        let dp_ids = raw.functions.iter()
+            .chain(raw.status.iter())
+            .map(|s| s.dp_id)
+            .collect();
+        Ok(DeviceSpecs { dp_ids })
+    }
+
     /// Cloud de-registration — removes device from cloud account without
     /// necessarily physically resetting the device hardware.
     pub async fn factory_reset(&self, device_id: &str) -> Result<()> {
@@ -233,6 +245,27 @@ impl TuyaCloudClient {
         self.request::<serde_json::Value>(Method::DELETE, &path, None::<&()>).await?;
         Ok(())
     }
+}
+
+// ─── Device specifications ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct DpSpecRaw {
+    dp_id: u16,
+}
+
+#[derive(Deserialize)]
+struct DeviceSpecsRaw {
+    #[serde(default)]
+    functions: Vec<DpSpecRaw>,
+    #[serde(default)]
+    status:    Vec<DpSpecRaw>,
+}
+
+/// Processed device DP specifications — ready for profile detection.
+pub struct DeviceSpecs {
+    /// Union of all DP IDs from `functions` and `status`.
+    pub dp_ids: std::collections::HashSet<u16>,
 }
 
 // ─── Wire types ──────────────────────────────────────────────────────────────

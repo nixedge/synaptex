@@ -17,6 +17,28 @@ impl StateCache {
         self.0.insert(state.device_id, state);
     }
 
+    /// Merge a (possibly partial) state update into the cache.
+    ///
+    /// `online` and `updated_at_ms` are always overwritten.  All `Option`
+    /// fields are only overwritten when the incoming value is `Some`, so a
+    /// partial echo-back (e.g. only the mode DP changed) preserves the full
+    /// state that was built by the last complete poll.
+    pub fn merge(&self, new: DeviceState) {
+        self.0
+            .entry(new.device_id)
+            .and_modify(|s| {
+                s.online        = new.online;
+                s.updated_at_ms = new.updated_at_ms;
+                if let Some(v) = new.power        { s.power        = Some(v); }
+                if let Some(v) = new.brightness   { s.brightness   = Some(v); }
+                if let Some(v) = new.color_temp_k { s.color_temp_k = Some(v); }
+                if let Some(v) = new.rgb          { s.rgb          = Some(v); }
+                if !new.switches.is_empty()       { s.switches     = new.switches.clone(); }
+                if let Some(v) = new.fan_speed    { s.fan_speed    = Some(v); }
+            })
+            .or_insert(new);
+    }
+
     pub fn get(&self, id: &DeviceId) -> Option<DeviceState> {
         self.0.get(id).map(|r| r.clone())
     }
