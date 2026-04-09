@@ -240,7 +240,7 @@ async fn get(mac: String, http_url: &str, api_key: Option<&str>) -> Result<()> {
 
     if let Some(state) = d["state"].as_object() {
         let online = state["online"].as_bool().unwrap_or(false);
-        println!("online:    {}", online);
+        println!("online:    {}", if online { "yes" } else { "no" });
         if let Some(p) = state["power"].as_bool() {
             println!("power:     {}", if p { "on" } else { "off" });
         }
@@ -611,7 +611,7 @@ async fn probe(config_arg: Option<String>, set_dps: Vec<String>, _http_url: &str
             Ok(s) => s,
             Err(e) => {
                 println!("\n=== parsed state ===");
-                println!("  online:       false");
+                println!("  online:       no");
                 println!("  reason:       {e}");
                 return Ok(());
             }
@@ -641,7 +641,7 @@ async fn probe(config_arg: Option<String>, set_dps: Vec<String>, _http_url: &str
         }
 
         println!("\n=== parsed state ===");
-        println!("  online:       {}", state.online);
+        println!("  online:       {}", if state.online { "yes" } else { "no" });
         if !state.online {
             println!("  reason:       no DPS received within timeout (wrong credentials or protocol version?)");
         }
