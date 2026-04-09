@@ -84,9 +84,10 @@ struct Connection {
 }
 
 impl Connection {
-    /// Returns the appropriate DP-set command word for the negotiated protocol.
+    /// Returns the DP-set command word.
     ///
-    /// v3.4 and v3.5 devices use `ControlNew` (0x0D); v3.3 devices use `Control` (0x07).
+    /// v3.4 and v3.5 devices use `ControlNew` (0x0D); v3.3 uses `Control` (0x07).
+    /// tinytuya applies a `command_override: 13` for these protocol versions.
     fn control_cmd(&self) -> CommandWord {
         match &self.proto {
             ProtocolResult::V34(_) | ProtocolResult::V35(_) => CommandWord::ControlNew,
@@ -120,8 +121,8 @@ impl Connection {
                 }
                 ProtocolResult::V34(sk) => {
                     let sk = *sk;
-                    // ControlNew (0x0D) is the v3.4 data-frame command.
-                    // Prepend the 15-byte version prefix for data frames.
+                    // ControlNew (0x0D) data frames get the 15-byte version prefix
+                    // before ECB encryption (tinytuya NO_PROTOCOL_HEADER_CMDS).
                     let plaintext: Vec<u8> = if cmd == CommandWord::ControlNew {
                         let mut p = protocol::V34_DATA_PREFIX.to_vec();
                         p.extend_from_slice(payload);
@@ -201,7 +202,14 @@ impl Connection {
                 let plain: Vec<u8> = if is_v35 {
                     // GCM payload already decrypted by parse_frame_any.
                     if after_rc.is_empty() { continue; }
-                    after_rc.to_vec()
+                    // Echo-back from ControlNew includes a "3.5\0...\0" prefix
+                    // (tinytuya's version header) before the JSON.  Find the first
+                    // '{' or '[' and discard everything before it.
+                    let json_start = after_rc
+                        .iter()
+                        .position(|&b| b == b'{' || b == b'[')
+                        .unwrap_or(0);
+                    after_rc[json_start..].to_vec()
                 } else {
                     let enc = if after_rc.len() >= 15
                         && (after_rc.starts_with(b"3.3") || after_rc.starts_with(b"3.4"))
@@ -235,7 +243,12 @@ impl Connection {
                     debug!(device = %device_id, "non-JSON payload");
                     continue;
                 };
-                let Some(dps_obj) = val.get("dps").and_then(Value::as_object) else {
+                // Accept both the legacy flat format {"dps":{...}} and the
+                // protocol-4/5 envelope {"protocol":N,"data":{"dps":{...}}}
+                // used by v3.4/v3.5 echo-backs.
+                let dps_obj = val.get("dps").and_then(Value::as_object)
+                    .or_else(|| val.pointer("/data/dps").and_then(Value::as_object));
+                let Some(dps_obj) = dps_obj else {
                     debug!(device = %device_id, payload = %val, "JSON without dps");
                     continue;
                 };
@@ -700,23 +713,44 @@ impl DevicePlugin for TuyaPlugin {
     }
 
     async fn execute_command(&self, cmd: DeviceCommand) -> PluginResult<()> {
-        let dps = self
-            .command_to_dps(&cmd)
-            .ok_or(PluginError::UnsupportedCommand)?;
-
-        let t = (Self::epoch_ms() / 1000).to_string();
-        let payload = json!({
-            "devId": self.config.tuya_id,
-            "uid":   self.config.tuya_id,
-            "t":     t,
-            "dps":   dps,
-        })
-        .to_string();
-
-        info!(device = %self.info.id, cmd = ?cmd, dps = %dps, "→ control");
-
         let id = self.info.id;
-        let mut conn = self.open_connection().await.map_err(PluginError::from)?;
+
+        let dps = match self.command_to_dps(&cmd) {
+            Some(d) => d,
+            None => {
+                tracing::warn!(device = %id, cmd = ?cmd, "command not supported by this device's DP map");
+                return Err(PluginError::UnsupportedCommand);
+            }
+        };
+
+        info!(device = %id, cmd = ?cmd, dps = %dps, "→ control");
+
+        let mut conn = match self.open_connection().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(device = %id, "execute_command: open_connection failed: {e}");
+                return Err(PluginError::from(e));
+            }
+        };
+
+        // v3.4/v3.5 use the protocol-5 envelope; v3.3 uses the legacy devId/uid format.
+        let t = Self::epoch_ms() / 1000;
+        let payload = match &conn.proto {
+            ProtocolResult::V34(_) | ProtocolResult::V35(_) => json!({
+                "protocol": 5,
+                "t":        t,
+                "data":     { "dps": dps },
+            })
+            .to_string(),
+            ProtocolResult::V33 => json!({
+                "devId": self.config.tuya_id,
+                "uid":   self.config.tuya_id,
+                "t":     t.to_string(),
+                "dps":   dps,
+            })
+            .to_string(),
+        };
+
         let ctrl = conn.control_cmd();
         conn.send(ctrl, payload.as_bytes())
             .await
@@ -733,7 +767,7 @@ impl DevicePlugin for TuyaPlugin {
                 tracing::warn!(device = %id, "device rejected command: {e}");
             }
             Err(_elapsed) => {
-                debug!(device = %id, "no echo-back within 1 s");
+                tracing::warn!(device = %id, "no echo-back within 1 s — device may have rejected the command");
             }
         }
         Ok(())
