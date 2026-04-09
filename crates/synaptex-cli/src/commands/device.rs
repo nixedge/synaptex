@@ -767,9 +767,14 @@ async fn import(http_url: &str, api_key: Option<&str>) -> Result<()> {
         }
     }
     if !not_discovered.is_empty() {
-        println!("\nOnline but not found locally ({}):", not_discovered.len());
+        println!("\nNot found locally ({}) — register manually with 'device add':", not_discovered.len());
         for d in not_discovered {
-            println!("  {}  {}", d["id"].as_str().unwrap_or("?"), d["name"].as_str().unwrap_or("?"));
+            let id        = d["id"].as_str().unwrap_or("?");
+            let name      = d["name"].as_str().unwrap_or("?");
+            let local_key = d["local_key"].as_str().unwrap_or("?");
+            let online    = d["online"].as_bool().unwrap_or(false);
+            println!("  {}  {:32}  key:{}  [{}]",
+                id, name, local_key, if online { "online" } else { "offline" });
         }
     }
     if !skipped_virtual.is_empty() {
