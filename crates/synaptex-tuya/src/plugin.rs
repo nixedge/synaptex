@@ -106,7 +106,17 @@ impl Connection {
                     let sk = *sk;
                     let mut iv = [0u8; 12];
                     rand::thread_rng().fill_bytes(&mut iv);
-                    protocol::build_frame_v35(seq, cmd, payload, &sk, &iv)?
+                    // Data commands (Control, ControlNew) require the 15-byte
+                    // version prefix before GCM encryption.  Query/heartbeat/
+                    // session-key commands do not (tinytuya NO_PROTOCOL_HEADER_CMDS).
+                    let prefixed: Vec<u8> = if matches!(cmd, CommandWord::Control | CommandWord::ControlNew) {
+                        let mut p = protocol::V35_DATA_PREFIX.to_vec();
+                        p.extend_from_slice(payload);
+                        p
+                    } else {
+                        payload.to_vec()
+                    };
+                    protocol::build_frame_v35(seq, cmd, &prefixed, &sk, &iv)?
                 }
                 ProtocolResult::V34(sk) => {
                     let sk = *sk;
@@ -177,17 +187,22 @@ impl Connection {
                     "← rx"
                 );
 
+                // ── Strip and check return code ───────────────────────────────
+                if frame.payload.len() < 4 { continue; }
+                let rc = u32::from_be_bytes(frame.payload[0..4].try_into().unwrap());
+                if rc != 0 {
+                    return Err(TuyaError::Protocol(format!(
+                        "device returned error code {rc} (0x{rc:08X})"
+                    )));
+                }
+                let after_rc = &frame.payload[4..];
+
                 // ── Decrypt payload ───────────────────────────────────────────
                 let plain: Vec<u8> = if is_v35 {
-                    if frame.payload.is_empty() { continue; }
-                    frame.payload.to_vec()
+                    // GCM payload already decrypted by parse_frame_any.
+                    if after_rc.is_empty() { continue; }
+                    after_rc.to_vec()
                 } else {
-                    if frame.payload.len() <= 4 { continue; }
-                    let rc = u32::from_be_bytes(frame.payload[0..4].try_into().unwrap());
-                    if rc != 0 {
-                        debug!(device = %device_id, return_code = rc, "non-zero return code");
-                    }
-                    let after_rc = &frame.payload[4..];
                     let enc = if after_rc.len() >= 15
                         && (after_rc.starts_with(b"3.3") || after_rc.starts_with(b"3.4"))
                     {
@@ -491,13 +506,14 @@ impl TuyaPlugin {
                 resp.command
             )));
         }
-        if resp.payload.len() < 16 {
+        // resp.payload = retcode(4) + remote_nonce(16) + [hmac(32)]
+        if resp.payload.len() < 20 {
             return Err(TuyaError::Protocol(format!(
                 "v3.5 SessKeyNegResp payload too short: {} bytes",
                 resp.payload.len()
             )));
         }
-        let remote_nonce: [u8; 16] = resp.payload[..16].try_into().unwrap();
+        let remote_nonce: [u8; 16] = resp.payload[4..20].try_into().unwrap();
         let mut xor_nonces = [0u8; 16];
         for i in 0..16 {
             xor_nonces[i] = nonce35[i] ^ remote_nonce[i];
@@ -709,10 +725,16 @@ impl DevicePlugin for TuyaPlugin {
         // Best-effort: receive the state echo-back and push to bus.
         let dp_map = self.config.dp_map.clone();
         let bus_tx = self.bus_tx.clone();
-        if let Ok(Ok((state, raw_dps))) =
-            timeout(Duration::from_secs(1), conn.recv_state(&dp_map, id)).await
-        {
-            let _ = bus_tx.send(StateChangeEvent { device_id: id, state, raw_dps });
+        match timeout(Duration::from_secs(1), conn.recv_state(&dp_map, id)).await {
+            Ok(Ok((state, raw_dps))) => {
+                let _ = bus_tx.send(StateChangeEvent { device_id: id, state, raw_dps });
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(device = %id, "device rejected command: {e}");
+            }
+            Err(_elapsed) => {
+                debug!(device = %id, "no echo-back within 1 s");
+            }
         }
         Ok(())
     }

@@ -54,6 +54,13 @@ pub const V33_DATA_PREFIX: &[u8; 15] =
 pub const V34_DATA_PREFIX: &[u8; 15] =
     b"3.4\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 
+/// v3.5 command data prefix (15 bytes): `"3.5"` + 12 null bytes.
+/// Must be prepended to the plaintext of data commands (Control, ControlNew)
+/// before GCM encryption.  Not used for DpQuery, DpQueryNew, Heartbeat, or
+/// session-key negotiation frames (those are in tinytuya's NO_PROTOCOL_HEADER_CMDS).
+pub const V35_DATA_PREFIX: &[u8; 15] =
+    b"3.5\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+
 // ─── Trailer kind ─────────────────────────────────────────────────────────────
 
 /// Selects which trailer format to use when building or verifying 0x55AA frames.
@@ -345,13 +352,9 @@ fn parse_frame_v35(
 
     let plaintext = cipher::gcm_decrypt(key, iv, aad, ciphertext, tag)?;
 
-    // Strip 4-byte retcode from the front of the decrypted plaintext.
-    // Device→client frames always include a retcode as the first 4 bytes inside GCM.
-    let payload = if plaintext.len() >= 4 {
-        Bytes::from(plaintext[4..].to_vec())
-    } else {
-        Bytes::from(plaintext)
-    };
+    // Leave the 4-byte retcode in the payload so recv_state can inspect it
+    // consistently across all protocol versions.
+    let payload = Bytes::from(plaintext);
 
     let command = CommandWord::try_from(cmd_raw)?;
     Ok(Some((
