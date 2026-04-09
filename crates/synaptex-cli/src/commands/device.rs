@@ -276,12 +276,16 @@ async fn set(
             bail!("server error: {}", resp.text().await?);
         }
         let d: serde_json::Value = resp.json().await?;
-        matches!(device_type(&d).as_str(),
-            "rgb_bulb" | "bulb" | "fan+bulb" | "fan+rgb_bulb" | "fan+light"
-        )
+        let dtype = device_type(&d);
+        match dtype.as_str() {
+            // Groups may contain mixed device types — treat like a room and
+            // let build_command_json infer intent from whichever flags are set.
+            "group" => None,
+            t => Some(matches!(t, "rgb_bulb" | "bulb" | "fan+bulb" | "fan+rgb_bulb" | "fan+light")),
+        }
     };
 
-    let cmd_json = build_command_json(power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, Some(is_light))?;
+    let cmd_json = build_command_json(power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, is_light)?;
 
     let client = reqwest::Client::new();
     let mut req = client
