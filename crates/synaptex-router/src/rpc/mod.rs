@@ -11,13 +11,15 @@ use synaptex_router_proto::{
     StatusRequest, StatusResponse,
 };
 
-use crate::{db::RouterDb, dhcp, firewall};
+use crate::{db::RouterDb, dhcp::KeaClient, firewall};
 
 // ─── Service implementation ───────────────────────────────────────────────────
 
 pub struct RouterServiceImpl {
     pub discovery_tx: Arc<broadcast::Sender<DiscoveredDevice>>,
     pub db:           Arc<RouterDb>,
+    /// Kea control client — None when --kea-ctrl-socket is not configured.
+    pub kea:          Option<Arc<KeaClient>>,
 }
 
 type BoxStream<T> = Pin<Box<dyn futures_core::Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -32,7 +34,7 @@ impl RouterService for RouterServiceImpl {
     ) -> Result<Response<StatusResponse>, Status> {
         Ok(Response::new(StatusResponse {
             discovery_active:         true,
-            devices_seen_last_minute: 0, // TODO: track with an AtomicU32 + timestamp
+            devices_seen_last_minute: 0,
             version:                  env!("CARGO_PKG_VERSION").to_string(),
         }))
     }
@@ -45,11 +47,8 @@ impl RouterService for RouterServiceImpl {
         &self,
         _req: Request<DiscoveryRequest>,
     ) -> Result<Response<Self::WatchDiscoveryStream>, Status> {
-        // Subscribe before reading the DB snapshot to avoid a race where a
-        // change fires between the list and the subscribe.
         let rx = self.discovery_tx.subscribe();
 
-        // Send all currently-known devices as the initial burst.
         let known = self.db.list_all()
             .map_err(|e| Status::internal(e.to_string()))?
             .into_iter()
@@ -74,7 +73,15 @@ impl RouterService for RouterServiceImpl {
         &self,
         req: Request<DhcpReservation>,
     ) -> Result<Response<Ack>, Status> {
-        dhcp::add(req.get_ref()).await
+        let r = req.get_ref();
+        let Some(ref kea) = self.kea else {
+            return Ok(Response::new(Ack {
+                ok:    false,
+                error: "kea control socket not configured".into(),
+            }));
+        };
+        kea.reservation_add(&r.mac, &r.ip)
+            .await
             .map(|_| Response::new(Ack { ok: true, error: String::new() }))
             .map_err(|e| Status::internal(e.to_string()))
     }
@@ -83,7 +90,14 @@ impl RouterService for RouterServiceImpl {
         &self,
         req: Request<MacAddress>,
     ) -> Result<Response<Ack>, Status> {
-        dhcp::remove(&req.get_ref().mac).await
+        let Some(ref kea) = self.kea else {
+            return Ok(Response::new(Ack {
+                ok:    false,
+                error: "kea control socket not configured".into(),
+            }));
+        };
+        kea.reservation_del(&req.get_ref().mac)
+            .await
             .map(|_| Response::new(Ack { ok: true, error: String::new() }))
             .map_err(|e| Status::internal(e.to_string()))
     }
@@ -92,9 +106,19 @@ impl RouterService for RouterServiceImpl {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<DhcpReservationList>, Status> {
-        dhcp::list().await
-            .map(|reservations| Response::new(DhcpReservationList { reservations }))
-            .map_err(|e| Status::internal(e.to_string()))
+        // List from the router DB — these are the devices whose reservations
+        // we have pushed to Kea (or will push on next sync).
+        let reservations = self.db.list_all()
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .filter(|r| !r.mac.is_empty() && !r.ip.is_empty())
+            .map(|r| DhcpReservation {
+                mac:      r.mac,
+                ip:       r.ip,
+                hostname: r.tuya_id, // use tuya_id as a stable identifier
+            })
+            .collect();
+        Ok(Response::new(DhcpReservationList { reservations }))
     }
 
     // ── Firewall ──────────────────────────────────────────────────────────────

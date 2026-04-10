@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::sync::broadcast;
 use tonic::transport::{Identity, Server, ServerTlsConfig, Certificate};
-use tracing::info;
+use tracing::{info, warn};
 
 use synaptex_router_proto::router_service_server::RouterServiceServer;
 
@@ -61,6 +61,19 @@ struct Args {
     /// e.g. "10.10.20.1" or "10.10.20.1,10.10.21.1"
     #[arg(long, env = "SYNAPTEX_ROUTER_KEA_IOT_RELAY", value_delimiter = ',')]
     kea_iot_relay: Vec<std::net::Ipv4Addr>,
+
+    /// Unix socket path for the Kea DHCPv4 control channel.
+    /// Requires the host_cmds hook loaded in kea-dhcp4.conf.
+    /// When set, device reservations are pushed to Kea on discovery
+    /// and synced from the router DB at startup.
+    #[arg(long, env = "SYNAPTEX_ROUTER_KEA_CTRL_SOCKET")]
+    kea_ctrl_socket: Option<std::path::PathBuf>,
+
+    /// Kea DHCPv4 subnet-id for managed reservations.
+    /// Must match the subnet-id in kea-dhcp4.conf where discovered
+    /// devices should receive reserved IPs.
+    #[arg(long, env = "SYNAPTEX_ROUTER_KEA_SUBNET_ID", default_value = "0")]
+    kea_subnet_id: u32,
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -105,6 +118,22 @@ async fn main() -> Result<()> {
     let (discovery_tx, _) = broadcast::channel::<synaptex_router_proto::DiscoveredDevice>(64);
     let discovery_tx = Arc::new(discovery_tx);
 
+    // ── Kea control client ────────────────────────────────────────────────────
+    let kea_client: Option<Arc<dhcp::KeaClient>> = if let Some(socket) = args.kea_ctrl_socket {
+        info!(
+            path      = %socket.display(),
+            subnet_id = args.kea_subnet_id,
+            "dhcp: Kea control client configured",
+        );
+        let client = Arc::new(dhcp::KeaClient::new(socket, args.kea_subnet_id));
+        if let Err(e) = client.sync_from_db(&router_db).await {
+            warn!("dhcp: startup reservation sync failed: {e}");
+        }
+        Some(client)
+    } else {
+        None
+    };
+
     // ── Kea hook domain socket ───────────────────────────────────────────────
     if let Some(socket_path) = args.kea_socket {
         if args.kea_iot_relay.is_empty() {
@@ -115,17 +144,17 @@ async fn main() -> Result<()> {
             relays = ?args.kea_iot_relay,
             "kea: starting hook listener",
         );
-        kea::spawn(socket_path, args.kea_iot_relay);
+        kea::spawn(socket_path, args.kea_iot_relay, router_db.clone());
     }
 
     // ── Spawn UDP discovery listener ─────────────────────────────────────────
     let interfaces = args.interfaces
         .as_deref()
         .map(|s| s.split(',').map(str::trim).map(str::to_string).collect::<Vec<_>>());
-    discovery::spawn(discovery_tx.clone(), router_db.clone(), interfaces);
+    discovery::spawn(discovery_tx.clone(), router_db.clone(), interfaces, kea_client.clone());
 
     // ── gRPC service ──────────────────────────────────────────────────────────
-    let service = rpc::RouterServiceImpl { discovery_tx, db: router_db };
+    let service = rpc::RouterServiceImpl { discovery_tx, db: router_db, kea: kea_client };
 
     info!(listen = %args.listen, "gRPC server listening");
 

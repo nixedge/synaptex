@@ -39,6 +39,7 @@ use tokio::{net::UdpSocket, sync::broadcast};
 use synaptex_router_proto::DiscoveredDevice;
 
 use crate::db::{DeviceRecord, RouterDb};
+use crate::dhcp::KeaClient;
 
 // ─── Crypto ───────────────────────────────────────────────────────────────────
 
@@ -331,6 +332,7 @@ pub fn spawn(
     tx:         Arc<broadcast::Sender<DiscoveredDevice>>,
     db:         Arc<RouterDb>,
     interfaces: Option<Vec<String>>,
+    kea:        Option<Arc<KeaClient>>,
 ) {
     // Build the list of (port, Option<iface>) pairs to listen on.
     let iface_list: Vec<Option<String>> = match &interfaces {
@@ -346,8 +348,9 @@ pub fn spawn(
             let tx    = tx.clone();
             let db    = db.clone();
             let iface = iface.clone();
+            let kea   = kea.clone();
             tokio::spawn(async move {
-                listen_loop(port, tx, db, iface).await;
+                listen_loop(port, tx, db, iface, kea).await;
             });
         }
     }
@@ -362,6 +365,7 @@ async fn listen_loop(
     tx:    Arc<broadcast::Sender<DiscoveredDevice>>,
     db:    Arc<RouterDb>,
     iface: Option<String>,
+    kea:   Option<Arc<KeaClient>>,
 ) {
     let sock = match bind_udp(port, iface.as_deref()) {
         Ok(s)  => s,
@@ -405,6 +409,20 @@ async fn listen_loop(
         };
 
         if !changed { continue; }
+
+        // Push/refresh Kea reservation for new or IP-changed devices so Kea
+        // assigns the same IP on the next DHCP renewal.
+        if let Some(ref kea) = kea {
+            if !record.mac.is_empty() && !record.ip.is_empty() {
+                if let Err(e) = kea.reservation_add(&record.mac, &record.ip).await {
+                    tracing::warn!(
+                        mac = %record.mac,
+                        ip  = %record.ip,
+                        "discovery: kea reservation: {e}",
+                    );
+                }
+            }
+        }
 
         tracing::debug!(
             tuya_id = %parsed.tuya_id,

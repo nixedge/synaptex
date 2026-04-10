@@ -34,6 +34,8 @@
 
 use std::{net::Ipv4Addr, path::Path, sync::Arc};
 
+use crate::db::RouterDb;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -70,23 +72,42 @@ pub struct PktResponse {
 
 /// Classify a DHCP packet.
 ///
-/// Returns an empty list if `giaddr` is absent or not in `iot_relay_ips`,
-/// so Kea uses its NixOS-defined rules unmodified for non-IoT traffic.
-pub fn classify(req: &PktRequest, iot_relay_ips: &[Ipv4Addr]) -> Vec<&'static str> {
-    // Gate on giaddr — only act on IoT VLAN traffic.
+/// Always checks the router DB first — if the device is known, adds
+/// `SYNAPTEX_KNOWN` so Kea (and future nftables hooks) can distinguish
+/// managed devices from unknown ones.  Its IP reservation is handled
+/// separately by the discovery pipeline pushing to Kea on device upsert.
+///
+/// Additionally gates on `giaddr` for IoT VLAN classification: if the
+/// request arrived via a relay in `iot_relay_ips`, the device also gets
+/// `IOT_DEVICE` and any applicable vendor class.  Non-IoT traffic that
+/// is also unknown returns an empty list so Kea falls through to its
+/// statically-configured subnet rules unchanged.
+pub fn classify(req: &PktRequest, iot_relay_ips: &[Ipv4Addr], db: &RouterDb) -> Vec<&'static str> {
+    let mut classes: Vec<&'static str> = vec![];
+
+    // Known device check — O(1) sled lookup via MAC secondary index.
+    match db.get_by_mac(&req.mac) {
+        Ok(Some(_)) => {
+            debug!(mac = %req.mac, "kea: known device");
+            classes.push("SYNAPTEX_KNOWN");
+        }
+        Ok(None)    => {}
+        Err(e)      => warn!(mac = %req.mac, "kea: db lookup: {e}"),
+    }
+
+    // IoT VLAN classification (giaddr gating).
     let on_iot_vlan = req.giaddr.as_deref()
         .and_then(|s| s.parse::<Ipv4Addr>().ok())
         .map(|ip| iot_relay_ips.contains(&ip))
         .unwrap_or(false);
 
-    if !on_iot_vlan {
-        return vec![];
+    if on_iot_vlan {
+        classes.push("IOT_DEVICE");
+        if let Some(vendor) = classify_vendor(&req.mac, req.hostname.as_deref(), req.vendor_class.as_deref()) {
+            classes.push(vendor);
+        }
     }
 
-    let mut classes = vec!["IOT_DEVICE"];
-    if let Some(vendor) = classify_vendor(&req.mac, req.hostname.as_deref(), req.vendor_class.as_deref()) {
-        classes.push(vendor);
-    }
     classes
 }
 
@@ -153,16 +174,20 @@ fn oui_matches(mac: &str, prefixes: &[&str]) -> bool {
 /// Removes any stale socket file, binds a new `UnixListener`, and accepts
 /// connections indefinitely.  Each connection (one per Kea worker) is
 /// handled in its own task and is persistent for the shim's lifetime.
-pub fn spawn(path: impl AsRef<Path> + Send + 'static, iot_relay_ips: Vec<Ipv4Addr>) {
+pub fn spawn(
+    path:          impl AsRef<Path> + Send + 'static,
+    iot_relay_ips: Vec<Ipv4Addr>,
+    db:            Arc<RouterDb>,
+) {
     let iot_relay_ips = Arc::new(iot_relay_ips);
     tokio::spawn(async move {
-        if let Err(e) = run(path.as_ref(), &iot_relay_ips).await {
+        if let Err(e) = run(path.as_ref(), &iot_relay_ips, &db).await {
             warn!("kea socket listener exited: {e}");
         }
     });
 }
 
-async fn run(path: &Path, iot_relay_ips: &Arc<Vec<Ipv4Addr>>) -> Result<()> {
+async fn run(path: &Path, iot_relay_ips: &Arc<Vec<Ipv4Addr>>, db: &Arc<RouterDb>) -> Result<()> {
     let _ = tokio::fs::remove_file(path).await;
     let listener = UnixListener::bind(path)?;
     info!(path = %path.display(), "kea: listening for hook connections");
@@ -171,14 +196,19 @@ async fn run(path: &Path, iot_relay_ips: &Arc<Vec<Ipv4Addr>>) -> Result<()> {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let ips = iot_relay_ips.clone();
-                tokio::spawn(handle_connection(stream, ips));
+                let db  = db.clone();
+                tokio::spawn(handle_connection(stream, ips, db));
             }
             Err(e) => warn!("kea: accept error: {e}"),
         }
     }
 }
 
-async fn handle_connection(stream: UnixStream, iot_relay_ips: Arc<Vec<Ipv4Addr>>) {
+async fn handle_connection(
+    stream:        UnixStream,
+    iot_relay_ips: Arc<Vec<Ipv4Addr>>,
+    db:            Arc<RouterDb>,
+) {
     debug!("kea: shim connected");
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -186,7 +216,7 @@ async fn handle_connection(stream: UnixStream, iot_relay_ips: Arc<Vec<Ipv4Addr>>
     while let Ok(Some(line)) = lines.next_line().await {
         let response = match serde_json::from_str::<PktRequest>(&line) {
             Ok(req) => {
-                let classes = classify(&req, &iot_relay_ips);
+                let classes = classify(&req, &iot_relay_ips, &db);
                 debug!(
                     mac      = %req.mac,
                     giaddr   = ?req.giaddr,
