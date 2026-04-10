@@ -62,6 +62,81 @@
             '';
           };
 
+          # ── Kea DHCP integration ──────────────────────────────────────────────
+
+          keaSocket = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            example = "/run/synaptex-router/kea-hook.sock";
+            description = ''
+              Unix socket path for the Kea hook shim to connect to.
+              When set, the daemon classifies DHCP packets forwarded by the shim.
+              Must match the "socket" parameter in the kea-dhcp4.conf hooks-libraries entry.
+              Requires keaIotRelay to also be set.
+            '';
+          };
+
+          keaIotRelay = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [];
+            example = ["10.40.8.1"];
+            description = ''
+              Relay agent IP(s) for the IoT VLAN (giaddr values).
+              Only DHCP requests arriving via these relay IPs are classified as IOT_DEVICE.
+            '';
+          };
+
+          keaCtrlSocket = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            example = "/run/kea/kea-dhcp4.sock";
+            description = ''
+              Unix socket path for the Kea DHCPv4 control channel.
+              Requires the host_cmds hook in kea-dhcp4.conf.
+              When set, device reservations are pushed to Kea on discovery
+              and re-synced from the router DB at startup.
+            '';
+          };
+
+          keaSubnetId = lib.mkOption {
+            type = lib.types.int;
+            default = 0;
+            example = 10408;
+            description = ''
+              Kea DHCPv4 subnet-id for managed reservations.
+              Must match the subnet-id in kea-dhcp4.conf for the IoT VLAN subnet.
+            '';
+          };
+
+          # ── Managed IP allocation ─────────────────────────────────────────────
+
+          managedSubnet = lib.mkOption {
+            type = lib.types.str;
+            default = "10.40.8";
+            example = "192.168.10";
+            description = ''
+              First three octets of the subnet synaptex manages IP allocation within.
+              Synaptex allocates addresses between managedHostStart and managedHostEnd
+              and pushes them to Kea as reservations.
+            '';
+          };
+
+          managedHostStart = lib.mkOption {
+            type = lib.types.int;
+            default = 21;
+            description = ''
+              First host octet synaptex may allocate within the managed subnet.
+            '';
+          };
+
+          managedHostEnd = lib.mkOption {
+            type = lib.types.int;
+            default = 223;
+            description = ''
+              Last host octet synaptex may allocate within the managed subnet (inclusive).
+            '';
+          };
+
           openFirewall = lib.mkOption {
             type = lib.types.bool;
             default = false;
@@ -75,6 +150,10 @@
               assertion = (cfg.certFile == null) == (cfg.keyFile == null);
               message = "services.synaptex-router: certFile and keyFile must both be set or both be null.";
             }
+            {
+              assertion = cfg.keaSocket == null || cfg.keaIotRelay != [];
+              message = "services.synaptex-router: keaIotRelay must be set when keaSocket is configured.";
+            }
           ];
 
           networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [50052];
@@ -82,7 +161,7 @@
           systemd.services.synaptex-router = {
             description = "Synaptex router daemon";
             wantedBy = ["multi-user.target"];
-            after = ["network.target"];
+            after = ["network.target" "kea-dhcp4.service"];
 
             serviceConfig = let
               stateDir = "/var/lib/synaptex-router";
@@ -92,6 +171,9 @@
                   "${cfg.package}/bin/synaptex-router"
                   "--listen ${cfg.listenAddress}"
                   "--db ${cfg.dbPath}"
+                  "--managed-subnet ${cfg.managedSubnet}"
+                  "--managed-host-start ${toString cfg.managedHostStart}"
+                  "--managed-host-end ${toString cfg.managedHostEnd}"
                 ]
                 ++ lib.optionals (cfg.certFile != null) [
                   "--cert ${cfg.certFile}"
@@ -107,16 +189,29 @@
                 ++ lib.optionals (cfg.interfaces != []) [
                   "--interfaces ${lib.concatStringsSep "," cfg.interfaces}"
                 ]
+                ++ lib.optionals (cfg.keaSocket != null) [
+                  "--kea-socket ${cfg.keaSocket}"
+                  "--kea-iot-relay ${lib.concatStringsSep "," cfg.keaIotRelay}"
+                ]
+                ++ lib.optionals (cfg.keaCtrlSocket != null) [
+                  "--kea-ctrl-socket ${cfg.keaCtrlSocket}"
+                  "--kea-subnet-id ${toString cfg.keaSubnetId}"
+                ]
               );
 
               DynamicUser = true;
               StateDirectory = "synaptex-router";
               StateDirectoryMode = "0750";
+              # Socket for the Kea hook shim lives here.
+              RuntimeDirectory = "synaptex-router";
+              RuntimeDirectoryMode = "0755";
+              # Needs access to the Kea control socket (owned by kea group).
+              SupplementaryGroups = ["kea"];
 
               Restart = "on-failure";
               RestartSec = "5s";
 
-              # Needs CAP_NET_RAW for SO_BINDTODEVICE and raw UDP
+              # Needs CAP_NET_RAW for SO_BINDTODEVICE and raw UDP.
               AmbientCapabilities = ["CAP_NET_RAW"];
               CapabilityBoundingSet = ["CAP_NET_RAW"];
 
@@ -128,7 +223,8 @@
               ProtectKernelTunables = true;
               ProtectKernelModules = true;
               ProtectControlGroups = true;
-              RestrictAddressFamilies = ["AF_INET" "AF_INET6"];
+              # AF_UNIX needed for Kea control socket and hook socket.
+              RestrictAddressFamilies = ["AF_INET" "AF_INET6" "AF_UNIX"];
               LockPersonality = true;
               RestrictRealtime = true;
               SystemCallFilter = ["@system-service" "@network-io"];
