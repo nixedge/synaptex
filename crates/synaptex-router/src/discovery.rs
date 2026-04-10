@@ -38,7 +38,7 @@ use tokio::{net::UdpSocket, sync::broadcast};
 
 use synaptex_router_proto::DiscoveredDevice;
 
-use crate::db::{DeviceRecord, RouterDb};
+use crate::db::{DeviceKind, NetPolicy, RouterDb, RouterDevice};
 use crate::dhcp::KeaClient;
 
 // ─── Crypto ───────────────────────────────────────────────────────────────────
@@ -392,15 +392,53 @@ async fn listen_loop(
         let ip  = parsed.payload_ip.unwrap_or(src_ip);
         let mac = resolve_mac(ip).await;
 
-        let record = DeviceRecord {
-            tuya_id: parsed.tuya_id.clone(),
-            mac:     mac.clone(),
-            ip:      ip.to_string(),
-            version: parsed.version.clone(),
+        // Find an existing RouterDevice by native Tuya ID so we preserve the
+        // stable UUID across IP/MAC changes.  Construct a new record only when
+        // this tuya_id has never been seen before.
+        let device = match db.get_by_native_id(&parsed.tuya_id) {
+            Ok(Some(mut existing)) => {
+                existing.mac = mac.clone();
+                existing.ip  = ip.to_string();
+                if let DeviceKind::Tuya { ref mut version, .. } = existing.kind {
+                    *version = parsed.version.clone();
+                }
+                existing
+            }
+            _ => {
+                let device_id = uuid::Uuid::new_v4().to_string();
+                let managed_ip = match db.allocate_ip(&device_id) {
+                    Ok(addr) => {
+                        tracing::info!(
+                            tuya_id    = %parsed.tuya_id,
+                            managed_ip = %addr,
+                            "discovery: allocated managed IP",
+                        );
+                        Some(addr.to_string())
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            tuya_id = %parsed.tuya_id,
+                            "discovery: IP allocation failed: {e}",
+                        );
+                        None
+                    }
+                };
+                RouterDevice {
+                    device_id,
+                    ip:         ip.to_string(),
+                    mac:        mac.clone(),
+                    managed_ip,
+                    kind:       DeviceKind::Tuya {
+                        tuya_id: parsed.tuya_id.clone(),
+                        version: parsed.version.clone(),
+                    },
+                    net_policy: NetPolicy::Provisioning,
+                }
+            }
         };
 
         // Persist and only forward if something changed.
-        let changed = match db.upsert(&record) {
+        let changed = match db.upsert(&device) {
             Ok(c)  => c,
             Err(e) => {
                 tracing::warn!(tuya_id = %parsed.tuya_id, "discovery: db upsert error: {e}");
@@ -410,14 +448,15 @@ async fn listen_loop(
 
         if !changed { continue; }
 
-        // Push/refresh Kea reservation for new or IP-changed devices so Kea
-        // assigns the same IP on the next DHCP renewal.
+        // Push/refresh Kea reservation using the managed IP so the device
+        // migrates off the pool on its next DHCP renewal.
         if let Some(ref kea) = kea {
-            if !record.mac.is_empty() && !record.ip.is_empty() {
-                if let Err(e) = kea.reservation_add(&record.mac, &record.ip).await {
+            let kea_ip = device.managed_ip.as_deref().unwrap_or(device.ip.as_str());
+            if !device.mac.is_empty() && !kea_ip.is_empty() {
+                if let Err(e) = kea.reservation_add(&device.mac, kea_ip).await {
                     tracing::warn!(
-                        mac = %record.mac,
-                        ip  = %record.ip,
+                        mac = %device.mac,
+                        ip  = kea_ip,
                         "discovery: kea reservation: {e}",
                     );
                 }

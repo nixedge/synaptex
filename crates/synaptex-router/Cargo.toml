@@ -31,3 +31,4 @@ serde_json   = { workspace = true }
 socket2      = { workspace = true }
 sled         = { workspace = true }
 postcard     = { workspace = true }
+uuid         = { workspace = true }

@@ -11,7 +11,7 @@ use synaptex_router_proto::{
     StatusRequest, StatusResponse,
 };
 
-use crate::{db::RouterDb, dhcp::KeaClient, firewall};
+use crate::{db::{DeviceKind, RouterDb}, dhcp::KeaClient, firewall};
 
 // ─── Service implementation ───────────────────────────────────────────────────
 
@@ -52,12 +52,13 @@ impl RouterService for RouterServiceImpl {
         let known = self.db.list_all()
             .map_err(|e| Status::internal(e.to_string()))?
             .into_iter()
-            .map(|r| Ok(DiscoveredDevice {
-                tuya_id: r.tuya_id,
-                ip:      r.ip,
-                mac:     r.mac,
-                version: r.version,
-            }));
+            .map(|d| {
+                let (tuya_id, version) = match &d.kind {
+                    DeviceKind::Tuya { tuya_id, version } => (tuya_id.clone(), version.clone()),
+                    _ => (String::new(), String::new()),
+                };
+                Ok(DiscoveredDevice { tuya_id, ip: d.ip, mac: d.mac, version })
+            });
 
         let initial = tokio_stream::iter(known);
         let changes = BroadcastStream::new(rx)
@@ -111,11 +112,13 @@ impl RouterService for RouterServiceImpl {
         let reservations = self.db.list_all()
             .map_err(|e| Status::internal(e.to_string()))?
             .into_iter()
-            .filter(|r| !r.mac.is_empty() && !r.ip.is_empty())
-            .map(|r| DhcpReservation {
-                mac:      r.mac,
-                ip:       r.ip,
-                hostname: r.tuya_id, // use tuya_id as a stable identifier
+            .filter(|d| !d.mac.is_empty() && !d.ip.is_empty())
+            .map(|d| {
+                let hostname = match &d.kind {
+                    DeviceKind::Tuya { tuya_id, .. } => tuya_id.clone(),
+                    _ => d.device_id.clone(),
+                };
+                DhcpReservation { mac: d.mac, ip: d.ip, hostname }
             })
             .collect();
         Ok(Response::new(DhcpReservationList { reservations }))

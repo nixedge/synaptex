@@ -74,6 +74,20 @@ struct Args {
     /// devices should receive reserved IPs.
     #[arg(long, env = "SYNAPTEX_ROUTER_KEA_SUBNET_ID", default_value = "0")]
     kea_subnet_id: u32,
+
+    /// First three octets of the managed device subnet, e.g. "10.40.8".
+    /// Synaptex allocates addresses within this subnet and pushes them to Kea
+    /// as reservations so devices never use the default pool.
+    #[arg(long, env = "SYNAPTEX_ROUTER_MANAGED_SUBNET", default_value = "10.40.8")]
+    managed_subnet: String,
+
+    /// First host octet synaptex may allocate within the managed subnet.
+    #[arg(long, env = "SYNAPTEX_ROUTER_MANAGED_HOST_START", default_value = "21")]
+    managed_host_start: u8,
+
+    /// Last host octet synaptex may allocate within the managed subnet (inclusive).
+    #[arg(long, env = "SYNAPTEX_ROUTER_MANAGED_HOST_END", default_value = "223")]
+    managed_host_end: u8,
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -108,9 +122,24 @@ async fn main() -> Result<()> {
     }
 
     // ── Persistent device database ───────────────────────────────────────────
+    let managed_subnet: [u8; 3] = {
+        let parts: Vec<u8> = args.managed_subnet
+            .split('.')
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        anyhow::ensure!(
+            parts.len() == 3,
+            "--managed-subnet must be three octets, e.g. '10.40.8' (got '{}')",
+            args.managed_subnet,
+        );
+        [parts[0], parts[1], parts[2]]
+    };
     std::fs::create_dir_all(&args.db).context("create router db directory")?;
     let sled_db = sled::open(&args.db).context("open router sled database")?;
-    let router_db = Arc::new(db::RouterDb::open(&sled_db).context("open router db trees")?);
+    let router_db = Arc::new(
+        db::RouterDb::open(&sled_db, managed_subnet, args.managed_host_start, args.managed_host_end)
+            .context("open router db trees")?
+    );
 
     // ── Discovery broadcast channel ───────────────────────────────────────────
     // The discovery listener sends DiscoveredDevice events on this channel.

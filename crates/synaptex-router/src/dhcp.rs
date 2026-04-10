@@ -74,12 +74,13 @@ impl KeaClient {
         let total   = devices.len();
         let mut pushed = 0usize;
         for d in &devices {
-            if d.mac.is_empty() || d.ip.is_empty() {
+            let kea_ip = d.managed_ip.as_deref().unwrap_or(d.ip.as_str());
+            if d.mac.is_empty() || kea_ip.is_empty() {
                 continue;
             }
-            match self.reservation_add(&d.mac, &d.ip).await {
+            match self.reservation_add(&d.mac, kea_ip).await {
                 Ok(())  => pushed += 1,
-                Err(e)  => warn!(mac = %d.mac, ip = %d.ip, "dhcp: sync: {e}"),
+                Err(e)  => warn!(mac = %d.mac, ip = kea_ip, "dhcp: sync: {e}"),
             }
         }
         info!(total, pushed, "dhcp: startup reservation sync complete");
