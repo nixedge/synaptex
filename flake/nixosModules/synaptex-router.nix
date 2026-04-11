@@ -220,13 +220,32 @@
                   '';
                 };
               in {
-                postInstall = (old.postInstall or "") + ''
-                  install -Dm755 ${keaHook}/lib/kea/hooks/synaptex_hook.so \
-                    $out/lib/kea/hooks/synaptex_hook.so
-                '';
+                postInstall =
+                  (old.postInstall or "")
+                  + ''
+                    install -Dm755 ${keaHook}/lib/kea/hooks/synaptex_hook.so \
+                      $out/lib/kea/hooks/synaptex_hook.so
+                  '';
               });
             })
           ];
+
+          # Ensure a static "kea" group exists so the socket ownership below
+          # resolves to a named group rather than a transient DynamicUser GID.
+          users.groups.kea = lib.mkIf (cfg.keaCtrlSocket != null || cfg.keaSocket != null) {};
+
+          # Kea uses DynamicUser = true, so its control socket is owned by a
+          # transient UID/GID that appears as "nobody/nogroup".  Override the
+          # kea-dhcp4-server service to use a static "kea" group and set the
+          # runtime directory / umask so the socket is group-accessible.
+          # synaptex-router's SupplementaryGroups = ["kea"] then grants access.
+          systemd.services.kea-dhcp4-server = lib.mkIf (cfg.keaCtrlSocket != null) {
+            serviceConfig = {
+              Group = lib.mkForce "kea";
+              RuntimeDirectoryMode = lib.mkForce "0750";
+              UMask = lib.mkForce "0007";
+            };
+          };
 
           systemd.services.synaptex-router = {
             description = "Synaptex router daemon";
