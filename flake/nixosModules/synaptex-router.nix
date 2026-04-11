@@ -246,6 +246,7 @@
           # Type "e" adjusts ownership/mode without altering contents.
           systemd.tmpfiles.rules = lib.mkIf (cfg.keaCtrlSocket != null) [
             "e /run/kea 0750 kea kea -"
+            "Z /run/kea - kea kea -"
           ];
 
           # Switch kea-dhcp4-server off DynamicUser so the control socket is
