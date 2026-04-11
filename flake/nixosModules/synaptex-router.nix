@@ -1,5 +1,5 @@
 {
-  flake = {config, ...}: {
+  flake = {config, self, ...}: {
     nixosModules = {
       synaptex-router = {
         lib,
@@ -157,6 +157,37 @@
           ];
 
           networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [50052];
+
+          # Bundle synaptex_hook.so into the consumer's kea store path.
+          # Kea 2.5+ validates that hook libraries reside under its own installation
+          # prefix (a compile-time constant).  We must compile the hook against the
+          # *consumer's* pkgs.kea so KEA_HOOKS_VERSION matches exactly, then inject
+          # the resulting .so via overrideAttrs so it lands at the right path.
+          nixpkgs.overlays = [
+            (_final: prev: {
+              kea = prev.kea.overrideAttrs (old: let
+                keaHook = prev.stdenv.mkDerivation {
+                  pname = "synaptex-kea-hook";
+                  version = "0.1.0";
+                  src = self + "/src/kea-hook";
+                  nativeBuildInputs = [prev.cmake];
+                  buildInputs = [prev.kea prev.boost];
+                  cmakeFlags = ["-DKEA_INCLUDE_DIR=${prev.kea}/include/kea"];
+                  installPhase = ''
+                    runHook preInstall
+                    install -Dm755 synaptex_hook.so \
+                      $out/lib/kea/hooks/synaptex_hook.so
+                    runHook postInstall
+                  '';
+                };
+              in {
+                postInstall = (old.postInstall or "") + ''
+                  install -Dm755 ${keaHook}/lib/kea/hooks/synaptex_hook.so \
+                    $out/lib/kea/hooks/synaptex_hook.so
+                '';
+              });
+            })
+          ];
 
           systemd.services.synaptex-router = {
             description = "Synaptex router daemon";
