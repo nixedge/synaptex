@@ -38,5 +38,5 @@ set_target_properties(synaptex_hook PROPERTIES
 )
 
 target_compile_options(synaptex_hook PRIVATE
-    -Wall -Wextra -fvisibility=hidden
+    -Wall -Wextra
 )
