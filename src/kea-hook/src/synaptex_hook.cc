@@ -198,6 +198,12 @@ int version() {
     return KEA_HOOKS_VERSION;
 }
 
+// Each worker thread uses its own thread_local socket — no shared mutable
+// state, so this hook is safe to run under Kea's multi-threading mode.
+int multi_threading_compatible() {
+    return 1;
+}
+
 int load(LibraryHandle& handle) {
     ConstElementPtr params = handle.getParameters();
     if (!params) {
