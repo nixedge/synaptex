@@ -29,6 +29,7 @@ hex          = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 socket2      = { workspace = true }
+nix          = { version = "0.29", features = ["fs", "user"] }
 sled         = { workspace = true }
 postcard     = { workspace = true }
 uuid         = { workspace = true }

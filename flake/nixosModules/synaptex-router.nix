@@ -253,7 +253,7 @@
               # Socket for the Kea hook shim lives here.
               RuntimeDirectory = "synaptex-router";
               RuntimeDirectoryMode = "0755";
-              # Needs access to the Kea control socket (owned by kea group).
+              # Needed to chown the hook socket to group "kea" after binding.
               SupplementaryGroups = ["kea"];
 
               Restart = "on-failure";
@@ -271,7 +271,7 @@
               ProtectKernelTunables = true;
               ProtectKernelModules = true;
               ProtectControlGroups = true;
-              # AF_UNIX needed for Kea control socket and hook socket.
+              # AF_UNIX needed for the kea hook classification/cmd socket.
               RestrictAddressFamilies = ["AF_INET" "AF_INET6" "AF_UNIX"];
               LockPersonality = true;
               RestrictRealtime = true;

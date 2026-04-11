@@ -217,6 +217,21 @@ async fn run(
 ) -> Result<()> {
     let _ = tokio::fs::remove_file(path).await;
     let listener = UnixListener::bind(path)?;
+    // Set socket group to "kea" and permissions to 0660 so only the kea process
+    // can connect.  synaptex-router has SupplementaryGroups=["kea"] so the chown
+    // is permitted.  Linux requires the write bit on a Unix socket for connect(2).
+    match nix::unistd::Group::from_name("kea") {
+        Ok(Some(grp)) => {
+            nix::unistd::chown(path, None, Some(grp.gid)).ok();
+            nix::sys::stat::fchmodat(
+                None,
+                path,
+                nix::sys::stat::Mode::from_bits_truncate(0o660),
+                nix::sys::stat::FchmodatFlags::FollowSymlink,
+            ).ok();
+        }
+        _ => warn!("kea: group 'kea' not found — hook socket permissions unchanged"),
+    }
     info!(path = %path.display(), "kea: listening for hook connections");
 
     loop {
