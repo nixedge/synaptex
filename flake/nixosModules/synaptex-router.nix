@@ -86,15 +86,17 @@
             '';
           };
 
-          keaCtrlSocket = lib.mkOption {
+          keaCmdSocket = lib.mkOption {
             type = lib.types.nullOr lib.types.str;
             default = null;
-            example = "/run/kea/kea-dhcp4.sock";
+            example = "/run/kea/synaptex-cmd.sock";
             description = ''
-              Unix socket path for the Kea DHCPv4 control channel.
-              Requires the host_cmds hook in kea-dhcp4.conf.
-              When set, device reservations are pushed to Kea on discovery
-              and re-synced from the router DB at startup.
+              Unix socket path for the synaptex kea-hook command channel.
+              The hook creates this socket (world-accessible) at load time;
+              configure the same path as "cmd_socket" in kea-dhcp4.conf's
+              hooks-libraries parameters entry.
+              When set, device reservations are pushed via the hook's HostMgr
+              API on discovery and re-synced from the router DB at startup.
             '';
           };
 
@@ -134,18 +136,6 @@
             default = 223;
             description = ''
               Last host octet synaptex may allocate within the managed subnet (inclusive).
-            '';
-          };
-
-          managedLeaseSecs = lib.mkOption {
-            type = lib.types.nullOr lib.types.int;
-            default = null;
-            example = 86400;
-            description = ''
-              DHCP valid lifetime (seconds) for managed (reserved) devices.
-              Also sets T1 = lease÷2 and T2 = lease×7÷8 via per-reservation
-              option-data, overriding the subnet-level renew/rebind timers.
-              Leave null to inherit subnet defaults.
             '';
           };
 
@@ -230,39 +220,6 @@
             })
           ];
 
-          # Static kea user/group so the control socket has a named group owner.
-          # DynamicUser = true forces both UID and GID to be transient, so even
-          # setting Group= doesn't change the socket's group to a named group.
-          # Using a static user/group is the only reliable fix.
-          users.users.kea = lib.mkIf (cfg.keaCtrlSocket != null) {
-            isSystemUser = true;
-            group = "kea";
-          };
-          users.groups.kea = lib.mkIf (cfg.keaCtrlSocket != null || cfg.keaSocket != null) {};
-
-          # Ensure /run/kea/ is owned by the static kea user on every activation.
-          # When transitioning from DynamicUser=true, the directory retains its
-          # old transient ownership even across service restarts (RuntimeDirectoryPreserve).
-          # Type "e" adjusts ownership/mode without altering contents.
-          systemd.tmpfiles.rules = lib.mkIf (cfg.keaCtrlSocket != null) [
-            "e /run/kea 0750 kea kea -"
-            "Z /run/kea - kea kea -"
-          ];
-
-          # Switch kea-dhcp4-server off DynamicUser so the control socket is
-          # owned by the static "kea" group.  UMask = "0007" ensures the socket
-          # is group-writable; synaptex-router's SupplementaryGroups = ["kea"]
-          # then grants access.
-          systemd.services.kea-dhcp4-server = lib.mkIf (cfg.keaCtrlSocket != null) {
-            serviceConfig = {
-              DynamicUser = lib.mkForce false;
-              User = "kea";
-              Group = "kea";
-              RuntimeDirectoryMode = "0750";
-              UMask = lib.mkForce "0007";
-            };
-          };
-
           systemd.services.synaptex-router = {
             description = "Synaptex router daemon";
             wantedBy = ["multi-user.target"];
@@ -298,12 +255,9 @@
                   "--kea-socket ${cfg.keaSocket}"
                   "--kea-iot-relay ${lib.concatStringsSep "," cfg.keaIotRelay}"
                 ]
-                ++ lib.optionals (cfg.keaCtrlSocket != null) [
-                  "--kea-ctrl-socket ${cfg.keaCtrlSocket}"
+                ++ lib.optionals (cfg.keaCmdSocket != null) [
+                  "--kea-cmd-socket ${cfg.keaCmdSocket}"
                   "--kea-subnet-id ${toString cfg.keaSubnetId}"
-                ]
-                ++ lib.optionals (cfg.managedLeaseSecs != null) [
-                  "--managed-lease-secs ${toString cfg.managedLeaseSecs}"
                 ]
               );
 

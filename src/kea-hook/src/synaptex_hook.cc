@@ -1,25 +1,41 @@
 // synaptex_hook.cc — Kea pkt4_receive hook shim
 //
-// Forwards DHCP packet metadata to synaptex-router via a persistent Unix
-// domain socket and applies the returned client-class names to the packet.
+// Two responsibilities:
+//
+// 1. DHCP classification (pkt4_receive):
+//    Connects to synaptex-router's Unix socket, forwards packet metadata,
+//    and applies the returned client-class names to the packet.
+//
+// 2. Reservation command server (optional):
+//    If "cmd_socket" is configured, listens on a Unix socket for
+//    reservation-add / reservation-del commands from synaptex-router
+//    and applies them via kea's HostMgr in-process API.
+//    The socket is created world-accessible (0666); kea's security policy
+//    only applies to its own control socket, not hook-created sockets.
 //
 // Configuration (kea-dhcp4.conf hooks-libraries entry):
 //   {
 //     "library": "/path/to/synaptex_hook.so",
-//     "parameters": { "socket": "/run/synaptex/kea-hook.sock" }
+//     "parameters": {
+//       "socket":     "/run/synaptex-router/kea-hook.sock",
+//       "cmd_socket": "/run/kea/synaptex-cmd.sock"
+//     }
 //   }
 //
-// If synaptex-router is unavailable the shim silently passes through with no
-// classes set, so Kea continues with its statically-configured subnet rules.
+// If synaptex-router is unavailable the shim silently passes through.
 
 #include <hooks/hooks.h>
 #include <dhcp/pkt4.h>
 #include <dhcp/dhcp4.h>
 #include <cc/data.h>
 #include <asiolink/io_address.h>
+#include <dhcpsrv/host_mgr.h>
+#include <dhcpsrv/host.h>
+#include <boost/make_shared.hpp>
 
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <cstring>
 #include <cerrno>
@@ -28,6 +44,9 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 using namespace isc::hooks;
 using namespace isc::dhcp;
@@ -41,7 +60,129 @@ static std::string g_socket_path;
 // DHCP clients retry after 4 s so 50 ms is safe.
 static constexpr int TIMEOUT_MS = 50;
 
-// ─── Per-thread persistent socket ─────────────────────────────────────────────
+// ─── Reservation command server ───────────────────────────────────────────────
+
+static std::string  g_cmd_socket_path;
+static int          g_cmd_server_fd = -1;
+static std::thread  g_cmd_thread;
+static std::atomic<bool> g_cmd_running{false};
+static std::mutex   g_hostmgr_mutex;
+
+// Parse "fc:65:de:aa:bb:cc" → bytes.
+static std::vector<uint8_t> parse_mac_bytes(const std::string& mac) {
+    std::vector<uint8_t> out;
+    out.reserve(6);
+    std::istringstream ss(mac);
+    std::string tok;
+    while (std::getline(ss, tok, ':')) {
+        out.push_back(static_cast<uint8_t>(std::stoi(tok, nullptr, 16)));
+    }
+    return out;
+}
+
+static std::string handle_reservation_add(ConstElementPtr args) {
+    auto mac_e    = args->get("mac");
+    auto ip_e     = args->get("ip");
+    auto subnet_e = args->get("subnet_id");
+    if (!mac_e || !ip_e || !subnet_e) {
+        return "{\"result\":1,\"text\":\"missing mac/ip/subnet_id\"}\n";
+    }
+    try {
+        auto mac  = parse_mac_bytes(mac_e->stringValue());
+        auto host = boost::make_shared<Host>(
+            mac.data(), mac.size(),
+            Host::IDENT_HWADDR,
+            SubnetID(subnet_e->intValue()),
+            SUBNET_ID_UNUSED,
+            isc::asiolink::IOAddress(ip_e->stringValue())
+        );
+        std::lock_guard<std::mutex> lk(g_hostmgr_mutex);
+        try {
+            HostMgr::instance().add(host);
+        } catch (const DuplicateHost&) {
+            // Upsert: remove old reservation then re-add.
+            HostMgr::instance().del4(
+                SubnetID(subnet_e->intValue()),
+                Host::IDENT_HWADDR,
+                mac.data(), mac.size()
+            );
+            HostMgr::instance().add(host);
+        }
+        return "{\"result\":0,\"text\":\"ok\"}\n";
+    } catch (const std::exception& e) {
+        return std::string("{\"result\":1,\"text\":\"") + e.what() + "\"}\n";
+    }
+}
+
+static std::string handle_reservation_del(ConstElementPtr args) {
+    auto mac_e    = args->get("mac");
+    auto subnet_e = args->get("subnet_id");
+    if (!mac_e || !subnet_e) {
+        return "{\"result\":1,\"text\":\"missing mac/subnet_id\"}\n";
+    }
+    try {
+        auto mac = parse_mac_bytes(mac_e->stringValue());
+        std::lock_guard<std::mutex> lk(g_hostmgr_mutex);
+        HostMgr::instance().del4(
+            SubnetID(subnet_e->intValue()),
+            Host::IDENT_HWADDR,
+            mac.data(), mac.size()
+        );
+        return "{\"result\":0,\"text\":\"ok\"}\n";
+    } catch (const std::exception& e) {
+        return std::string("{\"result\":1,\"text\":\"") + e.what() + "\"}\n";
+    }
+}
+
+static std::string dispatch_cmd(const std::string& line) {
+    try {
+        ConstElementPtr msg = Element::fromJSON(line);
+        auto cmd_e = msg->get("cmd");
+        if (!cmd_e) return "{\"result\":1,\"text\":\"missing cmd\"}\n";
+        std::string cmd = cmd_e->stringValue();
+        if (cmd == "reservation-add") {
+            return handle_reservation_add(msg);
+        } else if (cmd == "reservation-del") {
+            return handle_reservation_del(msg);
+        } else {
+            return "{\"result\":1,\"text\":\"unknown cmd\"}\n";
+        }
+    } catch (const std::exception& e) {
+        return std::string("{\"result\":1,\"text\":\"parse error: ") + e.what() + "\"}\n";
+    }
+}
+
+static void cmd_server_loop() {
+    while (g_cmd_running) {
+        int conn = ::accept(g_cmd_server_fd, nullptr, nullptr);
+        if (conn < 0) {
+            if (g_cmd_running) {
+                fprintf(stderr, "synaptex_hook: cmd accept: %s\n", strerror(errno));
+            }
+            break;
+        }
+
+        // Read newline-delimited JSON commands, respond to each.
+        std::string buf;
+        char ch;
+        while (true) {
+            ssize_t n = ::read(conn, &ch, 1);
+            if (n <= 0) break;
+            if (ch == '\n') {
+                if (!buf.empty()) {
+                    std::string resp = dispatch_cmd(buf);
+                    ::write(conn, resp.c_str(), resp.size());
+                    buf.clear();
+                }
+            } else {
+                buf += ch;
+            }
+        }
+        ::close(conn);
+    }
+}
+
+// ─── Per-thread persistent socket (classification) ────────────────────────────
 //
 // Each Kea worker thread gets its own connection.  Thread-local storage means
 // no locking needed; the destructor closes the fd when the thread exits.
@@ -217,10 +358,63 @@ int load(LibraryHandle& handle) {
     }
     g_socket_path = socket_elem->stringValue();
     fprintf(stderr, "synaptex_hook: loaded, socket=%s\n", g_socket_path.c_str());
+
+    // Optional reservation command socket.
+    ConstElementPtr cmd_elem = params->get("cmd_socket");
+    if (cmd_elem && cmd_elem->getType() == Element::string) {
+        g_cmd_socket_path = cmd_elem->stringValue();
+
+        ::unlink(g_cmd_socket_path.c_str());
+
+        int sfd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sfd < 0) {
+            fprintf(stderr, "synaptex_hook: cmd socket(): %s\n", strerror(errno));
+            return 1;
+        }
+
+        struct sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        ::strncpy(addr.sun_path, g_cmd_socket_path.c_str(), sizeof(addr.sun_path) - 1);
+
+        if (::bind(sfd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+            fprintf(stderr, "synaptex_hook: cmd bind(%s): %s\n",
+                    g_cmd_socket_path.c_str(), strerror(errno));
+            ::close(sfd);
+            return 1;
+        }
+
+        // World-accessible — kea's security policy only applies to its own
+        // control socket, not to hook-created sockets.
+        ::chmod(g_cmd_socket_path.c_str(), 0666);
+
+        if (::listen(sfd, 8) < 0) {
+            fprintf(stderr, "synaptex_hook: cmd listen: %s\n", strerror(errno));
+            ::close(sfd);
+            return 1;
+        }
+
+        g_cmd_server_fd = sfd;
+        g_cmd_running   = true;
+        g_cmd_thread    = std::thread(cmd_server_loop);
+
+        fprintf(stderr, "synaptex_hook: cmd_socket=%s\n", g_cmd_socket_path.c_str());
+    }
+
     return 0;
 }
 
 int unload() {
+    if (g_cmd_server_fd >= 0) {
+        g_cmd_running = false;
+        ::close(g_cmd_server_fd);
+        g_cmd_server_fd = -1;
+        if (g_cmd_thread.joinable()) {
+            g_cmd_thread.join();
+        }
+        if (!g_cmd_socket_path.empty()) {
+            ::unlink(g_cmd_socket_path.c_str());
+        }
+    }
     // tls_sock cleaned up per-thread automatically.
     return 0;
 }

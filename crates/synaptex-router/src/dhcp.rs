@@ -1,22 +1,26 @@
-/// Kea DHCP4 control socket client.
+/// Kea reservation client via the synaptex hook command socket.
 ///
-/// Pushes host reservations into Kea's in-memory host cache via the
-/// `host_cmds` hook library.  Requires in kea-dhcp4.conf:
+/// Instead of connecting to Kea's own control socket (which Kea enforces
+/// strict permissions on), synaptex-router connects to a socket created by
+/// the synaptex_hook.so shared library running inside the Kea process.
+/// The hook handles reservation-add / reservation-del commands using Kea's
+/// in-process HostMgr API.
 ///
+/// Configure in kea-dhcp4.conf:
 /// ```json
-/// "control-socket": { "socket-type": "unix", "socket-name": "/run/kea/kea4.sock" },
-/// "hooks-libraries": [{ "library": "/path/to/libdhcp_host_cmds.so" }]
+/// "hooks-libraries": [{
+///   "library": "/path/to/synaptex_hook.so",
+///   "parameters": {
+///     "socket":     "/run/synaptex-router/kea-hook.sock",
+///     "cmd_socket": "/run/kea/synaptex-cmd.sock"
+///   }
+/// }]
 /// ```
-///
-/// Reservations survive Kea SIGHUP (config reload) but are lost on a full
-/// daemon restart.  `sync_from_db` re-pushes all known devices at router
-/// startup to cover that case.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 
@@ -25,45 +29,43 @@ use crate::db::RouterDb;
 // ─── Client ───────────────────────────────────────────────────────────────────
 
 pub struct KeaClient {
-    socket_path:        PathBuf,
-    subnet_id:          u32,
-    /// When set, managed reservations advertise this valid lifetime plus
-    /// T1 (lease/2) and T2 (lease×7/8) via per-reservation option-data,
-    /// overriding the subnet-level renew/rebind timers.
-    managed_lease_secs: Option<u32>,
+    socket_path: PathBuf,
+    subnet_id:   u32,
 }
 
 impl KeaClient {
-    pub fn new(socket_path: PathBuf, subnet_id: u32, managed_lease_secs: Option<u32>) -> Self {
-        Self { socket_path, subnet_id, managed_lease_secs }
+    pub fn new(socket_path: PathBuf, subnet_id: u32) -> Self {
+        Self { socket_path, subnet_id }
     }
 
     /// Add or refresh a host reservation (MAC → IP).
     ///
-    /// If a reservation already exists for this MAC (e.g. the device is
-    /// renewing with a different IP), deletes it first then re-adds so the
-    /// entry stays current (upsert semantics).
+    /// Upsert semantics: duplicate detection is handled in the hook via
+    /// DuplicateHost exception (delete + re-add).
     pub async fn reservation_add(&self, hw_address: &str, ip: &str) -> Result<()> {
         let mac = hw_address.to_ascii_lowercase();
-        match self.send(&self.add_cmd(&mac, ip)).await {
-            Ok(()) => {
-                debug!(%mac, %ip, "dhcp: reservation added");
-                Ok(())
-            }
-            Err(e) if is_duplicate(&e) => {
-                info!(%mac, %ip, "dhcp: duplicate reservation — refreshing");
-                self.del_inner(&mac).await.ok();
-                self.send(&self.add_cmd(&mac, ip)).await
-            }
-            Err(e) => Err(e),
-        }
+        let cmd = serde_json::json!({
+            "cmd":       "reservation-add",
+            "mac":       mac,
+            "ip":        ip,
+            "subnet_id": self.subnet_id,
+        })
+        .to_string();
+        self.send(&cmd).await.map(|_| {
+            debug!(%mac, %ip, "dhcp: reservation added");
+        })
     }
 
-    /// Remove a reservation by MAC address.  Non-fatal if the reservation
-    /// does not exist.
+    /// Remove a reservation by MAC address.  Non-fatal if not found.
     pub async fn reservation_del(&self, hw_address: &str) -> Result<()> {
         let mac = hw_address.to_ascii_lowercase();
-        if let Err(e) = self.del_inner(&mac).await {
+        let cmd = serde_json::json!({
+            "cmd":       "reservation-del",
+            "mac":       mac,
+            "subnet_id": self.subnet_id,
+        })
+        .to_string();
+        if let Err(e) = self.send(&cmd).await {
             warn!(%mac, "dhcp: reservation-del: {e}");
         }
         Ok(())
@@ -78,11 +80,12 @@ impl KeaClient {
         let total   = devices.len();
         let mut pushed = 0usize;
         for d in &devices {
-            let kea_ip = d.managed_ip.as_deref().unwrap_or(d.ip.as_str());
-            if d.mac.is_empty() || kea_ip.is_empty() {
-                continue;
-            }
-            match self.reservation_add(&d.mac, kea_ip).await {
+            let kea_ip = match d.managed_ip.as_deref() {
+                Some(ip) => ip.to_string(),
+                None     => continue,
+            };
+            if d.mac.is_empty() { continue; }
+            match self.reservation_add(&d.mac, &kea_ip).await {
                 Ok(())  => pushed += 1,
                 Err(e)  => warn!(mac = %d.mac, ip = kea_ip, "dhcp: sync failed: {e:#}"),
             }
@@ -93,85 +96,38 @@ impl KeaClient {
 
     // ── Internals ─────────────────────────────────────────────────────────────
 
-    fn add_cmd(&self, mac: &str, ip: &str) -> String {
-        let reservation = if let Some(lease) = self.managed_lease_secs {
-            let renew  = lease / 2;
-            let rebind = lease * 7 / 8;
-            json!({
-                "hw-address":  mac,
-                "ip-address":  ip,
-                "subnet-id":   self.subnet_id,
-                "valid-lft":   lease,
-                "option-data": [
-                    { "name": "dhcp-renewal-time",   "data": renew.to_string()  },
-                    { "name": "dhcp-rebinding-time", "data": rebind.to_string() },
-                ]
-            })
-        } else {
-            json!({
-                "hw-address": mac,
-                "ip-address": ip,
-                "subnet-id":  self.subnet_id,
-            })
-        };
-        json!({
-            "command": "reservation-add",
-            "service": ["dhcp4"],
-            "arguments": { "reservation": reservation }
-        })
-        .to_string()
-    }
-
-    fn del_cmd(&self, mac: &str) -> String {
-        json!({
-            "command": "reservation-del",
-            "service": ["dhcp4"],
-            "arguments": {
-                "identifier-type": "hw-address",
-                "identifier":      mac,
-                "subnet-id":       self.subnet_id
-            }
-        })
-        .to_string()
-    }
-
-    async fn del_inner(&self, mac: &str) -> Result<()> {
-        self.send(&self.del_cmd(mac)).await
-    }
-
-    /// Send one JSON command to the Kea control socket and check the result.
+    /// Send one JSON command to the hook cmd socket and check the result.
     ///
-    /// Opens a fresh connection per call — Kea closes the socket after each
-    /// command anyway.
-    async fn send(&self, cmd: &str) -> Result<()> {
-        let mut stream = UnixStream::connect(&self.socket_path)
+    /// Opens a fresh connection per call.
+    async fn send(&self, cmd: &str) -> Result<serde_json::Value> {
+        let stream = UnixStream::connect(&self.socket_path)
             .await
             .with_context(|| format!("connect to {}", self.socket_path.display()))?;
 
-        stream.write_all(cmd.as_bytes()).await.context("write")?;
-        stream.shutdown().await.context("shutdown write")?;
+        let (read_half, mut write_half) = stream.into_split();
 
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.context("read")?;
+        let mut line = cmd.to_string();
+        line.push('\n');
+        write_half.write_all(line.as_bytes()).await.context("write")?;
 
-        // Response: [{"result": N, "text": "..."}]
+        let mut resp_line = String::new();
+        BufReader::new(read_half)
+            .read_line(&mut resp_line)
+            .await
+            .context("read")?;
+
         let resp: serde_json::Value =
-            serde_json::from_slice(&buf).context("parse Kea response")?;
+            serde_json::from_str(resp_line.trim()).context("parse hook response")?;
 
-        let result = resp[0]["result"].as_i64().unwrap_or(-1);
-        let text   = resp[0]["text"].as_str().unwrap_or("(no text)");
+        debug!(result = ?resp["result"], text = ?resp["text"], "dhcp: hook response");
 
-        debug!(result, text, "dhcp: kea response");
+        let result = resp["result"].as_i64().unwrap_or(-1);
+        let text   = resp["text"].as_str().unwrap_or("(no text)");
 
         if result == 0 {
-            Ok(())
+            Ok(resp)
         } else {
             anyhow::bail!("result={result}: {text}")
         }
     }
-}
-
-fn is_duplicate(e: &anyhow::Error) -> bool {
-    let s = e.to_string().to_ascii_lowercase();
-    s.contains("already") || s.contains("duplicate") || s.contains("exist")
 }

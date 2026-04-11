@@ -62,25 +62,20 @@ struct Args {
     #[arg(long, env = "SYNAPTEX_ROUTER_KEA_IOT_RELAY", value_delimiter = ',')]
     kea_iot_relay: Vec<std::net::Ipv4Addr>,
 
-    /// Unix socket path for the Kea DHCPv4 control channel.
-    /// Requires the host_cmds hook loaded in kea-dhcp4.conf.
-    /// When set, device reservations are pushed to Kea on discovery
-    /// and synced from the router DB at startup.
-    #[arg(long, env = "SYNAPTEX_ROUTER_KEA_CTRL_SOCKET")]
-    kea_ctrl_socket: Option<std::path::PathBuf>,
+    /// Unix socket path for the synaptex kea-hook command channel.
+    /// The synaptex_hook.so creates this socket (world-accessible) and listens
+    /// for reservation-add/del commands, handling them via Kea's in-process
+    /// HostMgr API.  Configure "cmd_socket" in kea-dhcp4.conf hook parameters
+    /// to the same path.  When set, reservations are pushed on discovery and
+    /// synced from the router DB at startup.
+    #[arg(long, env = "SYNAPTEX_ROUTER_KEA_CMD_SOCKET")]
+    kea_cmd_socket: Option<std::path::PathBuf>,
 
     /// Kea DHCPv4 subnet-id for managed reservations.
     /// Must match the subnet-id in kea-dhcp4.conf where discovered
     /// devices should receive reserved IPs.
     #[arg(long, env = "SYNAPTEX_ROUTER_KEA_SUBNET_ID", default_value = "0")]
     kea_subnet_id: u32,
-
-    /// DHCP valid lifetime (seconds) advertised to managed (reserved) devices.
-    /// Also sets T1 = lease/2 and T2 = lease×7/8 via per-reservation option-data,
-    /// overriding the subnet-level renew/rebind timers for these devices.
-    /// Omit to inherit the subnet defaults.
-    #[arg(long, env = "SYNAPTEX_ROUTER_MANAGED_LEASE_SECS")]
-    managed_lease_secs: Option<u32>,
 
     /// First three octets of the managed device subnet, e.g. "10.40.8".
     /// Synaptex allocates addresses within this subnet and pushes them to Kea
@@ -154,14 +149,14 @@ async fn main() -> Result<()> {
     let (discovery_tx, _) = broadcast::channel::<synaptex_router_proto::DiscoveredDevice>(64);
     let discovery_tx = Arc::new(discovery_tx);
 
-    // ── Kea control client ────────────────────────────────────────────────────
-    let kea_client: Option<Arc<dhcp::KeaClient>> = if let Some(socket) = args.kea_ctrl_socket {
+    // ── Kea hook command client ───────────────────────────────────────────────
+    let kea_client: Option<Arc<dhcp::KeaClient>> = if let Some(socket) = args.kea_cmd_socket {
         info!(
             path      = %socket.display(),
             subnet_id = args.kea_subnet_id,
-            "dhcp: Kea control client configured",
+            "dhcp: hook command client configured",
         );
-        let client = Arc::new(dhcp::KeaClient::new(socket, args.kea_subnet_id, args.managed_lease_secs));
+        let client = Arc::new(dhcp::KeaClient::new(socket, args.kea_subnet_id));
         if let Err(e) = client.sync_from_db(&router_db).await {
             warn!("dhcp: startup reservation sync failed: {e}");
         }
