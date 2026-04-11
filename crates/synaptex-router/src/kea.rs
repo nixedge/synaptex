@@ -200,10 +200,11 @@ pub fn spawn(
     iot_relay_ips: Vec<Ipv4Addr>,
     db:            Arc<RouterDb>,
     cmd_state:     CmdState,
+    cmd_connected: Arc<tokio::sync::Notify>,
 ) {
     let iot_relay_ips = Arc::new(iot_relay_ips);
     tokio::spawn(async move {
-        if let Err(e) = run(path.as_ref(), &iot_relay_ips, &db, cmd_state).await {
+        if let Err(e) = run(path.as_ref(), &iot_relay_ips, &db, cmd_state, cmd_connected).await {
             warn!("kea socket listener exited: {e}");
         }
     });
@@ -214,6 +215,7 @@ async fn run(
     iot_relay_ips: &Arc<Vec<Ipv4Addr>>,
     db:            &Arc<RouterDb>,
     cmd_state:     CmdState,
+    cmd_connected: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
     let _ = tokio::fs::remove_file(path).await;
     let listener = UnixListener::bind(path)?;
@@ -240,7 +242,8 @@ async fn run(
                 let ips = iot_relay_ips.clone();
                 let db  = db.clone();
                 let cmd = cmd_state.clone();
-                tokio::spawn(handle_connection(stream, ips, db, cmd));
+                let notify = cmd_connected.clone();
+                tokio::spawn(handle_connection(stream, ips, db, cmd, notify));
             }
             Err(e) => warn!("kea: accept error: {e}"),
         }
@@ -252,6 +255,7 @@ async fn handle_connection(
     iot_relay_ips: Arc<Vec<Ipv4Addr>>,
     db:            Arc<RouterDb>,
     cmd_state:     CmdState,
+    cmd_connected: Arc<tokio::sync::Notify>,
 ) {
     let (read_half, write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -270,6 +274,10 @@ async fn handle_connection(
     {
         info!("kea: cmd channel connected");
         *cmd_state.lock().await = Some(CmdConn { write: write_half, lines });
+        // Signal that the cmd channel is ready so the startup reservation sync
+        // can proceed.  notify_one stores the notification even if nobody is
+        // currently awaiting it.
+        cmd_connected.notify_one();
         // Task exits here; KeaClient owns the connection from this point.
         // When the hook disconnects, KeaClient clears cmd_state on the next error.
         return;

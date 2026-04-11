@@ -155,17 +155,23 @@ async fn main() -> Result<()> {
             relays = ?args.kea_iot_relay,
             "kea: starting hook listener",
         );
-        kea::spawn(socket_path, args.kea_iot_relay, router_db.clone(), cmd_state.clone());
+        let cmd_connected = Arc::new(tokio::sync::Notify::new());
+        kea::spawn(socket_path, args.kea_iot_relay, router_db.clone(), cmd_state.clone(), cmd_connected.clone());
 
         if args.kea_subnet_id > 0 {
             info!(subnet_id = args.kea_subnet_id, "dhcp: reservation client configured");
             let client = Arc::new(dhcp::KeaClient::new(cmd_state, args.kea_subnet_id));
-            // sync_from_db runs after hook connects; if not connected yet it will
-            // log "not connected" and succeed silently — discovery will re-push on
-            // the next device packet anyway.
-            if let Err(e) = client.sync_from_db(&router_db).await {
-                warn!("dhcp: startup reservation sync failed: {e}");
-            }
+            // Defer the startup reservation sync until the hook's cmd channel has
+            // connected.  Running it eagerly produced "not connected" failures on
+            // every device because the hook needs a few seconds to dial in.
+            let client_sync = client.clone();
+            let db_sync     = router_db.clone();
+            tokio::spawn(async move {
+                cmd_connected.notified().await;
+                if let Err(e) = client_sync.sync_from_db(&db_sync).await {
+                    warn!("dhcp: startup reservation sync failed: {e}");
+                }
+            });
             Some(client)
         } else {
             None
