@@ -402,6 +402,27 @@ async fn listen_loop(
                 if let DeviceKind::Tuya { ref mut version, .. } = existing.kind {
                     *version = parsed.version.clone();
                 }
+                // Backfill managed_ip for devices that predate IP allocation
+                // (e.g. DB populated before this feature was deployed).
+                if existing.managed_ip.is_none() {
+                    existing.managed_ip = match db.allocate_ip(&existing.device_id) {
+                        Ok(addr) => {
+                            tracing::info!(
+                                tuya_id    = %parsed.tuya_id,
+                                managed_ip = %addr,
+                                "discovery: backfilled managed IP",
+                            );
+                            Some(addr.to_string())
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                tuya_id = %parsed.tuya_id,
+                                "discovery: IP backfill failed: {e:#}",
+                            );
+                            None
+                        }
+                    };
+                }
                 existing
             }
             _ => {
@@ -450,14 +471,13 @@ async fn listen_loop(
 
         // Push/refresh Kea reservation using the managed IP so the device
         // migrates off the pool on its next DHCP renewal.
-        if let Some(ref kea) = kea {
-            let kea_ip = device.managed_ip.as_deref().unwrap_or(device.ip.as_str());
-            if !device.mac.is_empty() && !kea_ip.is_empty() {
-                if let Err(e) = kea.reservation_add(&device.mac, kea_ip).await {
+        if let (Some(ref kea), Some(ref managed_ip)) = (&kea, &device.managed_ip) {
+            if !device.mac.is_empty() {
+                if let Err(e) = kea.reservation_add(&device.mac, managed_ip).await {
                     tracing::warn!(
                         mac = %device.mac,
-                        ip  = kea_ip,
-                        "discovery: kea reservation: {e}",
+                        ip  = managed_ip,
+                        "discovery: kea reservation: {e:#}",
                     );
                 }
             }
