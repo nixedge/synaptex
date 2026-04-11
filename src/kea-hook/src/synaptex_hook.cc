@@ -2,27 +2,25 @@
 //
 // Two responsibilities:
 //
-// 1. DHCP classification (pkt4_receive):
+// 1. DHCP classification (pkt4_receive, one connection per Kea worker thread):
 //    Connects to synaptex-router's Unix socket, forwards packet metadata,
 //    and applies the returned client-class names to the packet.
 //
-// 2. Reservation command server (optional):
-//    If "cmd_socket" is configured, listens on a Unix socket for
-//    reservation-add / reservation-del commands from synaptex-router
-//    and applies them via kea's HostMgr in-process API.
-//    The socket is created world-accessible (0666); kea's security policy
-//    only applies to its own control socket, not hook-created sockets.
+// 2. Reservation command channel (one persistent connection at load time):
+//    Makes a second connection to the same socket with {"type":"cmd"} as the
+//    first message.  synaptex-router then pushes reservation-add/del commands
+//    over that connection; the hook handles them via Kea's in-process HostMgr.
+//    No new socket is created — the existing classification socket (outside
+//    /run/kea, secured by the router's RuntimeDirectory permissions) is reused.
 //
 // Configuration (kea-dhcp4.conf hooks-libraries entry):
 //   {
 //     "library": "/path/to/synaptex_hook.so",
-//     "parameters": {
-//       "socket":     "/run/synaptex-router/kea-hook.sock",
-//       "cmd_socket": "/run/kea/synaptex-cmd.sock"
-//     }
+//     "parameters": { "socket": "/run/synaptex-router/kea-hook.sock" }
 //   }
 //
 // If synaptex-router is unavailable the shim silently passes through.
+// The cmd channel reconnects automatically every 5 s until the router is up.
 
 #include <hooks/hooks.h>
 #include <dhcp/pkt4.h>
@@ -35,7 +33,6 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/stat.h>
 #include <unistd.h>
 #include <cstring>
 #include <cerrno>
@@ -47,6 +44,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <chrono>
 
 using namespace isc::hooks;
 using namespace isc::dhcp;
@@ -56,19 +54,35 @@ using namespace isc::data;
 
 static std::string g_socket_path;
 
-// Hard timeout for the round-trip to synaptex-router (milliseconds).
+// Hard timeout for the classification round-trip (milliseconds).
 // DHCP clients retry after 4 s so 50 ms is safe.
 static constexpr int TIMEOUT_MS = 50;
 
-// ─── Reservation command server ───────────────────────────────────────────────
+// ─── Reservation command channel ─────────────────────────────────────────────
+//
+// One persistent connection to synaptex-router, opened at load() time.
+// synaptex-router pushes reservation-add/del commands over it; we handle
+// them via Kea's HostMgr and write back a one-line JSON result.
 
-static std::string  g_cmd_socket_path;
-static int          g_cmd_server_fd = -1;
-static std::thread  g_cmd_thread;
+static int              g_cmd_fd = -1;
+static std::mutex       g_cmd_fd_mutex;
+static std::thread      g_cmd_thread;
 static std::atomic<bool> g_cmd_running{false};
-static std::mutex   g_hostmgr_mutex;
+static std::mutex       g_hostmgr_mutex;
 
-// Parse "fc:65:de:aa:bb:cc" → bytes.
+static int connect_to_router() {
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    ::strncpy(addr.sun_path, g_socket_path.c_str(), sizeof(addr.sun_path) - 1);
+    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static std::vector<uint8_t> parse_mac_bytes(const std::string& mac) {
     std::vector<uint8_t> out;
     out.reserve(6);
@@ -100,7 +114,6 @@ static std::string handle_reservation_add(ConstElementPtr args) {
         try {
             HostMgr::instance().add(host);
         } catch (const DuplicateHost&) {
-            // Upsert: remove old reservation then re-add.
             HostMgr::instance().del4(
                 SubnetID(subnet_e->intValue()),
                 Host::IDENT_HWADDR,
@@ -140,52 +153,69 @@ static std::string dispatch_cmd(const std::string& line) {
         auto cmd_e = msg->get("cmd");
         if (!cmd_e) return "{\"result\":1,\"text\":\"missing cmd\"}\n";
         std::string cmd = cmd_e->stringValue();
-        if (cmd == "reservation-add") {
-            return handle_reservation_add(msg);
-        } else if (cmd == "reservation-del") {
-            return handle_reservation_del(msg);
-        } else {
-            return "{\"result\":1,\"text\":\"unknown cmd\"}\n";
-        }
+        if (cmd == "reservation-add") return handle_reservation_add(msg);
+        if (cmd == "reservation-del") return handle_reservation_del(msg);
+        return "{\"result\":1,\"text\":\"unknown cmd\"}\n";
     } catch (const std::exception& e) {
         return std::string("{\"result\":1,\"text\":\"parse error: ") + e.what() + "\"}\n";
     }
 }
 
-static void cmd_server_loop() {
+// Persistent cmd channel loop: connects (and reconnects) to synaptex-router,
+// announces itself as a cmd channel, then handles incoming reservation commands.
+static void cmd_channel_loop() {
     while (g_cmd_running) {
-        int conn = ::accept(g_cmd_server_fd, nullptr, nullptr);
-        if (conn < 0) {
-            if (g_cmd_running) {
-                fprintf(stderr, "synaptex_hook: cmd accept: %s\n", strerror(errno));
-            }
-            break;
+        int fd = connect_to_router();
+        if (fd < 0) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            continue;
         }
 
-        // Read newline-delimited JSON commands, respond to each.
+        // Announce cmd channel to synaptex-router.
+        const char* init = "{\"type\":\"cmd\"}\n";
+        if (::write(fd, init, ::strlen(init)) < 0) {
+            ::close(fd);
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            continue;
+        }
+
+        fprintf(stderr, "synaptex_hook: cmd channel connected\n");
+        {
+            std::lock_guard<std::mutex> lk(g_cmd_fd_mutex);
+            g_cmd_fd = fd;
+        }
+
+        // Read newline-delimited JSON commands until disconnected.
         std::string buf;
         char ch;
-        while (true) {
-            ssize_t n = ::read(conn, &ch, 1);
+        while (g_cmd_running) {
+            ssize_t n = ::read(fd, &ch, 1);
             if (n <= 0) break;
             if (ch == '\n') {
                 if (!buf.empty()) {
                     std::string resp = dispatch_cmd(buf);
-                    ::write(conn, resp.c_str(), resp.size());
+                    ::write(fd, resp.c_str(), resp.size());
                     buf.clear();
                 }
             } else {
                 buf += ch;
             }
         }
-        ::close(conn);
+
+        fprintf(stderr, "synaptex_hook: cmd channel disconnected, reconnecting...\n");
+        {
+            std::lock_guard<std::mutex> lk(g_cmd_fd_mutex);
+            g_cmd_fd = -1;
+        }
+        ::close(fd);
+
+        if (g_cmd_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
     }
 }
 
-// ─── Per-thread persistent socket (classification) ────────────────────────────
-//
-// Each Kea worker thread gets its own connection.  Thread-local storage means
-// no locking needed; the destructor closes the fd when the thread exits.
+// ─── Per-thread persistent socket (DHCP classification) ──────────────────────
 
 struct ThreadSocket {
     int fd = -1;
@@ -203,7 +233,6 @@ struct ThreadSocket {
         fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) return false;
 
-        // Apply send/recv timeout so we never block Kea indefinitely.
         struct timeval tv{};
         tv.tv_sec  = TIMEOUT_MS / 1000;
         tv.tv_usec = (TIMEOUT_MS % 1000) * 1000;
@@ -232,13 +261,12 @@ struct ThreadSocket {
         return true;
     }
 
-    // Read until newline.  Returns empty string on timeout or error.
     std::string read_line() {
         std::string line;
         char c;
         while (true) {
             ssize_t n = ::read(fd, &c, 1);
-            if (n <= 0) return "";  // timeout (EAGAIN) or error
+            if (n <= 0) return "";
             if (c == '\n') return line;
             line += c;
         }
@@ -309,8 +337,6 @@ static std::string build_request(const Pkt4Ptr& pkt) {
     return j.str();
 }
 
-// Minimal parser for {"classes":["A","B"]}.
-// No external JSON library — keeps the shim dependency-free.
 static std::vector<std::string> parse_classes(const std::string& json) {
     std::vector<std::string> out;
     auto pos = json.find("\"classes\"");
@@ -324,7 +350,6 @@ static std::vector<std::string> parse_classes(const std::string& json) {
         if (end == std::string::npos) break;
         out.push_back(json.substr(pos + 1, end - pos - 1));
         pos = end + 1;
-        // Stop at ']'
         auto next = json.find_first_not_of(" \t,", pos);
         if (next == std::string::npos || json[next] == ']') break;
     }
@@ -339,8 +364,6 @@ int version() {
     return KEA_HOOKS_VERSION;
 }
 
-// Each worker thread uses its own thread_local socket — no shared mutable
-// state, so this hook is safe to run under Kea's multi-threading mode.
 int multi_threading_compatible() {
     return 1;
 }
@@ -357,65 +380,28 @@ int load(LibraryHandle& handle) {
         return 1;
     }
     g_socket_path = socket_elem->stringValue();
+
+    // Start the persistent cmd channel thread.  It connects (and reconnects)
+    // to synaptex-router in the background so load() returns immediately.
+    g_cmd_running = true;
+    g_cmd_thread  = std::thread(cmd_channel_loop);
+
     fprintf(stderr, "synaptex_hook: loaded, socket=%s\n", g_socket_path.c_str());
-
-    // Optional reservation command socket.
-    ConstElementPtr cmd_elem = params->get("cmd_socket");
-    if (cmd_elem && cmd_elem->getType() == Element::string) {
-        g_cmd_socket_path = cmd_elem->stringValue();
-
-        ::unlink(g_cmd_socket_path.c_str());
-
-        int sfd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-        if (sfd < 0) {
-            fprintf(stderr, "synaptex_hook: cmd socket(): %s\n", strerror(errno));
-            return 1;
-        }
-
-        struct sockaddr_un addr{};
-        addr.sun_family = AF_UNIX;
-        ::strncpy(addr.sun_path, g_cmd_socket_path.c_str(), sizeof(addr.sun_path) - 1);
-
-        if (::bind(sfd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-            fprintf(stderr, "synaptex_hook: cmd bind(%s): %s\n",
-                    g_cmd_socket_path.c_str(), strerror(errno));
-            ::close(sfd);
-            return 1;
-        }
-
-        // World-accessible — kea's security policy only applies to its own
-        // control socket, not to hook-created sockets.
-        ::chmod(g_cmd_socket_path.c_str(), 0666);
-
-        if (::listen(sfd, 8) < 0) {
-            fprintf(stderr, "synaptex_hook: cmd listen: %s\n", strerror(errno));
-            ::close(sfd);
-            return 1;
-        }
-
-        g_cmd_server_fd = sfd;
-        g_cmd_running   = true;
-        g_cmd_thread    = std::thread(cmd_server_loop);
-
-        fprintf(stderr, "synaptex_hook: cmd_socket=%s\n", g_cmd_socket_path.c_str());
-    }
-
     return 0;
 }
 
 int unload() {
-    if (g_cmd_server_fd >= 0) {
-        g_cmd_running = false;
-        ::close(g_cmd_server_fd);
-        g_cmd_server_fd = -1;
-        if (g_cmd_thread.joinable()) {
-            g_cmd_thread.join();
-        }
-        if (!g_cmd_socket_path.empty()) {
-            ::unlink(g_cmd_socket_path.c_str());
+    g_cmd_running = false;
+    {
+        std::lock_guard<std::mutex> lk(g_cmd_fd_mutex);
+        if (g_cmd_fd >= 0) {
+            ::close(g_cmd_fd);
+            g_cmd_fd = -1;
         }
     }
-    // tls_sock cleaned up per-thread automatically.
+    if (g_cmd_thread.joinable()) {
+        g_cmd_thread.join();
+    }
     return 0;
 }
 
@@ -424,14 +410,12 @@ int pkt4_receive(CalloutHandle& handle) {
     handle.getArgument("query4", pkt4);
     if (!pkt4) return 0;
 
-    // Connect (or reconnect) if needed.
     if (!tls_sock.connected() && !tls_sock.connect()) {
-        return 0;  // router unavailable — pass through
+        return 0;
     }
 
     std::string req = build_request(pkt4);
 
-    // Send; retry once on failure (e.g. router restarted).
     if (!tls_sock.send_all(req)) {
         if (!tls_sock.connect() || !tls_sock.send_all(req)) {
             return 0;
@@ -440,7 +424,6 @@ int pkt4_receive(CalloutHandle& handle) {
 
     std::string resp = tls_sock.read_line();
     if (resp.empty()) {
-        // Timeout or broken pipe — drop connection so next call reconnects.
         tls_sock.close_fd();
         return 0;
     }
@@ -449,7 +432,7 @@ int pkt4_receive(CalloutHandle& handle) {
         pkt4->addClass(cls);
     }
 
-    return 0;  // NEXT_STEP_CONTINUE
+    return 0;
 }
 
 }  // extern "C"

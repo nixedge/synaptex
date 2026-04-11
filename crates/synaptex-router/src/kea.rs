@@ -39,10 +39,29 @@ use crate::db::RouterDb;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
+    net::{
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+        UnixListener, UnixStream,
+    },
+    sync::Mutex,
 };
 use tracing::{debug, info, warn};
+
+// ─── Cmd channel state ────────────────────────────────────────────────────────
+
+/// One end of the persistent reservation-command channel to the Kea hook.
+///
+/// Stored in `CmdState`; accessed exclusively by `KeaClient` methods and
+/// cleared automatically when the hook disconnects.
+pub struct CmdConn {
+    pub write: OwnedWriteHalf,
+    pub lines: Lines<BufReader<OwnedReadHalf>>,
+}
+
+/// Shared state for the cmd channel.  `None` until the hook's cmd thread
+/// has connected; cleared again on disconnection.
+pub type CmdState = Arc<Mutex<Option<CmdConn>>>;
 
 // ─── Wire types ───────────────────────────────────────────────────────────────
 
@@ -172,22 +191,30 @@ fn oui_matches(mac: &str, prefixes: &[&str]) -> bool {
 /// Spawn the Kea hook domain socket listener.
 ///
 /// Removes any stale socket file, binds a new `UnixListener`, and accepts
-/// connections indefinitely.  Each connection (one per Kea worker) is
-/// handled in its own task and is persistent for the shim's lifetime.
+/// connections indefinitely.  Classification connections (one per Kea worker
+/// thread) are handled in their own tasks.  The single cmd-channel connection
+/// (opened by the hook at load time with `{"type":"cmd"}`) is stored in
+/// `cmd_state` for `KeaClient` to push reservation commands through.
 pub fn spawn(
     path:          impl AsRef<Path> + Send + 'static,
     iot_relay_ips: Vec<Ipv4Addr>,
     db:            Arc<RouterDb>,
+    cmd_state:     CmdState,
 ) {
     let iot_relay_ips = Arc::new(iot_relay_ips);
     tokio::spawn(async move {
-        if let Err(e) = run(path.as_ref(), &iot_relay_ips, &db).await {
+        if let Err(e) = run(path.as_ref(), &iot_relay_ips, &db, cmd_state).await {
             warn!("kea socket listener exited: {e}");
         }
     });
 }
 
-async fn run(path: &Path, iot_relay_ips: &Arc<Vec<Ipv4Addr>>, db: &Arc<RouterDb>) -> Result<()> {
+async fn run(
+    path:          &Path,
+    iot_relay_ips: &Arc<Vec<Ipv4Addr>>,
+    db:            &Arc<RouterDb>,
+    cmd_state:     CmdState,
+) -> Result<()> {
     let _ = tokio::fs::remove_file(path).await;
     let listener = UnixListener::bind(path)?;
     info!(path = %path.display(), "kea: listening for hook connections");
@@ -197,7 +224,8 @@ async fn run(path: &Path, iot_relay_ips: &Arc<Vec<Ipv4Addr>>, db: &Arc<RouterDb>
             Ok((stream, _)) => {
                 let ips = iot_relay_ips.clone();
                 let db  = db.clone();
-                tokio::spawn(handle_connection(stream, ips, db));
+                let cmd = cmd_state.clone();
+                tokio::spawn(handle_connection(stream, ips, db, cmd));
             }
             Err(e) => warn!("kea: accept error: {e}"),
         }
@@ -208,37 +236,66 @@ async fn handle_connection(
     stream:        UnixStream,
     iot_relay_ips: Arc<Vec<Ipv4Addr>>,
     db:            Arc<RouterDb>,
+    cmd_state:     CmdState,
 ) {
-    debug!("kea: shim connected");
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let response = match serde_json::from_str::<PktRequest>(&line) {
-            Ok(req) => {
-                let classes = classify(&req, &iot_relay_ips, &db);
-                debug!(
-                    mac      = %req.mac,
-                    giaddr   = ?req.giaddr,
-                    msg_type = req.msg_type,
-                    ?classes,
-                    "kea: classified",
-                );
-                serde_json::to_string(&PktResponse { classes }).unwrap_or_default()
-            }
-            Err(e) => {
-                warn!("kea: malformed request: {e}  raw={line:?}");
-                serde_json::to_string(&PktResponse { classes: vec![] }).unwrap_or_default()
-            }
-        };
+    // Peek at the first line to distinguish connection types.
+    let first = match lines.next_line().await {
+        Ok(Some(l)) => l,
+        _ => return,
+    };
 
-        let mut buf = response.into_bytes();
-        buf.push(b'\n');
-        if let Err(e) = write_half.write_all(&buf).await {
-            warn!("kea: write error: {e}");
-            break;
-        }
+    // cmd-channel connection: hook announces {"type":"cmd"}.
+    if serde_json::from_str::<serde_json::Value>(&first)
+        .ok()
+        .and_then(|v| v["type"].as_str().map(str::to_string))
+        .as_deref() == Some("cmd")
+    {
+        info!("kea: cmd channel connected");
+        *cmd_state.lock().await = Some(CmdConn { write: write_half, lines });
+        // Task exits here; KeaClient owns the connection from this point.
+        // When the hook disconnects, KeaClient clears cmd_state on the next error.
+        return;
     }
 
+    // Classification connection: process first line then loop.
+    let mut write_half = write_half;
+    classify_and_reply(&first, &iot_relay_ips, &db, &mut write_half).await;
+    while let Ok(Some(line)) = lines.next_line().await {
+        classify_and_reply(&line, &iot_relay_ips, &db, &mut write_half).await;
+    }
     debug!("kea: shim disconnected");
+}
+
+async fn classify_and_reply(
+    line:          &str,
+    iot_relay_ips: &[Ipv4Addr],
+    db:            &RouterDb,
+    write_half:    &mut OwnedWriteHalf,
+) {
+    let response = match serde_json::from_str::<PktRequest>(line) {
+        Ok(req) => {
+            let classes = classify(&req, iot_relay_ips, db);
+            debug!(
+                mac      = %req.mac,
+                giaddr   = ?req.giaddr,
+                msg_type = req.msg_type,
+                ?classes,
+                "kea: classified",
+            );
+            serde_json::to_string(&PktResponse { classes }).unwrap_or_default()
+        }
+        Err(e) => {
+            warn!("kea: malformed request: {e}  raw={line:?}");
+            serde_json::to_string(&PktResponse { classes: vec![] }).unwrap_or_default()
+        }
+    };
+
+    let mut buf = response.into_bytes();
+    buf.push(b'\n');
+    if let Err(e) = write_half.write_all(&buf).await {
+        warn!("kea: write error: {e}");
+    }
 }

@@ -62,15 +62,6 @@ struct Args {
     #[arg(long, env = "SYNAPTEX_ROUTER_KEA_IOT_RELAY", value_delimiter = ',')]
     kea_iot_relay: Vec<std::net::Ipv4Addr>,
 
-    /// Unix socket path for the synaptex kea-hook command channel.
-    /// The synaptex_hook.so creates this socket (world-accessible) and listens
-    /// for reservation-add/del commands, handling them via Kea's in-process
-    /// HostMgr API.  Configure "cmd_socket" in kea-dhcp4.conf hook parameters
-    /// to the same path.  When set, reservations are pushed on discovery and
-    /// synced from the router DB at startup.
-    #[arg(long, env = "SYNAPTEX_ROUTER_KEA_CMD_SOCKET")]
-    kea_cmd_socket: Option<std::path::PathBuf>,
-
     /// Kea DHCPv4 subnet-id for managed reservations.
     /// Must match the subnet-id in kea-dhcp4.conf where discovered
     /// devices should receive reserved IPs.
@@ -149,24 +140,13 @@ async fn main() -> Result<()> {
     let (discovery_tx, _) = broadcast::channel::<synaptex_router_proto::DiscoveredDevice>(64);
     let discovery_tx = Arc::new(discovery_tx);
 
-    // ── Kea hook command client ───────────────────────────────────────────────
-    let kea_client: Option<Arc<dhcp::KeaClient>> = if let Some(socket) = args.kea_cmd_socket {
-        info!(
-            path      = %socket.display(),
-            subnet_id = args.kea_subnet_id,
-            "dhcp: hook command client configured",
-        );
-        let client = Arc::new(dhcp::KeaClient::new(socket, args.kea_subnet_id));
-        if let Err(e) = client.sync_from_db(&router_db).await {
-            warn!("dhcp: startup reservation sync failed: {e}");
-        }
-        Some(client)
-    } else {
-        None
-    };
-
-    // ── Kea hook domain socket ───────────────────────────────────────────────
-    if let Some(socket_path) = args.kea_socket {
+    // ── Kea hook socket + cmd channel ─────────────────────────────────────────
+    //
+    // The hook cmd channel piggybacks on the classification socket: the hook
+    // opens a second connection with {"type":"cmd"} and synaptex-router stores
+    // it in cmd_state.  KeaClient uses that connection to push reservations.
+    let cmd_state = kea::CmdState::default();
+    let kea_client: Option<Arc<dhcp::KeaClient>> = if let Some(socket_path) = args.kea_socket {
         if args.kea_iot_relay.is_empty() {
             anyhow::bail!("--kea-iot-relay must be set when --kea-socket is configured");
         }
@@ -175,8 +155,24 @@ async fn main() -> Result<()> {
             relays = ?args.kea_iot_relay,
             "kea: starting hook listener",
         );
-        kea::spawn(socket_path, args.kea_iot_relay, router_db.clone());
-    }
+        kea::spawn(socket_path, args.kea_iot_relay, router_db.clone(), cmd_state.clone());
+
+        if args.kea_subnet_id > 0 {
+            info!(subnet_id = args.kea_subnet_id, "dhcp: reservation client configured");
+            let client = Arc::new(dhcp::KeaClient::new(cmd_state, args.kea_subnet_id));
+            // sync_from_db runs after hook connects; if not connected yet it will
+            // log "not connected" and succeed silently — discovery will re-push on
+            // the next device packet anyway.
+            if let Err(e) = client.sync_from_db(&router_db).await {
+                warn!("dhcp: startup reservation sync failed: {e}");
+            }
+            Some(client)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // ── Spawn UDP discovery listener ─────────────────────────────────────────
     let interfaces = args.interfaces

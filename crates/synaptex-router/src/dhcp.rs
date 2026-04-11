@@ -1,56 +1,45 @@
-/// Kea reservation client via the synaptex hook command socket.
+/// Kea reservation client via the hook cmd channel.
 ///
-/// Instead of connecting to Kea's own control socket (which Kea enforces
-/// strict permissions on), synaptex-router connects to a socket created by
-/// the synaptex_hook.so shared library running inside the Kea process.
-/// The hook handles reservation-add / reservation-del commands using Kea's
-/// in-process HostMgr API.
+/// The Kea hook's cmd thread connects to synaptex-router's classification
+/// socket with {"type":"cmd"} as the opening message.  synaptex-router stores
+/// that connection in `CmdState`; this client sends reservation-add/del
+/// commands over it and reads the hook's responses.
 ///
-/// Configure in kea-dhcp4.conf:
-/// ```json
-/// "hooks-libraries": [{
-///   "library": "/path/to/synaptex_hook.so",
-///   "parameters": {
-///     "socket":     "/run/synaptex-router/kea-hook.sock",
-///     "cmd_socket": "/run/kea/synaptex-cmd.sock"
-///   }
-/// }]
-/// ```
-
-use std::path::PathBuf;
+/// No new sockets, no /run/kea permission changes — the existing
+/// /run/synaptex-router/kea-hook.sock is reused.
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 
 use crate::db::RouterDb;
+use crate::kea::{CmdConn, CmdState};
+
+use tokio::io::AsyncBufReadExt as _;
+use tokio::io::AsyncWriteExt as _;
 
 // ─── Client ───────────────────────────────────────────────────────────────────
 
 pub struct KeaClient {
-    socket_path: PathBuf,
-    subnet_id:   u32,
+    cmd:       CmdState,
+    subnet_id: u32,
 }
 
 impl KeaClient {
-    pub fn new(socket_path: PathBuf, subnet_id: u32) -> Self {
-        Self { socket_path, subnet_id }
+    pub fn new(cmd: CmdState, subnet_id: u32) -> Self {
+        Self { cmd, subnet_id }
     }
 
-    /// Add or refresh a host reservation (MAC → IP).
-    ///
-    /// Upsert semantics: duplicate detection is handled in the hook via
-    /// DuplicateHost exception (delete + re-add).
+    /// Add or refresh a host reservation (MAC → IP).  No-op if cmd channel not yet connected.
     pub async fn reservation_add(&self, hw_address: &str, ip: &str) -> Result<()> {
         let mac = hw_address.to_ascii_lowercase();
         let cmd = serde_json::json!({
             "cmd":       "reservation-add",
-            "mac":       mac,
+            "mac":       &mac,
             "ip":        ip,
             "subnet_id": self.subnet_id,
         })
         .to_string();
+
         self.send(&cmd).await.map(|_| {
             debug!(%mac, %ip, "dhcp: reservation added");
         })
@@ -61,20 +50,18 @@ impl KeaClient {
         let mac = hw_address.to_ascii_lowercase();
         let cmd = serde_json::json!({
             "cmd":       "reservation-del",
-            "mac":       mac,
+            "mac":       &mac,
             "subnet_id": self.subnet_id,
         })
         .to_string();
+
         if let Err(e) = self.send(&cmd).await {
             warn!(%mac, "dhcp: reservation-del: {e}");
         }
         Ok(())
     }
 
-    /// Re-push reservations for every device in the router DB.
-    ///
-    /// Called at startup because Kea's in-memory host cache does not survive
-    /// a daemon restart.  Errors are logged but do not abort the sync.
+    /// Re-push reservations for every device in the router DB at startup.
     pub async fn sync_from_db(&self, db: &RouterDb) -> Result<()> {
         let devices = db.list_all()?;
         let total   = devices.len();
@@ -96,28 +83,32 @@ impl KeaClient {
 
     // ── Internals ─────────────────────────────────────────────────────────────
 
-    /// Send one JSON command to the hook cmd socket and check the result.
-    ///
-    /// Opens a fresh connection per call.
     async fn send(&self, cmd: &str) -> Result<serde_json::Value> {
-        let stream = UnixStream::connect(&self.socket_path)
-            .await
-            .with_context(|| format!("connect to {}", self.socket_path.display()))?;
-
-        let (read_half, mut write_half) = stream.into_split();
+        let mut guard = self.cmd.lock().await;
+        let conn: &mut CmdConn = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("kea hook cmd channel not connected"))?;
 
         let mut line = cmd.to_string();
         line.push('\n');
-        write_half.write_all(line.as_bytes()).await.context("write")?;
+
+        if let Err(e) = conn.write.write_all(line.as_bytes()).await {
+            *guard = None;  // clear on write error so next connect restores it
+            return Err(e).context("dhcp: write to hook cmd channel");
+        }
 
         let mut resp_line = String::new();
-        BufReader::new(read_half)
-            .read_line(&mut resp_line)
-            .await
-            .context("read")?;
+        let result = conn.lines.get_mut().read_line(&mut resp_line).await;
+        match result {
+            Ok(0) | Err(_) => {
+                *guard = None;
+                anyhow::bail!("dhcp: hook cmd channel closed");
+            }
+            _ => {}
+        }
 
         let resp: serde_json::Value =
-            serde_json::from_str(resp_line.trim()).context("parse hook response")?;
+            serde_json::from_str(resp_line.trim()).context("dhcp: parse hook response")?;
 
         debug!(result = ?resp["result"], text = ?resp["text"], "dhcp: hook response");
 

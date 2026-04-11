@@ -86,19 +86,6 @@
             '';
           };
 
-          keaCmdSocket = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            example = "/run/kea/synaptex-cmd.sock";
-            description = ''
-              Unix socket path for the synaptex kea-hook command channel.
-              The hook creates this socket (world-accessible) at load time;
-              configure the same path as "cmd_socket" in kea-dhcp4.conf's
-              hooks-libraries parameters entry.
-              When set, device reservations are pushed via the hook's HostMgr
-              API on discovery and re-synced from the router DB at startup.
-            '';
-          };
 
           keaSubnetId = lib.mkOption {
             type = lib.types.int;
@@ -255,8 +242,7 @@
                   "--kea-socket ${cfg.keaSocket}"
                   "--kea-iot-relay ${lib.concatStringsSep "," cfg.keaIotRelay}"
                 ]
-                ++ lib.optionals (cfg.keaCmdSocket != null) [
-                  "--kea-cmd-socket ${cfg.keaCmdSocket}"
+                ++ lib.optionals (cfg.keaSocket != null && cfg.keaSubnetId != 0) [
                   "--kea-subnet-id ${toString cfg.keaSubnetId}"
                 ]
               );
