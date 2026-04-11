@@ -240,6 +240,14 @@
           };
           users.groups.kea = lib.mkIf (cfg.keaCtrlSocket != null || cfg.keaSocket != null) {};
 
+          # Ensure /run/kea/ is owned by the static kea user on every activation.
+          # When transitioning from DynamicUser=true, the directory retains its
+          # old transient ownership even across service restarts (RuntimeDirectoryPreserve).
+          # Type "e" adjusts ownership/mode without altering contents.
+          systemd.tmpfiles.rules = lib.mkIf (cfg.keaCtrlSocket != null) [
+            "e /run/kea 0750 kea kea -"
+          ];
+
           # Switch kea-dhcp4-server off DynamicUser so the control socket is
           # owned by the static "kea" group.  UMask = "0007" ensures the socket
           # is group-writable; synaptex-router's SupplementaryGroups = ["kea"]
