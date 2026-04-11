@@ -75,6 +75,13 @@ struct Args {
     #[arg(long, env = "SYNAPTEX_ROUTER_KEA_SUBNET_ID", default_value = "0")]
     kea_subnet_id: u32,
 
+    /// DHCP valid lifetime (seconds) advertised to managed (reserved) devices.
+    /// Also sets T1 = lease/2 and T2 = lease×7/8 via per-reservation option-data,
+    /// overriding the subnet-level renew/rebind timers for these devices.
+    /// Omit to inherit the subnet defaults.
+    #[arg(long, env = "SYNAPTEX_ROUTER_MANAGED_LEASE_SECS")]
+    managed_lease_secs: Option<u32>,
+
     /// First three octets of the managed device subnet, e.g. "10.40.8".
     /// Synaptex allocates addresses within this subnet and pushes them to Kea
     /// as reservations so devices never use the default pool.
@@ -154,7 +161,7 @@ async fn main() -> Result<()> {
             subnet_id = args.kea_subnet_id,
             "dhcp: Kea control client configured",
         );
-        let client = Arc::new(dhcp::KeaClient::new(socket, args.kea_subnet_id));
+        let client = Arc::new(dhcp::KeaClient::new(socket, args.kea_subnet_id, args.managed_lease_secs));
         if let Err(e) = client.sync_from_db(&router_db).await {
             warn!("dhcp: startup reservation sync failed: {e}");
         }

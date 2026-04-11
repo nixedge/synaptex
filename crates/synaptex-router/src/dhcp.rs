@@ -25,13 +25,17 @@ use crate::db::RouterDb;
 // ─── Client ───────────────────────────────────────────────────────────────────
 
 pub struct KeaClient {
-    socket_path: PathBuf,
-    subnet_id:   u32,
+    socket_path:        PathBuf,
+    subnet_id:          u32,
+    /// When set, managed reservations advertise this valid lifetime plus
+    /// T1 (lease/2) and T2 (lease×7/8) via per-reservation option-data,
+    /// overriding the subnet-level renew/rebind timers.
+    managed_lease_secs: Option<u32>,
 }
 
 impl KeaClient {
-    pub fn new(socket_path: PathBuf, subnet_id: u32) -> Self {
-        Self { socket_path, subnet_id }
+    pub fn new(socket_path: PathBuf, subnet_id: u32, managed_lease_secs: Option<u32>) -> Self {
+        Self { socket_path, subnet_id, managed_lease_secs }
     }
 
     /// Add or refresh a host reservation (MAC → IP).
@@ -47,7 +51,7 @@ impl KeaClient {
                 Ok(())
             }
             Err(e) if is_duplicate(&e) => {
-                warn!(%mac, %ip, "dhcp: duplicate reservation — refreshing");
+                info!(%mac, %ip, "dhcp: duplicate reservation — refreshing");
                 self.del_inner(&mac).await.ok();
                 self.send(&self.add_cmd(&mac, ip)).await
             }
@@ -80,7 +84,7 @@ impl KeaClient {
             }
             match self.reservation_add(&d.mac, kea_ip).await {
                 Ok(())  => pushed += 1,
-                Err(e)  => warn!(mac = %d.mac, ip = kea_ip, "dhcp: sync: {e}"),
+                Err(e)  => warn!(mac = %d.mac, ip = kea_ip, "dhcp: sync failed: {e:#}"),
             }
         }
         info!(total, pushed, "dhcp: startup reservation sync complete");
@@ -90,16 +94,30 @@ impl KeaClient {
     // ── Internals ─────────────────────────────────────────────────────────────
 
     fn add_cmd(&self, mac: &str, ip: &str) -> String {
+        let reservation = if let Some(lease) = self.managed_lease_secs {
+            let renew  = lease / 2;
+            let rebind = lease * 7 / 8;
+            json!({
+                "hw-address":  mac,
+                "ip-address":  ip,
+                "subnet-id":   self.subnet_id,
+                "valid-lft":   lease,
+                "option-data": [
+                    { "name": "dhcp-renewal-time",   "data": renew.to_string()  },
+                    { "name": "dhcp-rebinding-time", "data": rebind.to_string() },
+                ]
+            })
+        } else {
+            json!({
+                "hw-address": mac,
+                "ip-address": ip,
+                "subnet-id":  self.subnet_id,
+            })
+        };
         json!({
             "command": "reservation-add",
             "service": ["dhcp4"],
-            "arguments": {
-                "reservation": {
-                    "hw-address": mac,
-                    "ip-address": ip,
-                    "subnet-id":  self.subnet_id
-                }
-            }
+            "arguments": { "reservation": reservation }
         })
         .to_string()
     }

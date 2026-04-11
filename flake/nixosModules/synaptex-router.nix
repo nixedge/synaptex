@@ -137,6 +137,18 @@
             '';
           };
 
+          managedLeaseSecs = lib.mkOption {
+            type = lib.types.nullOr lib.types.int;
+            default = null;
+            example = 86400;
+            description = ''
+              DHCP valid lifetime (seconds) for managed (reserved) devices.
+              Also sets T1 = lease÷2 and T2 = lease×7÷8 via per-reservation
+              option-data, overriding the subnet-level renew/rebind timers.
+              Leave null to inherit subnet defaults.
+            '';
+          };
+
           openFirewall = lib.mkOption {
             type = lib.types.bool;
             default = false;
@@ -246,6 +258,9 @@
                 ++ lib.optionals (cfg.keaCtrlSocket != null) [
                   "--kea-ctrl-socket ${cfg.keaCtrlSocket}"
                   "--kea-subnet-id ${toString cfg.keaSubnetId}"
+                ]
+                ++ lib.optionals (cfg.managedLeaseSecs != null) [
+                  "--managed-lease-secs ${toString cfg.managedLeaseSecs}"
                 ]
               );
 
