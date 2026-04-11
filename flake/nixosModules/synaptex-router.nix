@@ -1,5 +1,5 @@
 {
-  flake = {config, self, ...}: {
+  flake = {config, ...}: {
     nixosModules = {
       synaptex-router = {
         lib,
@@ -142,6 +142,26 @@
             default = false;
             description = "Open the gRPC port in the firewall.";
           };
+
+          keaHookSrc = lib.mkOption {
+            type = lib.types.nullOr lib.types.path;
+            default = null;
+            example = "inputs.synaptex + \"/src/kea-hook\"";
+            description = ''
+              Path to the synaptex kea-hook source tree (the directory containing
+              CMakeLists.txt).  When set, the hook is compiled against the
+              system's kea package and injected into kea's store path so Kea's
+              hook library security check accepts it.
+
+              Set this to <literal>inputs.synaptex + "/src/kea-hook"</literal>
+              in your configuration.  The hook must be compiled against the
+              same kea version as the running binary (KEA_HOOKS_VERSION must
+              match), which this overlay guarantees by using prev.kea as the
+              build input.
+
+              Leave null to skip the overlay (hook not installed).
+            '';
+          };
         };
 
         config = lib.mkIf cfg.enable {
@@ -158,18 +178,17 @@
 
           networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [50052];
 
-          # Bundle synaptex_hook.so into the consumer's kea store path.
-          # Kea 2.5+ validates that hook libraries reside under its own installation
-          # prefix (a compile-time constant).  We must compile the hook against the
-          # *consumer's* pkgs.kea so KEA_HOOKS_VERSION matches exactly, then inject
-          # the resulting .so via overrideAttrs so it lands at the right path.
-          nixpkgs.overlays = [
+          # Bundle synaptex_hook.so into the consumer's kea store path when
+          # keaHookSrc is set.  Kea 2.5+ validates that hook libraries reside
+          # under its own installation prefix (a compile-time constant).
+          # Building against prev.kea guarantees KEA_HOOKS_VERSION matches.
+          nixpkgs.overlays = lib.mkIf (cfg.keaHookSrc != null) [
             (_final: prev: {
               kea = prev.kea.overrideAttrs (old: let
                 keaHook = prev.stdenv.mkDerivation {
                   pname = "synaptex-kea-hook";
                   version = "0.1.0";
-                  src = self + "/src/kea-hook";
+                  src = cfg.keaHookSrc;
                   nativeBuildInputs = [prev.cmake];
                   buildInputs = [prev.kea prev.boost];
                   cmakeFlags = ["-DKEA_INCLUDE_DIR=${prev.kea}/include/kea"];
