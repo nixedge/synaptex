@@ -200,7 +200,15 @@
                 keaHook = prev.stdenv.mkDerivation {
                   pname = "synaptex-kea-hook";
                   version = "0.1.0";
-                  src = cfg.keaHookSrc;
+                  # builtins.path produces a content-addressed store path whose
+                  # hash depends only on the directory contents, not the source
+                  # flake's store path.  Without this, any synaptex commit would
+                  # change cfg.keaHookSrc's store prefix and trigger a kea rebuild
+                  # even when the kea-hook files are unchanged.
+                  src = builtins.path {
+                    name = "synaptex-kea-hook-src";
+                    path = cfg.keaHookSrc;
+                  };
                   nativeBuildInputs = [prev.cmake];
                   buildInputs = [prev.kea prev.boost];
                   cmakeFlags = ["-DKEA_INCLUDE_DIR=${prev.kea}/include/kea"];
