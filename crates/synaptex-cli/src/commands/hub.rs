@@ -4,17 +4,10 @@ use clap::Subcommand;
 // ─── Subcommands ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Subcommand)]
-pub enum RouterCmd {
-    /// Manage devices known to the router.
-    #[command(subcommand)]
-    Device(RouterDeviceCmd),
-}
-
-#[derive(Debug, Subcommand)]
-pub enum RouterDeviceCmd {
-    /// Register a device with the router and allocate a managed IP.
+pub enum HubCmd {
+    /// Register a hub and allocate it a managed IP.
     Register {
-        /// MAC address of the device (AA:BB:CC:DD:EE:FF).
+        /// MAC address of the hub (AA:BB:CC:DD:EE:FF).
         #[arg(long, value_name = "MAC")]
         mac: String,
 
@@ -22,7 +15,7 @@ pub enum RouterDeviceCmd {
         #[arg(long, value_name = "IP", default_value = "")]
         ip: String,
 
-        /// Device kind: "bond", "matter", or "other".
+        /// Hub kind: "bond", "matter", or "other".
         #[arg(long, value_name = "KIND")]
         kind: String,
 
@@ -38,15 +31,9 @@ pub enum RouterDeviceCmd {
 
 // ─── Dispatch ─────────────────────────────────────────────────────────────────
 
-pub async fn run(cmd: RouterCmd, url: &str, key: Option<&str>) -> Result<()> {
+pub async fn run(cmd: HubCmd, url: &str, key: Option<&str>) -> Result<()> {
     match cmd {
-        RouterCmd::Device(device_cmd) => run_device(device_cmd, url, key).await,
-    }
-}
-
-async fn run_device(cmd: RouterDeviceCmd, url: &str, key: Option<&str>) -> Result<()> {
-    match cmd {
-        RouterDeviceCmd::Register { mac, ip, kind, bond_id, bond_token } => {
+        HubCmd::Register { mac, ip, kind, bond_id, bond_token } => {
             let body = serde_json::json!({
                 "mac":        mac,
                 "ip":         ip,
@@ -57,7 +44,7 @@ async fn run_device(cmd: RouterDeviceCmd, url: &str, key: Option<&str>) -> Resul
 
             let client = reqwest::Client::new();
             let mut req = client
-                .post(format!("{url}/api/v1/router/devices"))
+                .post(format!("{url}/api/v1/hubs"))
                 .json(&body);
 
             if let Some(k) = key {

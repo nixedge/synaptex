@@ -1,4 +1,4 @@
-/// REST handlers that proxy to the synaptex-router gRPC service.
+/// REST handlers for hub registration (Bond, Matter, Other).
 
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ pub struct RegisterDeviceResponse {
     pub managed_ip: String,
 }
 
-pub async fn register_device(
+pub async fn register_hub(
     State(state): State<AppState>,
     Json(body):   Json<RegisterDeviceBody>,
 ) -> Result<Json<RegisterDeviceResponse>, (StatusCode, String)> {

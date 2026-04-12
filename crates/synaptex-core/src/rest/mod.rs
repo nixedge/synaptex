@@ -23,7 +23,7 @@ use crate::{
     router_client::{RouterClientConfig, RouterDiscoveredDevice},
 };
 
-use handlers::{config, devices, events, groups, pairing, rooms, routines, router};
+use handlers::{config, devices, events, groups, hubs, pairing, rooms, routines};
 
 // ─── Shared application state ────────────────────────────────────────────────
 
@@ -88,8 +88,8 @@ fn api_router(state: AppState) -> Router {
         .route("/routines/:id/run",     delete(routines::cancel_routine))
         // Events (SSE)
         .route("/events",            get(events::sse_events))
-        // Router device management
-        .route("/router/devices", post(router::register_device))
+        // Hubs (Bond, Matter, etc.)
+        .route("/hubs", post(hubs::register_hub))
         // Pairing
         .route("/pairing/cloud-devices",
             get(pairing::list_cloud_devices))

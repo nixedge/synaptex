@@ -4631,6 +4631,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "synaptex-bond"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "synaptex-types",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "synaptex-cli"
 version = "0.1.0"
 dependencies = [
@@ -4669,6 +4685,7 @@ dependencies = [
  "sha2",
  "sled",
  "socket2 0.5.10",
+ "synaptex-bond",
  "synaptex-router-proto",
  "synaptex-tuya",
  "synaptex-types",
