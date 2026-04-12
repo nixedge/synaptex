@@ -98,10 +98,13 @@ public:
     // ── Write operations ──────────────────────────────────────────────────────
 
     void add(const HostPtr& host) override {
-        if (!host || !host->getHWAddress() || host->getHWAddress()->hwaddr_.empty()) {
-            return;
-        }
-        const auto& hw = host->getHWAddress()->hwaddr_;
+        if (!host) return;
+        // Keep hw_ptr alive — getHWAddress() returns a temporary shared_ptr, so
+        // binding a reference to ->hwaddr_ without storing it would be a
+        // dangling reference once the temporary is destroyed at the semicolon.
+        HWAddrPtr hw_ptr = host->getHWAddress();
+        if (!hw_ptr || hw_ptr->hwaddr_.empty()) return;
+        const auto& hw = hw_ptr->hwaddr_;
         std::string key = make_mac_key(hw.data(), hw.size());
         std::lock_guard<std::mutex> lk(mutex_);
         by_mac_[key] = host;  // natural upsert
