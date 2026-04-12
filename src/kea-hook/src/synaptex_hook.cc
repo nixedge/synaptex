@@ -1,17 +1,21 @@
 // synaptex_hook.cc — Kea pkt4_receive hook shim
 //
-// Two responsibilities:
+// Three responsibilities:
 //
-// 1. DHCP classification (pkt4_receive, one connection per Kea worker thread):
+// 1. In-memory host data source (SynaptexMemoryHostDataSource):
+//    Registers a custom BaseHostDataSource backend with Kea's HostMgr so
+//    that dynamic host reservations pushed by synaptex-router are visible
+//    to Kea's address allocation engine without any external database.
+//
+// 2. DHCP classification (pkt4_receive, one connection per Kea worker thread):
 //    Connects to synaptex-router's Unix socket, forwards packet metadata,
 //    and applies the returned client-class names to the packet.
 //
-// 2. Reservation command channel (one persistent connection at load time):
+// 3. Reservation command channel (one persistent connection at load time):
 //    Makes a second connection to the same socket with {"type":"cmd"} as the
 //    first message.  synaptex-router then pushes reservation-add/del commands
-//    over that connection; the hook handles them via Kea's in-process HostMgr.
-//    No new socket is created — the existing classification socket (outside
-//    /run/kea, secured by the router's RuntimeDirectory permissions) is reused.
+//    over that connection; the hook handles them via Kea's HostMgr, which
+//    dispatches into our in-memory data source.
 //
 // Configuration (kea-dhcp4.conf hooks-libraries entry):
 //   {
@@ -29,6 +33,9 @@
 #include <asiolink/io_address.h>
 #include <dhcpsrv/host_mgr.h>
 #include <dhcpsrv/host.h>
+#include <dhcpsrv/base_host_data_source.h>
+#include <dhcpsrv/host_data_source_factory.h>
+#include <dhcpsrv/subnet_id.h>
 #include <boost/make_shared.hpp>
 
 #include <sys/socket.h>
@@ -41,6 +48,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -49,6 +57,7 @@
 using namespace isc::hooks;
 using namespace isc::dhcp;
 using namespace isc::data;
+using namespace isc::asiolink;
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -58,17 +67,224 @@ static std::string g_socket_path;
 // DHCP clients retry after 4 s so 50 ms is safe.
 static constexpr int TIMEOUT_MS = 50;
 
+// ─── In-memory host data source ───────────────────────────────────────────────
+//
+// Registered with Kea's HostDataSourceFactory so HostMgr::add() has a
+// writable backend and Kea's allocator finds our reservations at runtime.
+// Storage is a simple MAC→Host map protected by a mutex.
+
+static std::string make_mac_key(const uint8_t* begin, size_t len) {
+    char buf[3];
+    std::string key;
+    key.reserve(len * 2);
+    for (size_t i = 0; i < len && i < 6; ++i) {
+        snprintf(buf, sizeof(buf), "%02x", begin[i]);
+        key += buf;
+    }
+    return key;
+}
+
+class SynaptexMemoryHostDataSource : public BaseHostDataSource {
+    mutable std::mutex mutex_;
+    std::unordered_map<std::string, HostPtr> by_mac_;
+
+public:
+    // ── Required metadata ─────────────────────────────────────────────────────
+
+    std::string getType() const override { return "synaptex-memory"; }
+
+    bool setIPReservationsUnique(const bool) override { return true; }
+
+    // ── Write operations ──────────────────────────────────────────────────────
+
+    void add(const HostPtr& host) override {
+        if (!host || !host->getHWAddress() || host->getHWAddress()->hwaddr_.empty()) {
+            return;
+        }
+        const auto& hw = host->getHWAddress()->hwaddr_;
+        std::string key = make_mac_key(hw.data(), hw.size());
+        std::lock_guard<std::mutex> lk(mutex_);
+        by_mac_[key] = host;  // natural upsert
+    }
+
+    bool del(const SubnetID& subnet_id, const IOAddress& addr) override {
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (auto it = by_mac_.begin(); it != by_mac_.end(); ++it) {
+            if (it->second->getIPv4SubnetID() == subnet_id &&
+                it->second->getIPv4Reservation() == addr) {
+                by_mac_.erase(it);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool del4(const SubnetID& subnet_id,
+              const Host::IdentifierType& id_type,
+              const uint8_t* id_begin,
+              const size_t id_len) override {
+        if (id_type != Host::IDENT_HWADDR) return false;
+        std::string key = make_mac_key(id_begin, id_len);
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto it = by_mac_.find(key);
+        if (it != by_mac_.end() && it->second->getIPv4SubnetID() == subnet_id) {
+            by_mac_.erase(it);
+            return true;
+        }
+        return false;
+    }
+
+    bool del6(const SubnetID&,
+              const Host::IdentifierType&,
+              const uint8_t*,
+              const size_t) override {
+        return false;
+    }
+
+    // ── Read operations ───────────────────────────────────────────────────────
+
+    ConstHostPtr
+    get4(const SubnetID& subnet_id,
+         const Host::IdentifierType& id_type,
+         const uint8_t* id_begin,
+         const size_t id_len) const override {
+        if (id_type != Host::IDENT_HWADDR) return {};
+        std::string key = make_mac_key(id_begin, id_len);
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto it = by_mac_.find(key);
+        if (it != by_mac_.end() && it->second->getIPv4SubnetID() == subnet_id) {
+            return it->second;
+        }
+        return {};
+    }
+
+    ConstHostPtr
+    get4(const SubnetID& subnet_id,
+         const IOAddress& addr) const override {
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (const auto& kv : by_mac_) {
+            if (kv.second->getIPv4SubnetID() == subnet_id &&
+                kv.second->getIPv4Reservation() == addr) {
+                return kv.second;
+            }
+        }
+        return {};
+    }
+
+    ConstHostCollection
+    getAll4(const SubnetID& subnet_id,
+            const IOAddress& addr) const override {
+        ConstHostCollection result;
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (const auto& kv : by_mac_) {
+            if (kv.second->getIPv4SubnetID() == subnet_id &&
+                kv.second->getIPv4Reservation() == addr) {
+                result.push_back(kv.second);
+            }
+        }
+        return result;
+    }
+
+    ConstHostCollection
+    getAll4(const IOAddress& addr) const override {
+        ConstHostCollection result;
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (const auto& kv : by_mac_) {
+            if (kv.second->getIPv4Reservation() == addr) {
+                result.push_back(kv.second);
+            }
+        }
+        return result;
+    }
+
+    ConstHostCollection
+    getAll(const Host::IdentifierType& id_type,
+           const uint8_t* id_begin,
+           const size_t id_len) const override {
+        ConstHostCollection result;
+        if (id_type != Host::IDENT_HWADDR) return result;
+        std::string key = make_mac_key(id_begin, id_len);
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto it = by_mac_.find(key);
+        if (it != by_mac_.end()) result.push_back(it->second);
+        return result;
+    }
+
+    // ── Stubs for unused IPv6/hostname/paging methods ─────────────────────────
+
+    ConstHostCollection
+    getAll4(const SubnetID&) const override { return {}; }
+
+    ConstHostCollection
+    getAll6(const SubnetID&) const override { return {}; }
+
+    ConstHostCollection
+    getAllbyHostname(const std::string&) const override { return {}; }
+
+    ConstHostCollection
+    getAllbyHostname4(const std::string&, const SubnetID&) const override { return {}; }
+
+    ConstHostCollection
+    getAllbyHostname6(const std::string&, const SubnetID&) const override { return {}; }
+
+    ConstHostCollection
+    getPage4(const SubnetID&, size_t& source_index, uint64_t,
+             const HostPageSize&) const override {
+        source_index = std::numeric_limits<size_t>::max();
+        return {};
+    }
+
+    ConstHostCollection
+    getPage6(const SubnetID&, size_t& source_index, uint64_t,
+             const HostPageSize&) const override {
+        source_index = std::numeric_limits<size_t>::max();
+        return {};
+    }
+
+    ConstHostCollection
+    getPage4(size_t& source_index, uint64_t,
+             const HostPageSize&) const override {
+        source_index = std::numeric_limits<size_t>::max();
+        return {};
+    }
+
+    ConstHostCollection
+    getPage6(size_t& source_index, uint64_t,
+             const HostPageSize&) const override {
+        source_index = std::numeric_limits<size_t>::max();
+        return {};
+    }
+
+    ConstHostPtr
+    get6(const SubnetID&, const Host::IdentifierType&,
+         const uint8_t*, const size_t) const override { return {}; }
+
+    ConstHostPtr
+    get6(const IOAddress&, const uint8_t) const override { return {}; }
+
+    ConstHostPtr
+    get6(const SubnetID&, const IOAddress&) const override { return {}; }
+
+    ConstHostCollection
+    getAll6(const SubnetID&, const IOAddress&) const override { return {}; }
+
+    ConstHostCollection
+    getAll6(const IOAddress&) const override { return {}; }
+};
+
+static boost::shared_ptr<SynaptexMemoryHostDataSource> g_host_source;
+
 // ─── Reservation command channel ─────────────────────────────────────────────
 //
 // One persistent connection to synaptex-router, opened at load() time.
 // synaptex-router pushes reservation-add/del commands over it; we handle
-// them via Kea's HostMgr and write back a one-line JSON result.
+// them via Kea's HostMgr (which dispatches into our in-memory data source)
+// and write back a one-line JSON result.
 
-static int              g_cmd_fd = -1;
-static std::mutex       g_cmd_fd_mutex;
-static std::thread      g_cmd_thread;
+static int               g_cmd_fd = -1;
+static std::mutex        g_cmd_fd_mutex;
+static std::thread       g_cmd_thread;
 static std::atomic<bool> g_cmd_running{false};
-static std::mutex       g_hostmgr_mutex;
 
 static int connect_to_router() {
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
@@ -110,7 +326,8 @@ static std::string handle_reservation_add(ConstElementPtr args) {
             SUBNET_ID_UNUSED,
             isc::asiolink::IOAddress(ip_e->stringValue())
         );
-        std::lock_guard<std::mutex> lk(g_hostmgr_mutex);
+        // add() on our data source is a natural upsert (overwrites by MAC key).
+        // Going through HostMgr dispatches to our registered backend.
         try {
             HostMgr::instance().add(host);
         } catch (const DuplicateHost&) {
@@ -135,7 +352,6 @@ static std::string handle_reservation_del(ConstElementPtr args) {
     }
     try {
         auto mac = parse_mac_bytes(mac_e->stringValue());
-        std::lock_guard<std::mutex> lk(g_hostmgr_mutex);
         HostMgr::instance().del4(
             SubnetID(subnet_e->intValue()),
             Host::IDENT_HWADDR,
@@ -381,6 +597,20 @@ int load(LibraryHandle& handle) {
     }
     g_socket_path = socket_elem->stringValue();
 
+    // Register our in-memory host data source so HostMgr::add() has a
+    // writable backend and Kea's allocator can find our reservations.
+    auto mem_source = boost::make_shared<SynaptexMemoryHostDataSource>();
+    g_host_source   = mem_source;
+
+    HostDataSourceFactory::registerFactory(
+        "synaptex-memory",
+        [mem_source](const isc::db::DatabaseConnection::ParameterMap&)
+            -> HostDataSourcePtr {
+            return mem_source;
+        }
+    );
+    HostMgr::instance().addBackend("type=synaptex-memory");
+
     // Start the persistent cmd channel thread.  It connects (and reconnects)
     // to synaptex-router in the background so load() returns immediately.
     g_cmd_running = true;
@@ -402,6 +632,11 @@ int unload() {
     if (g_cmd_thread.joinable()) {
         g_cmd_thread.join();
     }
+
+    HostMgr::instance().delBackend("synaptex-memory");
+    HostDataSourceFactory::deregisterFactory("synaptex-memory");
+    g_host_source.reset();
+
     return 0;
 }
 
