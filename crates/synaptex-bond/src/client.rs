@@ -80,7 +80,9 @@ impl BondClient {
                     .collect()
             })
             .unwrap_or_default();
-        Ok(BondDeviceInfo { id: id.to_string(), name, device_type, actions })
+        // max_speed lives under properties.max_speed (CF devices).
+        let max_speed = v["properties"]["max_speed"].as_u64().unwrap_or(3).max(1) as u8;
+        Ok(BondDeviceInfo { id: id.to_string(), name, device_type, actions, max_speed })
     }
 
     /// Fetch the current state of a Bond device.

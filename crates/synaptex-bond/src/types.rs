@@ -27,7 +27,13 @@ pub struct BondConfig {
     pub name: String,
     /// Actions supported by this device (used for capability mapping).
     pub actions: Vec<String>,
+    /// Maximum fan speed reported by the Bond bridge (CF devices only).
+    /// Used to map Low/Medium/High proportionally.  Default 3.
+    #[serde(default = "default_max_speed")]
+    pub max_speed: u8,
 }
+
+fn default_max_speed() -> u8 { 3 }
 
 /// Info returned by `GET /v2/devices/{id}`.
 #[derive(Debug, Clone)]
@@ -36,6 +42,7 @@ pub struct BondDeviceInfo {
     pub name:        String,
     pub device_type: String,
     pub actions:     Vec<String>,
+    pub max_speed:   u8,
 }
 
 /// State returned by `GET /v2/devices/{id}/state`.

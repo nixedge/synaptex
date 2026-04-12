@@ -81,6 +81,7 @@ pub async fn discover_hub_devices(
             device_type:    dev.device_type,
             name:           dev.name,
             actions:        dev.actions,
+            max_speed:      dev.max_speed,
         };
 
         results.push((info, cfg));

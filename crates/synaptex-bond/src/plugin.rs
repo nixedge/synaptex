@@ -67,12 +67,7 @@ impl DevicePlugin for BondPlugin {
 
         let has_fan = self.info.capabilities.contains(&Capability::Fan);
         let fan_speed = if has_fan {
-            Some(match raw.speed {
-                0     => FanSpeed::Off,
-                1 | 2 => FanSpeed::Low,
-                3 | 4 => FanSpeed::Medium,
-                _     => FanSpeed::High,
-            })
+            Some(speed_from_bond(raw.speed, self.cfg.max_speed))
         } else {
             None
         };
@@ -108,9 +103,10 @@ impl DevicePlugin for BondPlugin {
                 FanSpeed::Off => {
                     client.execute_action(id, "TurnOff", None).await
                 }
-                FanSpeed::Low    => client.execute_action(id, "SetSpeed", Some(2)).await,
-                FanSpeed::Medium => client.execute_action(id, "SetSpeed", Some(4)).await,
-                FanSpeed::High   => client.execute_action(id, "SetSpeed", Some(6)).await,
+                _ => {
+                    let arg = speed_to_bond(speed, self.cfg.max_speed);
+                    client.execute_action(id, "SetSpeed", Some(arg)).await
+                }
             },
             DeviceCommand::SetLight { power: Some(true), .. } => {
                 client.execute_action(id, "TurnLightOn", None).await
@@ -122,6 +118,31 @@ impl DevicePlugin for BondPlugin {
         };
 
         result.map_err(|e| PluginError::Unreachable(e.to_string()))
+    }
+}
+
+/// Map a Bond speed value (1..=max_speed) to a FanSpeed level.
+fn speed_from_bond(speed: u8, max_speed: u8) -> FanSpeed {
+    let max = max_speed.max(1);
+    if speed == 0 {
+        FanSpeed::Off
+    } else if speed <= max / 3 {
+        FanSpeed::Low
+    } else if speed <= (max * 2) / 3 {
+        FanSpeed::Medium
+    } else {
+        FanSpeed::High
+    }
+}
+
+/// Map a FanSpeed level to a Bond speed value (1..=max_speed).
+fn speed_to_bond(speed: FanSpeed, max_speed: u8) -> u32 {
+    let max = max_speed.max(1) as u32;
+    match speed {
+        FanSpeed::Off    => 0,
+        FanSpeed::Low    => 1,
+        FanSpeed::Medium => (max / 2).max(1),
+        FanSpeed::High   => max,
     }
 }
 
