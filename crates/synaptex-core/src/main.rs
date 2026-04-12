@@ -1,3 +1,4 @@
+mod bond_sync;
 mod bus;
 mod cache;
 mod db;
@@ -81,9 +82,32 @@ async fn main() -> Result<()> {
     let configs = db::load_all_plugin_configs(&trees)
         .context("load plugin configs from sled")?;
 
+    // Unique Bond hubs seen while loading configs — used to spawn periodic syncs.
+    let mut bond_hubs: std::collections::HashMap<String, db::BondConfig> = Default::default();
+
     let config_count = configs.len();
     for cfg in configs {
         match cfg {
+            PluginConfig::Bond(bond_cfg) => {
+                let info = match db::get(&trees.registry, &bond_cfg.device_id)
+                    .context("read bond device info")?
+                {
+                    Some(info) => info,
+                    None => {
+                        tracing::warn!(
+                            device = %bond_cfg.device_id,
+                            "bond config found but no registry entry — skipping"
+                        );
+                        continue;
+                    }
+                };
+
+                // Track unique hubs for periodic sync (keyed by hub MAC).
+                bond_hubs.entry(bond_cfg.hub_mac.clone()).or_insert_with(|| bond_cfg.clone());
+
+                let plugin = synaptex_bond::BondPlugin::new(info, bond_cfg, bus_tx.clone());
+                registry.register(Arc::new(plugin));
+            }
             PluginConfig::Tuya(tuya_cfg) => {
                 let info = match db::get(&trees.registry, &tuya_cfg.device_id)
                     .context("read device info")?
@@ -139,6 +163,23 @@ async fn main() -> Result<()> {
     }
 
     info!(loaded = config_count, "plugin configs loaded");
+
+    // ── Bond periodic sync (one task per unique hub) ──────────────────────────
+    for (_, hub_cfg) in bond_hubs {
+        let hub_ip    = hub_cfg.hub_ip.clone();
+        let hub_mac   = hub_cfg.hub_mac.clone();
+        let bond_token = hub_cfg.bond_token.clone();
+        let (t2, r2, b2) = (trees.clone(), registry.clone(), bus_tx.clone());
+        let (t3, r3, b3) = (trees.clone(), registry.clone(), bus_tx.clone());
+        // Re-sync immediately to pick up devices added while core was offline.
+        tokio::spawn(async move {
+            bond_sync::sync_hub(&hub_ip, &hub_mac, &bond_token, &hub_ip, t2, r2, b2).await;
+        });
+        bond_sync::spawn_periodic_sync(
+            hub_cfg.hub_ip.clone(), hub_cfg.hub_mac, hub_cfg.bond_token, hub_cfg.hub_ip,
+            t3, r3, b3,
+        );
+    }
 
     // ── Routine runner + cron tasks ──────────────────────────────────────────
     let routine_runner = Arc::new(routine::RoutineRunner::new());

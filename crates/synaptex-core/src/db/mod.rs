@@ -58,12 +58,14 @@ pub struct GroupConfig {
     pub member_ids: Vec<DeviceId>,
 }
 
+pub use synaptex_bond::BondConfig;
+
 /// Discriminated union of all per-protocol configs stored in the `configs` tree.
-/// Add new variants here when Phase 4+ protocols are introduced.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PluginConfig {
     Tuya(TuyaDeviceConfig),
     Group(GroupConfig),
+    Bond(BondConfig),
 }
 
 /// A named room containing a set of devices (physical and/or group).

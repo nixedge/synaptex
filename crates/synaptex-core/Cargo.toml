@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 synaptex-types        = { workspace = true }
 synaptex-tuya         = { workspace = true }
+synaptex-bond         = { workspace = true }
 synaptex-router-proto = { workspace = true }
 tonic              = { workspace = true }
 

@@ -32,6 +32,7 @@ pub async fn list_devices(
             .flatten()
             .map(|cfg| match cfg {
                 PluginConfig::Tuya(t) => (Some(t.ip.to_string()), t.protocol_version),
+                PluginConfig::Bond(b) => (Some(b.hub_ip), None),
                 PluginConfig::Group(_) => (None, None),
             })
             .unwrap_or((None, None));
@@ -63,6 +64,7 @@ pub async fn get_device(
         .flatten()
         .map(|cfg| match cfg {
             PluginConfig::Tuya(t) => (Some(t.ip.to_string()), t.protocol_version),
+            PluginConfig::Bond(b) => (Some(b.hub_ip), None),
             PluginConfig::Group(_) => (None, None),
         })
         .unwrap_or((None, None));
@@ -262,6 +264,15 @@ pub async fn device_debug_config(
             "protocol_version": t.protocol_version,
         }),
         PluginConfig::Group(g) => serde_json::json!({ "members": g.member_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>() }),
+        PluginConfig::Bond(b) => serde_json::json!({
+            "hub_mac":        b.hub_mac,
+            "hub_ip":         b.hub_ip,
+            "bond_device_id": b.bond_device_id,
+            "device_type":    b.device_type,
+            "name":           b.name,
+            "actions":        b.actions,
+            "protocol":       "bond_local",
+        }),
     };
 
     Ok(Json(out))
