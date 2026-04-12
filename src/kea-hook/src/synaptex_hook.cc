@@ -284,14 +284,22 @@ static boost::shared_ptr<SynaptexMemoryHostDataSource> g_host_source;
 // them via Kea's HostMgr (which dispatches into our in-memory data source)
 // and write back a one-line JSON result.
 
-static int               g_cmd_fd = -1;
-static std::mutex        g_cmd_fd_mutex;
-static std::thread       g_cmd_thread;
-static std::atomic<bool> g_cmd_running{false};
+static std::thread             g_cmd_thread;
+static std::atomic<bool>       g_cmd_running{false};
+static std::mutex              g_shutdown_mutex;
+static std::condition_variable g_shutdown_cv;
 
+// Connect to synaptex-router and set a 1-second receive timeout so that
+// read() in cmd_channel_loop returns EAGAIN periodically rather than
+// blocking forever, allowing the thread to check g_cmd_running and exit
+// promptly when unload() fires.
 static int connect_to_router() {
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+
+    struct timeval tv{1, 0};  // 1-second read timeout
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     ::strncpy(addr.sun_path, g_socket_path.c_str(), sizeof(addr.sun_path) - 1);
@@ -300,6 +308,14 @@ static int connect_to_router() {
         return -1;
     }
     return fd;
+}
+
+// Interruptible reconnect delay: waits up to 5 seconds but wakes immediately
+// when unload() calls g_shutdown_cv.notify_all().
+static void reconnect_wait() {
+    std::unique_lock<std::mutex> lk(g_shutdown_mutex);
+    g_shutdown_cv.wait_for(lk, std::chrono::seconds(5),
+                           [] { return !g_cmd_running.load(); });
 }
 
 static std::vector<uint8_t> parse_mac_bytes(const std::string& mac) {
@@ -378,11 +394,16 @@ static std::string dispatch_cmd(const std::string& line) {
 
 // Persistent cmd channel loop: connects (and reconnects) to synaptex-router,
 // announces itself as a cmd channel, then handles incoming reservation commands.
+//
+// Shutdown contract: unload() sets g_cmd_running=false and notifies
+// g_shutdown_cv.  The SO_RCVTIMEO on the socket (1 s) bounds how long read()
+// can block, so join() in unload() completes within ~1 second.  The
+// reconnect_wait() helper also wakes immediately on notify.
 static void cmd_channel_loop() {
     while (g_cmd_running) {
         int fd = connect_to_router();
         if (fd < 0) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            reconnect_wait();
             continue;
         }
 
@@ -390,22 +411,26 @@ static void cmd_channel_loop() {
         const char* init = "{\"type\":\"cmd\"}\n";
         if (::write(fd, init, ::strlen(init)) < 0) {
             ::close(fd);
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            reconnect_wait();
             continue;
         }
 
         fprintf(stderr, "synaptex_hook: cmd channel connected\n");
-        {
-            std::lock_guard<std::mutex> lk(g_cmd_fd_mutex);
-            g_cmd_fd = fd;
-        }
 
         // Read newline-delimited JSON commands until disconnected.
+        // read() returns EAGAIN after SO_RCVTIMEO (1 s); we re-check
+        // g_cmd_running and continue so unload() can join promptly.
         std::string buf;
         char ch;
         while (g_cmd_running) {
             ssize_t n = ::read(fd, &ch, 1);
-            if (n <= 0) break;
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                    continue;  // timeout or signal — check g_cmd_running
+                }
+                break;  // real error
+            }
+            if (n == 0) break;  // peer closed
             if (ch == '\n') {
                 if (!buf.empty()) {
                     std::string resp = dispatch_cmd(buf);
@@ -418,14 +443,10 @@ static void cmd_channel_loop() {
         }
 
         fprintf(stderr, "synaptex_hook: cmd channel disconnected, reconnecting...\n");
-        {
-            std::lock_guard<std::mutex> lk(g_cmd_fd_mutex);
-            g_cmd_fd = -1;
-        }
         ::close(fd);
 
         if (g_cmd_running) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            reconnect_wait();
         }
     }
 }
@@ -621,15 +642,9 @@ int load(LibraryHandle& handle) {
 
 int unload() {
     g_cmd_running = false;
-    {
-        std::lock_guard<std::mutex> lk(g_cmd_fd_mutex);
-        if (g_cmd_fd >= 0) {
-            ::close(g_cmd_fd);
-            g_cmd_fd = -1;
-        }
-    }
+    g_shutdown_cv.notify_all();  // wake reconnect_wait() if the thread is sleeping
     if (g_cmd_thread.joinable()) {
-        g_cmd_thread.join();
+        g_cmd_thread.join();     // completes within ~1 s (SO_RCVTIMEO bound)
     }
 
     HostMgr::instance().delBackend("synaptex-memory");
