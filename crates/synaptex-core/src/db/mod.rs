@@ -259,6 +259,37 @@ pub fn remove_routine(trees: &Trees, routine_id: &str) -> Result<()> {
     Ok(())
 }
 
+// ─── Hub registration helpers ────────────────────────────────────────────────
+
+/// Persisted record of a hub registered via POST /api/v1/hubs.
+/// Stored in the `config` sled tree under key `hub:<mac>`.
+/// This is the durable source of truth for hub discovery — independent of
+/// whether sub-devices have been found yet.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HubRegistration {
+    pub mac:        String,
+    pub kind:       String,   // "bond" | "matter" | "other"
+    pub hub_ip:     String,   // router-allocated managed IP
+    pub bond_token: String,
+    pub bond_id:    String,
+}
+
+pub fn save_hub_registration(trees: &Trees, hub: &HubRegistration) -> Result<()> {
+    put_str(&trees.config, &format!("hub:{}", hub.mac), hub)
+}
+
+pub fn list_hub_registrations(trees: &Trees) -> Result<Vec<HubRegistration>> {
+    let mut hubs = Vec::new();
+    for item in trees.config.scan_prefix(b"hub:") {
+        let (_k, v) = item?;
+        match from_bytes::<HubRegistration>(&v) {
+            Ok(h)  => hubs.push(h),
+            Err(e) => tracing::warn!("skipping corrupt hub registration: {e}"),
+        }
+    }
+    Ok(hubs)
+}
+
 // ─── Global config helpers ─────────────────────────────────────────────────
 
 const KEY_TUYA_CLOUD: &str = "tuya_cloud";

@@ -1,22 +1,66 @@
-/// REST handlers for hub registration (Bond, Matter, Other).
+/// REST handlers for hub registration and listing (Bond, Matter, Other).
+
+use std::collections::HashMap;
 
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::bond_sync;
+use crate::db::{self, HubRegistration, PluginConfig};
 use crate::router_client::RouterClient;
 use crate::rest::AppState;
 
-// ─── Register device ──────────────────────────────────────────────────────────
+// ─── List hubs ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct HubDto {
+    pub mac:          String,
+    pub kind:         String,
+    pub hub_ip:       String,
+    /// Number of virtual sub-devices currently registered for this hub.
+    pub device_count: usize,
+}
+
+pub async fn list_hubs(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<HubDto>>, (StatusCode, String)> {
+    let ie = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+
+    // Hub registrations are the authoritative source — present even before
+    // sub-device discovery completes.
+    let registrations = db::list_hub_registrations(&state.trees).map_err(ie)?;
+
+    // Count discovered sub-devices per hub MAC.
+    let configs = db::load_all_plugin_configs(&state.trees).map_err(ie)?;
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for cfg in configs {
+        if let PluginConfig::Bond(b) = cfg {
+            *counts.entry(b.hub_mac).or_insert(0) += 1;
+        }
+    }
+
+    let mut dtos: Vec<HubDto> = registrations
+        .into_iter()
+        .map(|h| {
+            let device_count = counts.get(&h.mac).copied().unwrap_or(0);
+            HubDto { mac: h.mac, kind: h.kind, hub_ip: h.hub_ip, device_count }
+        })
+        .collect();
+
+    dtos.sort_by(|a, b| a.mac.cmp(&b.mac));
+    Ok(Json(dtos))
+}
+
+// ─── Register hub ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
-pub struct RegisterDeviceBody {
-    /// MAC address of the device (AA:BB:CC:DD:EE:FF).
+pub struct RegisterHubBody {
+    /// MAC address of the hub (AA:BB:CC:DD:EE:FF).
     pub mac:        String,
     /// Currently observed IP (optional; empty means unknown).
     #[serde(default)]
     pub ip:         String,
-    /// Device kind: "bond" | "matter" | "other".
+    /// Hub kind: "bond" | "matter" | "other".
     pub kind:       String,
     /// Bond hub serial number (bondid from GET /v2/sys/version).
     #[serde(default)]
@@ -27,15 +71,15 @@ pub struct RegisterDeviceBody {
 }
 
 #[derive(Debug, Serialize)]
-pub struct RegisterDeviceResponse {
+pub struct RegisterHubResponse {
     pub device_id:  String,
     pub managed_ip: String,
 }
 
 pub async fn register_hub(
     State(state): State<AppState>,
-    Json(body):   Json<RegisterDeviceBody>,
-) -> Result<Json<RegisterDeviceResponse>, (StatusCode, String)> {
+    Json(body):   Json<RegisterHubBody>,
+) -> Result<Json<RegisterHubResponse>, (StatusCode, String)> {
     let cfg = state.router_client_cfg.as_ref().ok_or_else(|| {
         (StatusCode::SERVICE_UNAVAILABLE,
          "router integration not configured (--router-url / --router-cert)".to_string())
@@ -54,6 +98,19 @@ pub async fn register_hub(
     }).await.map_err(|e| {
         (StatusCode::BAD_GATEWAY, format!("register_device RPC failed: {e}"))
     })?;
+
+    // Persist the hub registration so core can rediscover sub-devices on restart,
+    // even before any sub-devices have been found.
+    let hub_reg = HubRegistration {
+        mac:        body.mac.clone(),
+        kind:       body.kind.clone(),
+        hub_ip:     resp.managed_ip.clone(),
+        bond_token: body.bond_token.clone(),
+        bond_id:    body.bond_id.clone(),
+    };
+    if let Err(e) = db::save_hub_registration(&state.trees, &hub_reg) {
+        tracing::warn!(mac = %body.mac, "failed to save hub registration: {e}");
+    }
 
     // For Bond hubs: immediately discover sub-devices and register virtual plugins.
     // Use the currently observed IP for the initial connect (the device may not
@@ -79,7 +136,7 @@ pub async fn register_hub(
         );
     }
 
-    Ok(Json(RegisterDeviceResponse {
+    Ok(Json(RegisterHubResponse {
         device_id:  resp.device_id,
         managed_ip: resp.managed_ip,
     }))

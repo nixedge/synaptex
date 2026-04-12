@@ -5,6 +5,9 @@ use clap::Subcommand;
 
 #[derive(Debug, Subcommand)]
 pub enum HubCmd {
+    /// List registered hubs and their sub-device counts.
+    List,
+
     /// Register a hub and allocate it a managed IP.
     Register {
         /// MAC address of the hub (AA:BB:CC:DD:EE:FF).
@@ -33,6 +36,36 @@ pub enum HubCmd {
 
 pub async fn run(cmd: HubCmd, url: &str, key: Option<&str>) -> Result<()> {
     match cmd {
+        HubCmd::List => {
+            let client = reqwest::Client::new();
+            let mut req = client.get(format!("{url}/api/v1/hubs"));
+            if let Some(k) = key {
+                req = req.bearer_auth(k);
+            }
+            let resp = req.send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("list failed ({status}): {text}");
+            }
+            let hubs: serde_json::Value = resp.json().await?;
+            let hubs = hubs.as_array().map(Vec::as_slice).unwrap_or_default();
+            if hubs.is_empty() {
+                println!("no hubs registered");
+            } else {
+                println!("{:<19} {:<8} {:<16} devices", "MAC", "KIND", "HUB IP");
+                for h in hubs {
+                    println!("{:<19} {:<8} {:<16} {}",
+                        h["mac"].as_str().unwrap_or(""),
+                        h["kind"].as_str().unwrap_or(""),
+                        h["hub_ip"].as_str().unwrap_or(""),
+                        h["device_count"].as_u64().unwrap_or(0),
+                    );
+                }
+            }
+            Ok(())
+        }
+
         HubCmd::Register { mac, ip, kind, bond_id, bond_token } => {
             let body = serde_json::json!({
                 "mac":        mac,

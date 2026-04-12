@@ -82,9 +82,6 @@ async fn main() -> Result<()> {
     let configs = db::load_all_plugin_configs(&trees)
         .context("load plugin configs from sled")?;
 
-    // Unique Bond hubs seen while loading configs — used to spawn periodic syncs.
-    let mut bond_hubs: std::collections::HashMap<String, db::BondConfig> = Default::default();
-
     let config_count = configs.len();
     for cfg in configs {
         match cfg {
@@ -101,9 +98,6 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
-
-                // Track unique hubs for periodic sync (keyed by hub MAC).
-                bond_hubs.entry(bond_cfg.hub_mac.clone()).or_insert_with(|| bond_cfg.clone());
 
                 let plugin = synaptex_bond::BondPlugin::new(info, bond_cfg, bus_tx.clone());
                 registry.register(Arc::new(plugin));
@@ -164,20 +158,27 @@ async fn main() -> Result<()> {
 
     info!(loaded = config_count, "plugin configs loaded");
 
-    // ── Bond periodic sync (one task per unique hub) ──────────────────────────
-    for (_, hub_cfg) in bond_hubs {
-        let hub_ip    = hub_cfg.hub_ip.clone();
-        let hub_mac   = hub_cfg.hub_mac.clone();
-        let bond_token = hub_cfg.bond_token.clone();
+    // ── Bond sync: one immediate + one periodic task per registered hub ──────
+    // Uses HubRegistration records — present even before sub-device discovery,
+    // so this works correctly on first start after hub registration.
+    let hub_registrations = db::list_hub_registrations(&trees)
+        .context("load hub registrations")?;
+    for hub in hub_registrations {
+        if hub.kind != "bond" || hub.bond_token.is_empty() {
+            continue;
+        }
+        let (t1, r1, b1) = (trees.clone(), registry.clone(), bus_tx.clone());
         let (t2, r2, b2) = (trees.clone(), registry.clone(), bus_tx.clone());
-        let (t3, r3, b3) = (trees.clone(), registry.clone(), bus_tx.clone());
-        // Re-sync immediately to pick up devices added while core was offline.
+        let (ip, mac, tok, mgd) = (
+            hub.hub_ip.clone(), hub.mac.clone(),
+            hub.bond_token.clone(), hub.hub_ip.clone(),
+        );
         tokio::spawn(async move {
-            bond_sync::sync_hub(&hub_ip, &hub_mac, &bond_token, &hub_ip, t2, r2, b2).await;
+            bond_sync::sync_hub(&ip, &mac, &tok, &mgd, t1, r1, b1).await;
         });
         bond_sync::spawn_periodic_sync(
-            hub_cfg.hub_ip.clone(), hub_cfg.hub_mac, hub_cfg.bond_token, hub_cfg.hub_ip,
-            t3, r3, b3,
+            hub.hub_ip.clone(), hub.mac, hub.bond_token, hub.hub_ip,
+            t2, r2, b2,
         );
     }
 

@@ -89,7 +89,7 @@ fn api_router(state: AppState) -> Router {
         // Events (SSE)
         .route("/events",            get(events::sse_events))
         // Hubs (Bond, Matter, etc.)
-        .route("/hubs", post(hubs::register_hub))
+        .route("/hubs", get(hubs::list_hubs).post(hubs::register_hub))
         // Pairing
         .route("/pairing/cloud-devices",
             get(pairing::list_cloud_devices))
