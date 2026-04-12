@@ -26,6 +26,7 @@
         ../../Cargo.toml
         ../../crates/synaptex-types
         ../../crates/synaptex-tuya
+        ../../crates/synaptex-bond
         ../../crates/synaptex-core
         ../../crates/synaptex-cli
         ../../crates/synaptex-router-proto
