@@ -326,18 +326,12 @@ static std::string handle_reservation_add(ConstElementPtr args) {
             SUBNET_ID_UNUSED,
             isc::asiolink::IOAddress(ip_e->stringValue())
         );
-        // add() on our data source is a natural upsert (overwrites by MAC key).
-        // Going through HostMgr dispatches to our registered backend.
-        try {
-            HostMgr::instance().add(host);
-        } catch (const DuplicateHost&) {
-            HostMgr::instance().del4(
-                SubnetID(subnet_e->intValue()),
-                Host::IDENT_HWADDR,
-                mac.data(), mac.size()
-            );
-            HostMgr::instance().add(host);
-        }
+        // Write directly to g_host_source — add() is a natural upsert by MAC
+        // key so no duplicate-check is needed.  We bypass HostMgr::add() here
+        // because HostMgr::add() throws "no hosts-database configured" when its
+        // alternate_sources_ list is empty, which happens whenever Kea's config
+        // parser calls HostMgr::create() and resets it after load() runs.
+        g_host_source->add(host);
         return "{\"result\":0,\"text\":\"ok\"}\n";
     } catch (const std::exception& e) {
         return std::string("{\"result\":1,\"text\":\"") + e.what() + "\"}\n";
@@ -352,7 +346,9 @@ static std::string handle_reservation_del(ConstElementPtr args) {
     }
     try {
         auto mac = parse_mac_bytes(mac_e->stringValue());
-        HostMgr::instance().del4(
+        // Write directly to g_host_source for the same reason as add: avoid
+        // HostMgr::del4() which also guards on alternate_sources_ being set.
+        g_host_source->del4(
             SubnetID(subnet_e->intValue()),
             Host::IDENT_HWADDR,
             mac.data(), mac.size()
@@ -637,6 +633,22 @@ int unload() {
     HostDataSourceFactory::deregisterFactory("synaptex-memory");
     g_host_source.reset();
 
+    return 0;
+}
+
+// Called by Kea after it has finished parsing the DHCP configuration and
+// (re-)creating HostMgr from the "hosts-databases" section (or from nothing).
+// HostMgr::create() clears alternate_sources_, so any addBackend() call made
+// in load() is wiped out.  We re-add our backend here, after the reset, so
+// Kea's allocator can iterate it during get4() lookups.
+int dhcp4_srv_configured(CalloutHandle& /*handle*/) {
+    try {
+        HostMgr::instance().addBackend("type=synaptex-memory");
+        fprintf(stderr, "synaptex_hook: host backend registered after srv configured\n");
+    } catch (const std::exception& e) {
+        // Log but don't fail — if it's already registered Kea may throw.
+        fprintf(stderr, "synaptex_hook: addBackend in dhcp4_srv_configured: %s\n", e.what());
+    }
     return 0;
 }
 
