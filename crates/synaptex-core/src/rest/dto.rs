@@ -25,6 +25,9 @@ pub struct DeviceDto {
     pub tuya_version: Option<String>,
     pub capabilities: Vec<CapabilityDto>,
     pub state:        Option<DeviceStateDto>,
+    /// Per-member state, populated only for group devices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub members:      Option<Vec<DeviceDto>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -83,6 +86,7 @@ pub fn device_dto(info: &DeviceInfo, state: Option<DeviceState>, ip: Option<Stri
         ip,
         tuya_version,
         capabilities: info.capabilities.iter().map(CapabilityDto::from).collect(),
+        members:      None,
         state:        state.map(|s| DeviceStateDto {
             online:        s.online,
             updated_at_ms: s.updated_at_ms,

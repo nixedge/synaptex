@@ -225,6 +225,47 @@ pub async fn run(cmd: DeviceCmd, http_url: &str, api_key: Option<&str>) -> Resul
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
+fn print_device(d: &serde_json::Value, indent: &str) {
+    println!("{indent}device:    {}", d["mac"].as_str().unwrap_or("?"));
+    println!("{indent}name:      {}", d["name"].as_str().unwrap_or("?"));
+    println!("{indent}protocol:  {}", d["protocol"].as_str().unwrap_or("?"));
+    println!("{indent}ip:        {}", d["ip"].as_str().unwrap_or("-"));
+
+    if let Some(state) = d["state"].as_object() {
+        let online = state["online"].as_bool().unwrap_or(false);
+        println!("{indent}online:    {}", if online { "yes" } else { "no" });
+        if let Some(p) = state["power"].as_bool() {
+            println!("{indent}power:     {}", if p { "on" } else { "off" });
+        }
+        if let Some(b) = state["brightness"].as_u64() {
+            println!("{indent}brightness:{b}/1000");
+        }
+        if let Some(ct) = state["color_temp_k"].as_u64() {
+            println!("{indent}color_temp:{ct} K");
+        }
+        if let Some(rgb) = state["rgb"].as_array() {
+            if rgb.len() == 3 {
+                println!("{indent}rgb:       ({},{},{})", rgb[0], rgb[1], rgb[2]);
+            }
+        }
+        if let Some(mode) = state["mode"].as_str() {
+            println!("{indent}mode:      {mode}");
+        }
+        if let Some(spd) = state["fan_speed"].as_str() {
+            println!("{indent}fan_speed: {spd}");
+        }
+        if let Some(t) = state["temp_current"].as_u64() {
+            println!("{indent}temp_cur:  {t}°");
+        }
+        if let Some(t) = state["temp_set"].as_u64() {
+            println!("{indent}temp_set:  {t}°");
+        }
+        if let Some(t) = state["temp_calibration"].as_i64() {
+            println!("{indent}temp_cal:  {t:+}°");
+        }
+    }
+}
+
 async fn get(mac: String, http_url: &str, api_key: Option<&str>) -> Result<()> {
     let resp = rest_get(&format!("{http_url}/api/v1/devices/{mac}"), api_key).await
         .context("GET /api/v1/devices/{mac}")?;
@@ -237,43 +278,16 @@ async fn get(mac: String, http_url: &str, api_key: Option<&str>) -> Result<()> {
     }
 
     let d: serde_json::Value = resp.json().await?;
-    println!("device:    {}", d["mac"].as_str().unwrap_or("?"));
-    println!("name:      {}", d["name"].as_str().unwrap_or("?"));
-    println!("protocol:  {}", d["protocol"].as_str().unwrap_or("?"));
-    println!("ip:        {}", d["ip"].as_str().unwrap_or("-"));
 
-    if let Some(state) = d["state"].as_object() {
-        let online = state["online"].as_bool().unwrap_or(false);
-        println!("online:    {}", if online { "yes" } else { "no" });
-        if let Some(p) = state["power"].as_bool() {
-            println!("power:     {}", if p { "on" } else { "off" });
+    if let Some(members) = d["members"].as_array() {
+        println!("group:     {}", d["name"].as_str().unwrap_or("?"));
+        println!("members:   {}", members.len());
+        for (i, m) in members.iter().enumerate() {
+            println!("  ── [{}] ─────────────────────────────", i + 1);
+            print_device(m, "  ");
         }
-        if let Some(b) = state["brightness"].as_u64() {
-            println!("brightness:{b}/1000");
-        }
-        if let Some(ct) = state["color_temp_k"].as_u64() {
-            println!("color_temp:{ct} K");
-        }
-        if let Some(rgb) = state["rgb"].as_array() {
-            if rgb.len() == 3 {
-                println!("rgb:       ({},{},{})", rgb[0], rgb[1], rgb[2]);
-            }
-        }
-        if let Some(mode) = state["mode"].as_str() {
-            println!("mode:      {mode}");
-        }
-        if let Some(spd) = state["fan_speed"].as_str() {
-            println!("fan_speed: {spd}");
-        }
-        if let Some(t) = state["temp_current"].as_u64() {
-            println!("temp_cur:  {t}°");
-        }
-        if let Some(t) = state["temp_set"].as_u64() {
-            println!("temp_set:  {t}°");
-        }
-        if let Some(t) = state["temp_calibration"].as_i64() {
-            println!("temp_cal:  {t:+}°");
-        }
+    } else {
+        print_device(&d, "");
     }
     Ok(())
 }

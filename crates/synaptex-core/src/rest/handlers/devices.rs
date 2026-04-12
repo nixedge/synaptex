@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use serde::Deserialize;
@@ -18,6 +19,23 @@ use crate::{
     },
     tuya_cloud::TuyaCloudClient,
 };
+
+/// Build per-member `DeviceDto`s from cache for a group.
+fn member_dtos(member_ids: &[synaptex_types::device::DeviceId], state: &AppState) -> Vec<DeviceDto> {
+    member_ids.iter().filter_map(|mid| {
+        let info = db::get(&state.trees.registry, mid).ok()??;
+        let st   = state.cache.get(mid);
+        let (ip, ver) = db::load_plugin_config(&state.trees, mid)
+            .ok().flatten()
+            .map(|cfg| match cfg {
+                PluginConfig::Tuya(t) => (Some(t.ip.to_string()), t.protocol_version),
+                PluginConfig::Bond(b) => (Some(b.hub_ip), None),
+                PluginConfig::Group(_) => (None, None),
+            })
+            .unwrap_or((None, None));
+        Some(device_dto(&info, st, ip, ver))
+    }).collect()
+}
 
 pub async fn list_devices(
     State(state): State<AppState>,
@@ -59,16 +77,26 @@ pub async fn get_device(
         Err(_) => state.cache.get(&id),
     };
 
-    let (ip, tuya_version) = db::load_plugin_config(&state.trees, &id)
+    let cfg = db::load_plugin_config(&state.trees, &id)
         .ok()
-        .flatten()
+        .flatten();
+
+    let (ip, tuya_version) = cfg.as_ref()
         .map(|cfg| match cfg {
-            PluginConfig::Tuya(t) => (Some(t.ip.to_string()), t.protocol_version),
-            PluginConfig::Bond(b) => (Some(b.hub_ip), None),
+            PluginConfig::Tuya(t) => (Some(t.ip.to_string()), t.protocol_version.clone()),
+            PluginConfig::Bond(b) => (Some(b.hub_ip.clone()), None),
             PluginConfig::Group(_) => (None, None),
         })
         .unwrap_or((None, None));
-    Ok(Json(device_dto(&info, st, ip, tuya_version)))
+
+    let members = match &cfg {
+        Some(PluginConfig::Group(g)) => Some(member_dtos(&g.member_ids, &state)),
+        _ => None,
+    };
+
+    let mut dto = device_dto(&info, st, ip, tuya_version);
+    dto.members = members;
+    Ok(Json(dto))
 }
 
 pub async fn register_device(
@@ -282,7 +310,7 @@ pub async fn device_command(
     State(state): State<AppState>,
     Path(mac):    Path<String>,
     Json(dto):    Json<CommandDto>,
-) -> ApiResult<StatusCode> {
+) -> ApiResult<axum::response::Response> {
     let id = DeviceId::from_mac_str(&mac)
         .map_err(|e| ApiError::bad_request(e))?;
 
@@ -293,5 +321,17 @@ pub async fn device_command(
     state.registry.execute_command(&id, cmd).await
         .map_err(ApiError::from)?;
 
-    Ok(StatusCode::NO_CONTENT)
+    // For groups return per-member state so callers can see each device's result.
+    let cfg = db::load_plugin_config(&state.trees, &id).ok().flatten();
+    if let Some(PluginConfig::Group(g)) = cfg {
+        let info: DeviceInfo = db::get(&state.trees.registry, &id)
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .ok_or_else(|| ApiError::not_found(format!("device {mac} not found")))?;
+        let st = state.cache.get(&id);
+        let mut dto = device_dto(&info, st, None, None);
+        dto.members = Some(member_dtos(&g.member_ids, &state));
+        return Ok((StatusCode::OK, Json(dto)).into_response());
+    }
+
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
