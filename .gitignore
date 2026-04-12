@@ -1,5 +1,6 @@
 target
 result
+src/kea-hook/build/
 .direnv
 .claude/settings.local.json
 /db/
