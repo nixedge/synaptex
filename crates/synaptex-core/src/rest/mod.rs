@@ -20,23 +20,26 @@ use crate::{
     db::Trees,
     plugin::PluginRegistry,
     routine::RoutineRunner,
-    router_client::RouterDiscoveredDevice,
+    router_client::{RouterClientConfig, RouterDiscoveredDevice},
 };
 
-use handlers::{config, devices, events, groups, pairing, rooms, routines};
+use handlers::{config, devices, events, groups, pairing, rooms, routines, router};
 
 // ─── Shared application state ────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct AppState {
-    pub cache:           Arc<StateCache>,
-    pub registry:        Arc<PluginRegistry>,
-    pub trees:           Arc<Trees>,
-    pub bus_tx:          StateBusSender,
-    pub routine_runner:  Arc<RoutineRunner>,
+    pub cache:              Arc<StateCache>,
+    pub registry:           Arc<PluginRegistry>,
+    pub trees:              Arc<Trees>,
+    pub bus_tx:             StateBusSender,
+    pub routine_runner:     Arc<RoutineRunner>,
     /// Devices most recently seen by the synaptex-router gRPC stream,
     /// keyed by Tuya device ID.  Empty when router integration is disabled.
-    pub router_devices:  Arc<DashMap<String, RouterDiscoveredDevice>>,
+    pub router_devices:     Arc<DashMap<String, RouterDiscoveredDevice>>,
+    /// Config needed to open a gRPC connection to synaptex-router on demand
+    /// (e.g. for the register-device endpoint).  None when router is not configured.
+    pub router_client_cfg:  Option<RouterClientConfig>,
 }
 
 // ─── Router factory ──────────────────────────────────────────────────────────
@@ -85,6 +88,8 @@ fn api_router(state: AppState) -> Router {
         .route("/routines/:id/run",     delete(routines::cancel_routine))
         // Events (SSE)
         .route("/events",            get(events::sse_events))
+        // Router device management
+        .route("/router/devices", post(router::register_device))
         // Pairing
         .route("/pairing/cloud-devices",
             get(pairing::list_cloud_devices))

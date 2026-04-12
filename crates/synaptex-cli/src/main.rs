@@ -7,6 +7,7 @@ use commands::config::ConfigCmd;
 use commands::device::DeviceCmd;
 use commands::room::RoomCmd;
 use commands::routine::RoutineCmd;
+use commands::router::RouterCmd;
 
 // ─── CLI definition ──────────────────────────────────────────────────────────
 
@@ -47,6 +48,10 @@ enum Commands {
     /// Manage routines.
     #[command(subcommand)]
     Routine(RoutineCmd),
+
+    /// Manage the synaptex-router (device registration, IP allocation).
+    #[command(subcommand)]
+    Router(RouterCmd),
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -62,5 +67,6 @@ async fn main() -> Result<()> {
         Commands::Device(cmd)  => commands::device::run(cmd, url, key).await,
         Commands::Room(cmd)    => commands::room::run(cmd, url, key).await,
         Commands::Routine(cmd) => commands::routine::run(cmd, url, key).await,
+        Commands::Router(cmd)  => commands::router::run(cmd, url, key).await,
     }
 }

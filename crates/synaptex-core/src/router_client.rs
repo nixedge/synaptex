@@ -94,6 +94,18 @@ impl RouterClient {
         Ok(())
     }
 
+    pub async fn register_device(
+        &mut self,
+        req: synaptex_router_proto::RegisterDeviceRequest,
+    ) -> Result<synaptex_router_proto::RegisterDeviceResponse> {
+        let resp = self.inner
+            .register_device(req)
+            .await
+            .context("RegisterDevice RPC")?
+            .into_inner();
+        Ok(resp)
+    }
+
     #[allow(dead_code)]
     pub async fn upsert_firewall_rule(
         &mut self,

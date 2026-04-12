@@ -7,11 +7,22 @@ use tonic::{Request, Response, Status};
 use synaptex_router_proto::{
     router_service_server::RouterService,
     Ack, DhcpReservation, DhcpReservationList, DiscoveredDevice, DiscoveryRequest,
-    Empty, FirewallRule, FirewallRuleList, MacAddress, RuleId,
-    StatusRequest, StatusResponse,
+    Empty, FirewallRule, FirewallRuleList, MacAddress, RegisterDeviceRequest,
+    RegisterDeviceResponse, RuleId, StatusRequest, StatusResponse,
 };
 
-use crate::{db::{DeviceKind, RouterDb}, dhcp::KeaClient, firewall};
+use crate::{db::{DeviceKind, NetPolicy, RouterDb, RouterDevice}, dhcp::KeaClient, firewall};
+
+fn build_kind(r: &RegisterDeviceRequest) -> DeviceKind {
+    match r.kind.as_str() {
+        "bond" => DeviceKind::Bond {
+            bond_id:    r.bond_id.clone(),
+            bond_token: r.bond_token.clone(),
+        },
+        "matter" => DeviceKind::Matter { node_id: 0 },
+        other    => DeviceKind::Other(other.to_string()),
+    }
+}
 
 // ─── Service implementation ───────────────────────────────────────────────────
 
@@ -122,6 +133,80 @@ impl RouterService for RouterServiceImpl {
             })
             .collect();
         Ok(Response::new(DhcpReservationList { reservations }))
+    }
+
+    // ── Device registration ───────────────────────────────────────────────────
+
+    async fn register_device(
+        &self,
+        req: Request<RegisterDeviceRequest>,
+    ) -> Result<Response<RegisterDeviceResponse>, Status> {
+        let r = req.get_ref();
+
+        if r.mac.is_empty() {
+            return Err(Status::invalid_argument("mac is required"));
+        }
+        if r.kind != "bond" && r.kind != "matter" && r.kind != "other" {
+            return Err(Status::invalid_argument("kind must be bond, matter, or other"));
+        }
+
+        let ie = |e: anyhow::Error| Status::internal(e.to_string());
+
+        // Reuse an existing record (matched by MAC) or create a new one.
+        let device = match self.db.get_by_mac(&r.mac).map_err(ie)? {
+            Some(mut existing) => {
+                if !r.ip.is_empty() {
+                    existing.ip = r.ip.clone();
+                }
+                // Refresh kind fields (token rotation, bond_id correction).
+                existing.kind = build_kind(r);
+                // Backfill managed_ip if the record predates IP allocation.
+                if existing.managed_ip.is_none() {
+                    existing.managed_ip = self.db
+                        .allocate_ip(&existing.device_id)
+                        .ok()
+                        .map(|a| a.to_string());
+                }
+                existing
+            }
+            None => {
+                let device_id = uuid::Uuid::new_v4().to_string();
+                let managed_ip = self.db
+                    .allocate_ip(&device_id)
+                    .map_err(ie)?
+                    .to_string();
+                RouterDevice {
+                    device_id,
+                    ip:         r.ip.clone(),
+                    mac:        r.mac.clone(),
+                    managed_ip: Some(managed_ip),
+                    kind:       build_kind(r),
+                    net_policy: NetPolicy::Provisioned,
+                }
+            }
+        };
+
+        self.db.upsert(&device).map_err(ie)?;
+
+        // Push Kea reservation so the device migrates on next DHCP renewal.
+        if let (Some(ref kea), Some(ref managed_ip)) = (&self.kea, &device.managed_ip) {
+            if let Err(e) = kea.reservation_add(&device.mac, managed_ip).await {
+                tracing::warn!(mac = %device.mac, %managed_ip,
+                    "register_device: kea reservation: {e:#}");
+            }
+        }
+
+        tracing::info!(
+            mac        = %device.mac,
+            managed_ip = ?device.managed_ip,
+            kind       = %r.kind,
+            "router: device registered",
+        );
+
+        Ok(Response::new(RegisterDeviceResponse {
+            device_id:  device.device_id,
+            managed_ip: device.managed_ip.unwrap_or_default(),
+        }))
     }
 
     // ── Firewall ──────────────────────────────────────────────────────────────

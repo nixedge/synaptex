@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 pub enum DeviceKind {
     Tuya   { tuya_id: String, version: String },
     Matter { node_id: u64 },
-    Bond   { bond_id: String },
+    Bond   { bond_id: String, bond_token: String },
     Alexa,
     Sense,
     Other(String),
@@ -22,7 +22,7 @@ impl DeviceKind {
     pub fn native_id(&self) -> Option<String> {
         match self {
             DeviceKind::Tuya   { tuya_id, .. } => Some(tuya_id.clone()),
-            DeviceKind::Bond   { bond_id }     => Some(bond_id.clone()),
+            DeviceKind::Bond   { bond_id, .. }  => Some(bond_id.clone()),
             DeviceKind::Matter { node_id }     => Some(node_id.to_string()),
             DeviceKind::Alexa | DeviceKind::Sense | DeviceKind::Other(_) => None,
         }

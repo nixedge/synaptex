@@ -5,3 +5,4 @@ pub mod groups;
 pub mod pairing;
 pub mod rooms;
 pub mod routines;
+pub mod router;

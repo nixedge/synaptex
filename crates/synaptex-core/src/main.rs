@@ -157,6 +157,7 @@ async fn main() -> Result<()> {
     let router_devices = Arc::new(dashmap::DashMap::new());
 
     // ── Router client (optional) ─────────────────────────────────────────────
+    let mut router_client_cfg: Option<router_client::RouterClientConfig> = None;
     match (&args.router_url, &args.router_cert) {
         (Some(url), Some(cert_path)) => {
             let cert_pem = std::fs::read(cert_path)
@@ -165,6 +166,7 @@ async fn main() -> Result<()> {
                 endpoint:        url.clone(),
                 router_cert_pem: cert_pem,
             };
+            router_client_cfg = Some(cfg.clone());
             tokio::spawn(router_client::run_discovery_loop(cfg, router_devices.clone(), trees.clone()));
             info!(endpoint = %url, "router client starting");
         }
@@ -175,12 +177,13 @@ async fn main() -> Result<()> {
 
     // ── HTTP REST API (blocks until shutdown) ────────────────────────────────
     let app_state = rest::AppState {
-        cache:          cache.clone(),
-        registry:       registry.clone(),
-        trees:          trees.clone(),
-        bus_tx:         bus_tx.clone(),
-        routine_runner: routine_runner.clone(),
+        cache:             cache.clone(),
+        registry:          registry.clone(),
+        trees:             trees.clone(),
+        bus_tx:            bus_tx.clone(),
+        routine_runner:    routine_runner.clone(),
         router_devices,
+        router_client_cfg,
     };
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.http_port));
     let tcp = tokio::net::TcpListener::bind(http_addr)

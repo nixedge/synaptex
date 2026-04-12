@@ -17,6 +17,10 @@ service RouterService {
     rpc RemoveDhcpReservation(MacAddress) returns (Ack);
     rpc ListDhcpReservations(Empty) returns (DhcpReservationList);
 
+    // Register a non-Tuya device (Bond, Matter, Other) in the router DB.
+    // Allocates a managed IP from the pool and pushes a Kea reservation.
+    rpc RegisterDevice(RegisterDeviceRequest) returns (RegisterDeviceResponse);
+
     // Firewall rules (delegates to nftables).
     rpc UpsertFirewallRule(FirewallRule) returns (Ack);
     rpc RemoveFirewallRule(RuleId) returns (Ack);
@@ -70,6 +74,21 @@ message DhcpReservation {
 
 message DhcpReservationList {
     repeated DhcpReservation reservations = 1;
+}
+
+// ─── Device registration ──────────────────────────────────────────────────────
+
+message RegisterDeviceRequest {
+    string mac        = 1;   // "AA:BB:CC:DD:EE:FF" — required
+    string ip         = 2;   // currently observed IP (optional; empty = unknown)
+    string kind       = 3;   // "bond" | "matter" | "other"
+    string bond_id    = 4;   // Bond hub serial number (bondid from /v2/sys/version)
+    string bond_token = 5;   // Bond local API token (BOND-Token header value)
+}
+
+message RegisterDeviceResponse {
+    string device_id  = 1;   // stable UUID assigned to this device
+    string managed_ip = 2;   // Kea-reserved IP allocated from the managed pool
 }
 
 // ─── Firewall ─────────────────────────────────────────────────────────────────
