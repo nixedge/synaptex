@@ -54,10 +54,11 @@ message DiscoveryRequest {
 }
 
 message DiscoveredDevice {
-    string tuya_id = 1;   // Tuya gateway/device ID
-    string ip      = 2;   // IPv4 address seen in the UDP broadcast
-    string mac     = 3;   // MAC if resolvable via ARP (empty otherwise)
-    string version = 4;   // Tuya protocol version: "3.3", "3.4", "3.5"
+    string tuya_id    = 1;   // Tuya gateway/device ID
+    string ip         = 2;   // IPv4 address seen in the UDP broadcast
+    string mac        = 3;   // MAC if resolvable via ARP (empty otherwise)
+    string version    = 4;   // Tuya protocol version: "3.3", "3.4", "3.5"
+    string managed_ip = 5;   // Synaptex-allocated IP in the managed range (empty if not yet allocated)
 }
 
 // ─── DHCP ─────────────────────────────────────────────────────────────────────

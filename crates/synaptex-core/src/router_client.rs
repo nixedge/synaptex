@@ -1,9 +1,10 @@
 /// Cached info about a device most recently seen by the router.
 #[derive(Clone, Debug)]
 pub struct RouterDiscoveredDevice {
-    pub ip:      std::net::Ipv4Addr,
-    pub mac:     String,
-    pub version: String,
+    pub ip:         std::net::Ipv4Addr,
+    pub mac:        String,
+    pub version:    String,
+    pub managed_ip: Option<std::net::Ipv4Addr>,
 }
 
 /// Client for the synaptex-router gRPC service.
@@ -220,10 +221,12 @@ pub async fn run_discovery_loop(
                                     );
                                     // Parse the IP — skip on failure rather than crashing.
                                     if let Ok(ip) = device.ip.parse::<std::net::Ipv4Addr>() {
+                                        let managed_ip = device.managed_ip.parse::<std::net::Ipv4Addr>().ok();
                                         cache.insert(device.tuya_id.clone(), RouterDiscoveredDevice {
                                             ip,
-                                            mac:     device.mac.clone(),
-                                            version: device.version.clone(),
+                                            mac:        device.mac.clone(),
+                                            version:    device.version.clone(),
+                                            managed_ip,
                                         });
 
                                         // Sync IP + protocol_version back to stored config.

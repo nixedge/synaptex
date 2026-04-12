@@ -68,7 +68,13 @@ impl RouterService for RouterServiceImpl {
                     DeviceKind::Tuya { tuya_id, version } => (tuya_id.clone(), version.clone()),
                     _ => (String::new(), String::new()),
                 };
-                Ok(DiscoveredDevice { tuya_id, ip: d.ip, mac: d.mac, version })
+                Ok(DiscoveredDevice {
+                    tuya_id,
+                    ip:         d.ip,
+                    mac:        d.mac,
+                    version,
+                    managed_ip: d.managed_ip.unwrap_or_default(),
+                })
             });
 
         let initial = tokio_stream::iter(known);

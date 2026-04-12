@@ -8,6 +8,7 @@ use commands::device::DeviceCmd;
 use commands::room::RoomCmd;
 use commands::routine::RoutineCmd;
 use commands::hub::HubCmd;
+use commands::router::RouterCmd;
 
 // ─── CLI definition ──────────────────────────────────────────────────────────
 
@@ -52,6 +53,10 @@ enum Commands {
     /// Register and manage hubs (Bond, Matter, etc.).
     #[command(subcommand)]
     Hub(HubCmd),
+
+    /// Inspect the router's device and discovery state.
+    #[command(subcommand)]
+    Router(RouterCmd),
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -68,5 +73,6 @@ async fn main() -> Result<()> {
         Commands::Room(cmd)    => commands::room::run(cmd, url, key).await,
         Commands::Routine(cmd) => commands::routine::run(cmd, url, key).await,
         Commands::Hub(cmd)     => commands::hub::run(cmd, url, key).await,
+        Commands::Router(cmd)  => commands::router::run(cmd, url, key).await,
     }
 }

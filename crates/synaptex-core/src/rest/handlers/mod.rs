@@ -6,3 +6,4 @@ pub mod pairing;
 pub mod rooms;
 pub mod routines;
 pub mod hubs;
+pub mod router;

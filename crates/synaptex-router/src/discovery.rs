@@ -493,10 +493,11 @@ async fn listen_loop(
 
         // A send error just means no current subscribers — not fatal.
         let _ = tx.send(DiscoveredDevice {
-            tuya_id: parsed.tuya_id,
-            ip:      ip.to_string(),
+            tuya_id:    parsed.tuya_id,
+            ip:         ip.to_string(),
             mac,
-            version: parsed.version,
+            version:    parsed.version,
+            managed_ip: device.managed_ip.clone().unwrap_or_default(),
         });
     }
 }
