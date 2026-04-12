@@ -51,6 +51,7 @@
 #include <unordered_map>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <chrono>
 
@@ -434,7 +435,7 @@ static void cmd_channel_loop() {
             if (ch == '\n') {
                 if (!buf.empty()) {
                     std::string resp = dispatch_cmd(buf);
-                    ::write(fd, resp.c_str(), resp.size());
+                    (void)::write(fd, resp.c_str(), resp.size());
                     buf.clear();
                 }
             } else {
