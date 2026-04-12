@@ -267,6 +267,7 @@ impl Connection {
                     brightness:   None,
                     color_temp_k: None,
                     rgb:          None,
+                    mode:              None,
                     switches:          HashMap::new(),
                     fan_speed:         None,
                     temp_current:      None,
@@ -587,13 +588,13 @@ impl TuyaPlugin {
             DeviceCommand::SendIr { head, key } => dm.ir_dps(head.as_deref(), key),
             DeviceCommand::SetFanSpeed(speed)   => dm.fan_speed_dps(*speed),
             DeviceCommand::SetTargetTemp(temp)  => dm.set_temp_dps(*temp),
-            DeviceCommand::SetLight { power, brightness, color_temp, rgb, color_mode } => {
+            DeviceCommand::SetLight { power, brightness, color_temp, rgb, mode } => {
                 let dps = dm.patch_light_dps(
                     *power,
                     *brightness,
                     *color_temp,
                     *rgb,
-                    color_mode.as_deref(),
+                    mode.as_deref(),
                 );
                 // If nothing was set (all None), return None to skip the command.
                 if dps.as_object().map(|m| m.is_empty()).unwrap_or(true) {
@@ -788,7 +789,7 @@ fn offline_state(id: DeviceId) -> DeviceState {
             .unwrap_or_default()
             .as_millis() as u64,
         power: None, brightness: None, color_temp_k: None,
-        rgb: None, switches: HashMap::new(), fan_speed: None,
+        rgb: None, mode: None, switches: HashMap::new(), fan_speed: None,
         temp_current: None, temp_set: None, temp_calibration: None,
     }
 }

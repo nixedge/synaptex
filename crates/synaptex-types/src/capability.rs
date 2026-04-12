@@ -60,7 +60,7 @@ pub enum DeviceCommand {
         rgb:        Option<(u8, u8, u8)>,
         /// Mode override: `"white"` or `"colour"`.  When `None` the plugin
         /// auto-derives the mode from which fields are set.
-        color_mode: Option<String>,
+        mode: Option<String>,
     },
 }
 

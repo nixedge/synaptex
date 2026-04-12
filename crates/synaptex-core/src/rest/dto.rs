@@ -35,6 +35,7 @@ pub struct DeviceStateDto {
     pub brightness:    Option<u16>,
     pub color_temp_k:  Option<u16>,
     pub rgb:           Option<[u8; 3]>,
+    pub mode:          Option<String>,
     pub switches:      HashMap<u8, bool>,
     pub fan_speed:     Option<FanSpeed>,
     pub temp_current:     Option<u16>,
@@ -89,6 +90,7 @@ pub fn device_dto(info: &DeviceInfo, state: Option<DeviceState>, ip: Option<Stri
             brightness:    s.brightness,
             color_temp_k:  s.color_temp_k,
             rgb:           s.rgb.map(|(r, g, b)| [r, g, b]),
+            mode:          s.mode,
             switches:      s.switches,
             fan_speed:     s.fan_speed,
             temp_current:     s.temp_current,
@@ -127,7 +129,7 @@ pub enum CommandDto {
         #[serde(default)] g:          Option<u8>,
         #[serde(default)] b:          Option<u8>,
         /// Mode override: `"white"` | `"colour"`.
-        #[serde(default)] color_mode: Option<String>,
+        #[serde(default)] mode: Option<String>,
     },
 }
 
@@ -154,12 +156,12 @@ impl TryFrom<CommandDto> for DeviceCommand {
                 DeviceCommand::SetDpStr  { dp, value: v },
             CommandDto::SetDp { .. } =>
                 return Err("set_dp requires exactly one of bool_val, int_val, str_val"),
-            CommandDto::SetLight { power, brightness, color_temp, r, g, b, color_mode } => {
+            CommandDto::SetLight { power, brightness, color_temp, r, g, b, mode } => {
                 let rgb = match (r, g, b) {
                     (Some(r), Some(g), Some(b)) => Some((r, g, b)),
                     _                           => None,
                 };
-                DeviceCommand::SetLight { power, brightness, color_temp, rgb, color_mode }
+                DeviceCommand::SetLight { power, brightness, color_temp, rgb, mode }
             }
         })
     }
@@ -311,7 +313,7 @@ fn device_command_to_dto(cmd: &DeviceCommand) -> CommandDto {
             CommandDto::SetDp { dp: *dp, bool_val: None, int_val: Some(*value), str_val: None },
         DeviceCommand::SetDpStr { dp, value } =>
             CommandDto::SetDp { dp: *dp, bool_val: None, int_val: None, str_val: Some(value.clone()) },
-        DeviceCommand::SetLight { power, brightness, color_temp, rgb, color_mode } =>
+        DeviceCommand::SetLight { power, brightness, color_temp, rgb, mode } =>
             CommandDto::SetLight {
                 power:      *power,
                 brightness: *brightness,
@@ -319,7 +321,7 @@ fn device_command_to_dto(cmd: &DeviceCommand) -> CommandDto {
                 r:          rgb.map(|(r, _, _)| r),
                 g:          rgb.map(|(_, g, _)| g),
                 b:          rgb.map(|(_, _, b)| b),
-                color_mode: color_mode.clone(),
+                mode: mode.clone(),
             },
     }
 }

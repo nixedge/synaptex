@@ -30,6 +30,9 @@ pub struct DeviceState {
     /// Colour temperature in Kelvin.
     pub color_temp_k: Option<u16>,
     pub rgb:          Option<(u8, u8, u8)>,
+    /// Current mode as reported by the device (e.g. `"white"` or `"colour"` for bulbs).
+    /// `None` for devices without a mode DP (switches, fans, etc.).
+    pub mode:         Option<String>,
     /// Multi-switch state: index → on/off.
     pub switches:     HashMap<u8, bool>,
     pub fan_speed:    Option<FanSpeed>,

@@ -74,7 +74,7 @@ pub enum RoomCmd {
 
         /// Override colour mode: white | colour.
         #[arg(long, value_name = "MODE")]
-        color_mode: Option<String>,
+        mode: Option<String>,
 
         /// Send an IR code. Format: `HEAD:KEY`.
         #[arg(long, value_name = "HEAD:KEY", group = "cmd")]
@@ -99,8 +99,8 @@ pub async fn run(cmd: RoomCmd, http_url: &str, api_key: Option<&str>) -> Result<
         RoomCmd::Delete { id }                                                    => delete(id, http_url, api_key).await,
         RoomCmd::List                                                             => list(http_url, api_key).await,
         RoomCmd::Get { id }                                                       => get(id, http_url, api_key).await,
-        RoomCmd::Set { id, power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed } =>
-            set(id, power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, http_url, api_key).await,
+        RoomCmd::Set { id, power, brightness, color_temp, rgb, mode, send_ir, set_dp, fan_speed } =>
+            set(id, power, brightness, color_temp, rgb, mode, send_ir, set_dp, fan_speed, http_url, api_key).await,
     }
 }
 
@@ -211,14 +211,14 @@ async fn set(
     brightness: Option<u32>,
     color_temp: Option<u32>,
     rgb:        Option<String>,
-    color_mode: Option<String>,
+    mode: Option<String>,
     send_ir:    Option<String>,
     set_dp:     Option<String>,
     fan_speed:  Option<String>,
     http_url:   &str,
     api_key:    Option<&str>,
 ) -> Result<()> {
-    let cmd_json = build_command_json(power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, None, None)?;
+    let cmd_json = build_command_json(power, brightness, color_temp, rgb, mode, send_ir, set_dp, fan_speed, None, None)?;
 
     let client = reqwest::Client::new();
     let mut req = client

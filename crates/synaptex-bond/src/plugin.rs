@@ -80,6 +80,7 @@ impl DevicePlugin for BondPlugin {
             brightness:       None,
             color_temp_k:     None,
             rgb:              None,
+            mode:             None,
             switches:         Default::default(),
             fan_speed,
             temp_current:     None,

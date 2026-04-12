@@ -318,6 +318,11 @@ impl DpMap {
                 state.rgb = parse_color_hex(hex, self.color_format);
             }
         }
+        if let Some(dp) = self.mode_dp {
+            if let Some(s) = dps.get(&dp.to_string()).and_then(Value::as_str) {
+                state.mode = Some(s.to_string());
+            }
+        }
         if let Some(dp) = self.fan_speed_dp {
             if let Some(s) = dps.get(&dp.to_string()).and_then(Value::as_str) {
                 state.fan_speed = Some(match self.fan_speed_format {
@@ -417,17 +422,17 @@ impl DpMap {
     /// Build a `dps` JSON value for `SetLight` — a patch-style command that
     /// only writes DPs for the fields that are `Some`.
     ///
-    /// Auto-derived mode: if `rgb` is `Some` and `color_mode` is `None`, the
+    /// Auto-derived mode: if `rgb` is `Some` and `mode` is `None`, the
     /// mode DP is set to `"colour"`.  If only brightness/color_temp are `Some`
-    /// and `color_mode` is `None`, the mode DP is set to `"white"`.
-    /// An explicit `color_mode` overrides auto-derivation.
+    /// and `mode` is `None`, the mode DP is set to `"white"`.
+    /// An explicit `mode` overrides auto-derivation.
     pub fn patch_light_dps(
         &self,
         power:      Option<bool>,
         brightness: Option<u16>,
         color_temp: Option<u16>,
         rgb:        Option<(u8, u8, u8)>,
-        color_mode: Option<&str>,
+        mode: Option<&str>,
     ) -> Value {
         let mut map = serde_json::Map::new();
 
@@ -447,7 +452,7 @@ impl DpMap {
                 map.insert(color_dp.to_string(), Value::String(hex));
             }
             // Auto-set mode to "colour" when setting RGB (unless overridden).
-            if color_mode.is_none() {
+            if mode.is_none() {
                 if let Some(mode_dp) = self.mode_dp {
                     map.insert(mode_dp.to_string(), Value::String("colour".into()));
                 }
@@ -459,7 +464,7 @@ impl DpMap {
             let (dp, val) = self.brightness_dp_value(bri);
             map.insert(dp.to_string(), Value::Number(val.into()));
             // Auto-set mode to "white" when setting brightness (no rgb, no override).
-            if color_mode.is_none() && rgb.is_none() {
+            if mode.is_none() && rgb.is_none() {
                 if let Some(mode_dp) = self.mode_dp {
                     map.insert(mode_dp.to_string(), Value::String("white".into()));
                 }
@@ -471,15 +476,15 @@ impl DpMap {
             let (dp, val) = self.color_temp_dp_value(k);
             map.insert(dp.to_string(), Value::Number(val.into()));
             // Auto-set mode to "white" when setting color_temp (no rgb, no override).
-            if color_mode.is_none() && rgb.is_none() {
+            if mode.is_none() && rgb.is_none() {
                 if let Some(mode_dp) = self.mode_dp {
                     map.insert(mode_dp.to_string(), Value::String("white".into()));
                 }
             }
         }
 
-        // Explicit color_mode always wins.
-        if let Some(mode) = color_mode {
+        // Explicit mode always wins.
+        if let Some(mode) = mode {
             if let Some(mode_dp) = self.mode_dp {
                 map.insert(mode_dp.to_string(), Value::String(mode.into()));
             }

@@ -79,7 +79,7 @@ pub enum DeviceCmd {
 
         /// Override colour mode: white | colour.
         #[arg(long, value_name = "MODE")]
-        color_mode: Option<String>,
+        mode: Option<String>,
 
         /// Send an IR code. Format: `HEAD:KEY` (HEAD may be empty, e.g. `:KEY`).
         #[arg(long, value_name = "HEAD:KEY", group = "cmd")]
@@ -200,8 +200,8 @@ pub async fn run(cmd: DeviceCmd, http_url: &str, api_key: Option<&str>) -> Resul
     match cmd {
         DeviceCmd::Get { mac } =>
             get(mac, http_url, api_key).await,
-        DeviceCmd::Set { mac, power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, set_temp } =>
-            set(mac, power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, set_temp, http_url, api_key).await,
+        DeviceCmd::Set { mac, power, brightness, color_temp, rgb, mode, send_ir, set_dp, fan_speed, set_temp } =>
+            set(mac, power, brightness, color_temp, rgb, mode, send_ir, set_dp, fan_speed, set_temp, http_url, api_key).await,
         DeviceCmd::List { groups } =>
             list(groups, http_url, api_key).await,
         DeviceCmd::Add { mac, name, ip, tuya_id, local_key, model, port, dp_profile } =>
@@ -259,6 +259,9 @@ async fn get(mac: String, http_url: &str, api_key: Option<&str>) -> Result<()> {
                 println!("rgb:       ({},{},{})", rgb[0], rgb[1], rgb[2]);
             }
         }
+        if let Some(mode) = state["mode"].as_str() {
+            println!("mode:      {mode}");
+        }
         if let Some(spd) = state["fan_speed"].as_str() {
             println!("fan_speed: {spd}");
         }
@@ -282,7 +285,7 @@ async fn set(
     brightness: Option<u32>,
     color_temp: Option<u32>,
     rgb:        Option<String>,
-    color_mode: Option<String>,
+    mode: Option<String>,
     send_ir:    Option<String>,
     set_dp:     Option<String>,
     fan_speed:  Option<String>,
@@ -310,7 +313,7 @@ async fn set(
         }
     };
 
-    let cmd_json = build_command_json(power, brightness, color_temp, rgb, color_mode, send_ir, set_dp, fan_speed, set_temp, is_light)?;
+    let cmd_json = build_command_json(power, brightness, color_temp, rgb, mode, send_ir, set_dp, fan_speed, set_temp, is_light)?;
 
     let client = reqwest::Client::new();
     let mut req = client
@@ -838,7 +841,7 @@ pub fn build_command_json(
     brightness: Option<u32>,
     color_temp: Option<u32>,
     rgb:        Option<String>,
-    color_mode: Option<String>,
+    mode: Option<String>,
     send_ir:    Option<String>,
     set_dp:     Option<String>,
     fan_speed:  Option<String>,
@@ -850,11 +853,11 @@ pub fn build_command_json(
     }
 
     let has_light_attrs = brightness.is_some() || color_temp.is_some()
-        || rgb.is_some() || color_mode.is_some();
+        || rgb.is_some() || mode.is_some();
     let has_exclusive = send_ir.is_some() || set_dp.is_some() || fan_speed.is_some();
 
     if (power.is_some() || has_light_attrs) && has_exclusive {
-        bail!("--power/--brightness/--color-temp/--rgb/--color-mode cannot be combined \
+        bail!("--power/--brightness/--color-temp/--rgb/--mode cannot be combined \
                with --send-ir, --set-dp, or --fan-speed");
     }
 
@@ -896,12 +899,12 @@ pub fn build_command_json(
         if let Some(v) = r          { obj.insert("r".into(),           v.into()); }
         if let Some(v) = g          { obj.insert("g".into(),           v.into()); }
         if let Some(v) = b          { obj.insert("b".into(),           v.into()); }
-        if let Some(v) = color_mode {
+        if let Some(v) = mode {
             match v.as_str() {
                 "white" | "colour" => {}
-                _ => bail!("--color-mode must be 'white' or 'colour'"),
+                _ => bail!("--mode must be 'white' or 'colour'"),
             }
-            obj.insert("color_mode".into(), v.into());
+            obj.insert("mode".into(), v.into());
         }
         return Ok(serde_json::Value::Object(obj));
     }
@@ -937,7 +940,7 @@ pub fn build_command_json(
             _ => bail!("--fan-speed must be one of: off, low, medium, high"),
         }
     } else {
-        bail!("provide at least one of --power, --brightness, --color-temp, --rgb, --color-mode, \
+        bail!("provide at least one of --power, --brightness, --color-temp, --rgb, --mode, \
                --send-ir, --set-dp, --fan-speed, or --set-temp");
     }
 }
