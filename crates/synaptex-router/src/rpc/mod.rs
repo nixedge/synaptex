@@ -24,6 +24,7 @@ fn build_kind(r: &RegisterDeviceRequest) -> DeviceKind {
         "sense"  => DeviceKind::Sense,
         "roku"   => DeviceKind::Roku,
         "wled"   => DeviceKind::Wled,
+        "alexa"  => DeviceKind::Alexa,
         other    => DeviceKind::Other(other.to_string()),
     }
 }
@@ -156,8 +157,8 @@ impl RouterService for RouterServiceImpl {
         if r.mac.is_empty() {
             return Err(Status::invalid_argument("mac is required"));
         }
-        if !matches!(r.kind.as_str(), "bond" | "matter" | "mysa" | "sense" | "roku" | "wled" | "other") {
-            return Err(Status::invalid_argument("kind must be bond, matter, mysa, sense, roku, wled, or other"));
+        if !matches!(r.kind.as_str(), "bond" | "matter" | "mysa" | "sense" | "roku" | "wled" | "alexa" | "other") {
+            return Err(Status::invalid_argument("kind must be bond, matter, mysa, sense, roku, wled, alexa, or other"));
         }
 
         let ie = |e: anyhow::Error| Status::internal(e.to_string());
