@@ -23,16 +23,19 @@ use crate::{
 /// Build per-member `DeviceDto`s from cache for a group.
 fn member_dtos(member_ids: &[synaptex_types::device::DeviceId], state: &AppState) -> Vec<DeviceDto> {
     member_ids.iter().filter_map(|mid| {
-        let info = db::get(&state.trees.registry, mid).ok()??;
-        let st   = state.cache.get(mid);
-        let (ip, ver) = db::load_plugin_config(&state.trees, mid)
-            .ok().flatten()
+        let mut info: DeviceInfo = db::get(&state.trees.registry, mid).ok()??;
+        let st  = state.cache.get(mid);
+        let cfg = db::load_plugin_config(&state.trees, mid).ok().flatten();
+        let (ip, ver) = cfg.as_ref()
             .map(|cfg| match cfg {
-                PluginConfig::Tuya(t) => (Some(t.ip.to_string()), t.protocol_version),
-                PluginConfig::Bond(b) => (Some(b.hub_ip), None),
+                PluginConfig::Tuya(t) => (Some(t.ip.to_string()), t.protocol_version.clone()),
+                PluginConfig::Bond(b) => (Some(b.hub_ip.clone()), None),
                 PluginConfig::Group(_) => (None, None),
             })
             .unwrap_or((None, None));
+        if let Some(PluginConfig::Tuya(ref t)) = cfg {
+            info.capabilities = t.dp_map().capabilities();
+        }
         Some(device_dto(&info, st, ip, ver))
     }).collect()
 }
@@ -44,17 +47,20 @@ pub async fn list_devices(
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let dtos = infos.iter().map(|info| {
-        let st = state.cache.get(&info.id);
-        let (ip, tuya_version) = db::load_plugin_config(&state.trees, &info.id)
-            .ok()
-            .flatten()
+        let st  = state.cache.get(&info.id);
+        let cfg = db::load_plugin_config(&state.trees, &info.id).ok().flatten();
+        let (ip, tuya_version) = cfg.as_ref()
             .map(|cfg| match cfg {
-                PluginConfig::Tuya(t) => (Some(t.ip.to_string()), t.protocol_version),
-                PluginConfig::Bond(b) => (Some(b.hub_ip), None),
+                PluginConfig::Tuya(t) => (Some(t.ip.to_string()), t.protocol_version.clone()),
+                PluginConfig::Bond(b) => (Some(b.hub_ip.clone()), None),
                 PluginConfig::Group(_) => (None, None),
             })
             .unwrap_or((None, None));
-        device_dto(info, st, ip, tuya_version)
+        let mut info = info.clone();
+        if let Some(PluginConfig::Tuya(ref t)) = cfg {
+            info.capabilities = t.dp_map().capabilities();
+        }
+        device_dto(&info, st, ip, tuya_version)
     }).collect();
 
     Ok(Json(dtos))
@@ -67,7 +73,7 @@ pub async fn get_device(
     let id = DeviceId::from_mac_str(&mac)
         .map_err(|e| ApiError::bad_request(e))?;
 
-    let info: DeviceInfo = db::get(&state.trees.registry, &id)
+    let mut info: DeviceInfo = db::get(&state.trees.registry, &id)
         .map_err(|e| ApiError::internal(e.to_string()))?
         .ok_or_else(|| ApiError::not_found(format!("device {mac} not found")))?;
 
@@ -94,6 +100,9 @@ pub async fn get_device(
         _ => None,
     };
 
+    if let Some(PluginConfig::Tuya(ref t)) = cfg {
+        info.capabilities = t.dp_map().capabilities();
+    }
     let mut dto = device_dto(&info, st, ip, tuya_version);
     dto.members = members;
     Ok(Json(dto))
