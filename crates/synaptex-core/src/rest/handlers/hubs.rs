@@ -95,6 +95,7 @@ pub async fn register_hub(
         kind:       body.kind.clone(),
         bond_id:    body.bond_id.clone(),
         bond_token: body.bond_token.clone(),
+        managed_ip: String::new(),
     }).await.map_err(|e| {
         (StatusCode::BAD_GATEWAY, format!("register_device RPC failed: {e}"))
     })?;

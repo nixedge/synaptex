@@ -85,6 +85,7 @@ message RegisterDeviceRequest {
     string kind       = 3;   // "bond" | "matter" | "other"
     string bond_id    = 4;   // Bond hub serial number (bondid from /v2/sys/version)
     string bond_token = 5;   // Bond local API token (BOND-Token header value)
+    string managed_ip = 6;   // pin to a specific managed IP (optional; empty = auto-allocate)
 }
 
 message RegisterDeviceResponse {

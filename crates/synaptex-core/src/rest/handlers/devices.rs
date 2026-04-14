@@ -328,7 +328,10 @@ pub struct RegisterManagedBody {
     pub kind: String,
     /// Currently observed IP (optional).
     #[serde(default)]
-    pub ip:   String,
+    pub ip:         String,
+    /// Pin to a specific managed IP instead of auto-allocating (optional).
+    #[serde(default)]
+    pub managed_ip: String,
 }
 
 #[derive(Serialize)]
@@ -360,6 +363,7 @@ pub async fn register_managed_device(
         kind:       body.kind.clone(),
         bond_id:    String::new(),
         bond_token: String::new(),
+        managed_ip: body.managed_ip.clone(),
     }).await.map_err(|e| ApiError::internal(format!("register_device RPC failed: {e}")))?;
 
     // Write DeviceInfo to the registry tree — no PluginConfig, so no plugin is

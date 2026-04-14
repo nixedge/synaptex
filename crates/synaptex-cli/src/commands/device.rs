@@ -208,6 +208,10 @@ pub enum DeviceCmd {
         /// Currently observed IP address (optional; leave blank if unknown).
         #[arg(long, value_name = "IP", default_value = "")]
         ip: String,
+
+        /// Pin to a specific managed IP instead of auto-allocating (optional).
+        #[arg(long, value_name = "IP", default_value = "")]
+        managed_ip: String,
     },
 
     /// Manage device groups.
@@ -242,8 +246,8 @@ pub async fn run(cmd: DeviceCmd, http_url: &str, api_key: Option<&str>) -> Resul
             set_profile(mac, profile, protocol_version, http_url, api_key).await,
         DeviceCmd::Probe { config, set_dps } =>
             probe(config, set_dps, http_url, api_key).await,
-        DeviceCmd::Register { mac, name, kind, ip } =>
-            register_managed(mac, name, kind, ip, http_url, api_key).await,
+        DeviceCmd::Register { mac, name, kind, ip, managed_ip } =>
+            register_managed(mac, name, kind, ip, managed_ip, http_url, api_key).await,
         DeviceCmd::Import =>
             import(http_url, api_key).await,
     }
@@ -817,14 +821,15 @@ async fn import(http_url: &str, api_key: Option<&str>) -> Result<()> {
 }
 
 async fn register_managed(
-    mac:      String,
-    name:     String,
-    kind:     String,
-    ip:       String,
-    http_url: &str,
-    api_key:  Option<&str>,
+    mac:        String,
+    name:       String,
+    kind:       String,
+    ip:         String,
+    managed_ip: String,
+    http_url:   &str,
+    api_key:    Option<&str>,
 ) -> Result<()> {
-    let body = serde_json::json!({ "mac": mac, "name": name, "kind": kind, "ip": ip });
+    let body = serde_json::json!({ "mac": mac, "name": name, "kind": kind, "ip": ip, "managed_ip": managed_ip });
     let client = reqwest::Client::new();
     let mut req = client.post(format!("{http_url}/api/v1/devices/managed")).json(&body);
     if let Some(key) = api_key {

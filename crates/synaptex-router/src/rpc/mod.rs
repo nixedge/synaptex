@@ -25,6 +25,7 @@ fn build_kind(r: &RegisterDeviceRequest) -> DeviceKind {
         "roku"   => DeviceKind::Roku,
         "wled"   => DeviceKind::Wled,
         "alexa"  => DeviceKind::Alexa,
+        "dvr"    => DeviceKind::Dvr,
         other    => DeviceKind::Other(other.to_string()),
     }
 }
@@ -157,8 +158,8 @@ impl RouterService for RouterServiceImpl {
         if r.mac.is_empty() {
             return Err(Status::invalid_argument("mac is required"));
         }
-        if !matches!(r.kind.as_str(), "bond" | "matter" | "mysa" | "sense" | "roku" | "wled" | "alexa" | "other") {
-            return Err(Status::invalid_argument("kind must be bond, matter, mysa, sense, roku, wled, alexa, or other"));
+        if !matches!(r.kind.as_str(), "bond" | "matter" | "mysa" | "sense" | "roku" | "wled" | "alexa" | "dvr" | "other") {
+            return Err(Status::invalid_argument("kind must be bond, matter, mysa, sense, roku, wled, alexa, dvr, or other"));
         }
 
         let ie = |e: anyhow::Error| Status::internal(e.to_string());
@@ -173,19 +174,22 @@ impl RouterService for RouterServiceImpl {
                 existing.kind = build_kind(r);
                 // Backfill managed_ip if the record predates IP allocation.
                 if existing.managed_ip.is_none() {
-                    existing.managed_ip = self.db
-                        .allocate_ip(&existing.device_id)
-                        .ok()
-                        .map(|a| a.to_string());
+                    let alloc = if r.managed_ip.is_empty() {
+                        self.db.allocate_ip(&existing.device_id)
+                    } else {
+                        self.db.reserve_ip(&r.managed_ip, &existing.device_id)
+                    };
+                    existing.managed_ip = alloc.ok().map(|a| a.to_string());
                 }
                 existing
             }
             None => {
                 let device_id = uuid::Uuid::new_v4().to_string();
-                let managed_ip = self.db
-                    .allocate_ip(&device_id)
-                    .map_err(ie)?
-                    .to_string();
+                let managed_ip = if r.managed_ip.is_empty() {
+                    self.db.allocate_ip(&device_id).map_err(ie)?
+                } else {
+                    self.db.reserve_ip(&r.managed_ip, &device_id).map_err(ie)?
+                }.to_string();
                 RouterDevice {
                     device_id,
                     ip:         r.ip.clone(),

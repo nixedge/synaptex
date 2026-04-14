@@ -17,6 +17,7 @@ pub enum DeviceKind {
     Mysa,
     Roku,
     Wled,
+    Dvr,
     Other(String),
 }
 
@@ -27,7 +28,7 @@ impl DeviceKind {
             DeviceKind::Tuya   { tuya_id, .. } => Some(tuya_id.clone()),
             DeviceKind::Bond   { bond_id, .. }  => Some(bond_id.clone()),
             DeviceKind::Matter { node_id }     => Some(node_id.to_string()),
-            DeviceKind::Alexa | DeviceKind::Sense | DeviceKind::Mysa | DeviceKind::Roku | DeviceKind::Wled | DeviceKind::Other(_) => None,
+            DeviceKind::Alexa | DeviceKind::Sense | DeviceKind::Mysa | DeviceKind::Roku | DeviceKind::Wled | DeviceKind::Dvr | DeviceKind::Other(_) => None,
         }
     }
 }
@@ -194,6 +195,38 @@ impl RouterDb {
         let s = self.managed_host_start;
         let e = self.managed_host_end;
         anyhow::bail!("managed IP range {a}.{b}.{c}.{s}–{a}.{b}.{c}.{e} exhausted")
+    }
+
+    /// Pin a device to a specific managed IP.
+    ///
+    /// The IP must be within the managed range.  Returns an error if the host
+    /// octet is already claimed by a *different* device; re-claiming the same
+    /// device_id is a no-op and succeeds.
+    pub fn reserve_ip(&self, ip: &str, device_id: &str) -> Result<Ipv4Addr> {
+        let addr: Ipv4Addr = ip.parse()
+            .map_err(|_| anyhow::anyhow!("invalid IP address: {ip}"))?;
+        let [a, b, c, host] = addr.octets();
+        anyhow::ensure!(
+            [a, b, c] == self.managed_subnet,
+            "IP {ip} is not in the managed subnet",
+        );
+        anyhow::ensure!(
+            (self.managed_host_start..=self.managed_host_end).contains(&host),
+            "IP {ip} is outside the managed host range ({}.{}.{}.{}–{}.{}.{}.{})",
+            a, b, c, self.managed_host_start,
+            a, b, c, self.managed_host_end,
+        );
+        let key = [host];
+        match self.allocated_ips.get(key)? {
+            Some(existing) if existing.as_ref() != device_id.as_bytes() => {
+                let owner = std::str::from_utf8(&existing).unwrap_or("?");
+                anyhow::bail!("IP {ip} is already allocated to device {owner}");
+            }
+            _ => {
+                self.allocated_ips.insert(key, device_id.as_bytes())?;
+                Ok(addr)
+            }
+        }
     }
 
     /// Release a previously allocated managed IP back to the free pool.
