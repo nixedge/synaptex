@@ -6,7 +6,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use synaptex_types::device::{DeviceId, DeviceInfo};
 use synaptex_tuya::{plugin::TuyaConfig, TuyaPlugin};
 
@@ -17,6 +17,7 @@ use crate::{
         error::{ApiError, ApiResult},
         AppState,
     },
+    router_client::RouterClient,
     tuya_cloud::TuyaCloudClient,
 };
 
@@ -313,6 +314,74 @@ pub async fn device_debug_config(
     };
 
     Ok(Json(out))
+}
+
+// ─── Register managed (cloud / observe-only) device ──────────────────────────
+
+#[derive(Deserialize)]
+pub struct RegisterManagedBody {
+    /// MAC address "AA:BB:CC:DD:EE:FF".
+    pub mac:  String,
+    /// Human-readable name, e.g. "Bedroom Thermostat".
+    pub name: String,
+    /// Device kind: "mysa" | "roku" | "sense" | ...
+    pub kind: String,
+    /// Currently observed IP (optional).
+    #[serde(default)]
+    pub ip:   String,
+}
+
+#[derive(Serialize)]
+pub struct RegisterManagedResponse {
+    mac:        String,
+    managed_ip: String,
+}
+
+/// Register a device that has no local protocol support (cloud-controlled or
+/// observe-only).  Core writes a `DeviceInfo` to the registry so the device
+/// appears in `GET /api/v1/devices`, and the router allocates a managed IP.
+pub async fn register_managed_device(
+    State(state): State<AppState>,
+    Json(body):   Json<RegisterManagedBody>,
+) -> ApiResult<(StatusCode, Json<RegisterManagedResponse>)> {
+    let id = DeviceId::from_mac_str(&body.mac)
+        .map_err(|e| ApiError::bad_request(e))?;
+
+    let cfg = state.router_client_cfg.as_ref().ok_or_else(|| {
+        ApiError::unavailable("router integration not configured (--router-url / --router-cert)")
+    })?;
+
+    let mut client = RouterClient::connect(cfg.clone()).await
+        .map_err(|e| ApiError::internal(format!("router connection failed: {e}")))?;
+
+    let resp = client.register_device(synaptex_router_proto::RegisterDeviceRequest {
+        mac:        body.mac.clone(),
+        ip:         body.ip.clone(),
+        kind:       body.kind.clone(),
+        bond_id:    String::new(),
+        bond_token: String::new(),
+    }).await.map_err(|e| ApiError::internal(format!("register_device RPC failed: {e}")))?;
+
+    // Write DeviceInfo to the registry tree — no PluginConfig, so no plugin is
+    // loaded at startup.  Device appears in listings with state: null until a
+    // cloud plugin is added.
+    let info = DeviceInfo {
+        id,
+        name:         body.name.clone(),
+        model:        String::new(),
+        protocol:     body.kind.clone(),
+        capabilities: vec![],
+    };
+    db::register_device(&state.trees, &info)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    tracing::info!(mac = %body.mac, kind = %body.kind, managed_ip = %resp.managed_ip,
+        "managed device registered");
+
+    Ok((StatusCode::CREATED, Json(RegisterManagedResponse {
+        mac:        body.mac,
+        managed_ip: resp.managed_ip,
+    })))
 }
 
 pub async fn device_command(

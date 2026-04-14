@@ -65,6 +65,7 @@ fn api_router(state: AppState) -> Router {
         .route("/config/tuya-cloud", put(config::put_tuya_cloud))
         // Devices
         .route("/devices",           get(devices::list_devices).post(devices::register_device))
+        .route("/devices/managed",   post(devices::register_managed_device))
         .route("/devices/:mac",      get(devices::get_device).patch(devices::patch_device).delete(devices::unregister_device))
         .route("/devices/:mac/command",      post(devices::device_command))
         .route("/devices/:mac/debug-config", get(devices::device_debug_config))

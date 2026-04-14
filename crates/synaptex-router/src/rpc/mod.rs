@@ -20,6 +20,9 @@ fn build_kind(r: &RegisterDeviceRequest) -> DeviceKind {
             bond_token: r.bond_token.clone(),
         },
         "matter" => DeviceKind::Matter { node_id: 0 },
+        "mysa"   => DeviceKind::Mysa,
+        "sense"  => DeviceKind::Sense,
+        "roku"   => DeviceKind::Roku,
         other    => DeviceKind::Other(other.to_string()),
     }
 }
@@ -152,8 +155,8 @@ impl RouterService for RouterServiceImpl {
         if r.mac.is_empty() {
             return Err(Status::invalid_argument("mac is required"));
         }
-        if r.kind != "bond" && r.kind != "matter" && r.kind != "other" {
-            return Err(Status::invalid_argument("kind must be bond, matter, or other"));
+        if !matches!(r.kind.as_str(), "bond" | "matter" | "mysa" | "sense" | "roku" | "other") {
+            return Err(Status::invalid_argument("kind must be bond, matter, mysa, sense, roku, or other"));
         }
 
         let ie = |e: anyhow::Error| Status::internal(e.to_string());

@@ -190,6 +190,26 @@ pub enum DeviceCmd {
         set_dps: Vec<String>,
     },
 
+    /// Register a cloud/observe-only device (Mysa, Roku, Sense, etc.) and
+    /// allocate it a managed IP.  No local protocol support is required.
+    Register {
+        /// MAC address ("AA:BB:CC:DD:EE:FF").
+        #[arg(long, value_name = "MAC")]
+        mac: String,
+
+        /// Human-readable name, e.g. "Bedroom Thermostat".
+        #[arg(long)]
+        name: String,
+
+        /// Device kind: "mysa" | "roku" | "sense" | ...
+        #[arg(long, value_name = "KIND")]
+        kind: String,
+
+        /// Currently observed IP address (optional; leave blank if unknown).
+        #[arg(long, value_name = "IP", default_value = "")]
+        ip: String,
+    },
+
     /// Manage device groups.
     #[command(subcommand)]
     Group(GroupCmd),
@@ -222,6 +242,8 @@ pub async fn run(cmd: DeviceCmd, http_url: &str, api_key: Option<&str>) -> Resul
             set_profile(mac, profile, protocol_version, http_url, api_key).await,
         DeviceCmd::Probe { config, set_dps } =>
             probe(config, set_dps, http_url, api_key).await,
+        DeviceCmd::Register { mac, name, kind, ip } =>
+            register_managed(mac, name, kind, ip, http_url, api_key).await,
         DeviceCmd::Import =>
             import(http_url, api_key).await,
     }
@@ -791,6 +813,30 @@ async fn import(http_url: &str, api_key: Option<&str>) -> Result<()> {
             println!("  {}  {}", d["id"].as_str().unwrap_or("?"), d["name"].as_str().unwrap_or("?"));
         }
     }
+    Ok(())
+}
+
+async fn register_managed(
+    mac:      String,
+    name:     String,
+    kind:     String,
+    ip:       String,
+    http_url: &str,
+    api_key:  Option<&str>,
+) -> Result<()> {
+    let body = serde_json::json!({ "mac": mac, "name": name, "kind": kind, "ip": ip });
+    let client = reqwest::Client::new();
+    let mut req = client.post(format!("{http_url}/api/v1/devices/managed")).json(&body);
+    if let Some(key) = api_key {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    let resp = req.send().await.context("POST /api/v1/devices/managed")?;
+    if !resp.status().is_success() {
+        bail!("register failed ({}): {}", resp.status(), resp.text().await?);
+    }
+    let r: serde_json::Value = resp.json().await?;
+    println!("mac:        {}", r["mac"].as_str().unwrap_or(""));
+    println!("managed_ip: {}", r["managed_ip"].as_str().unwrap_or(""));
     Ok(())
 }
 

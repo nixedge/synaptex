@@ -14,6 +14,8 @@ pub enum DeviceKind {
     Bond   { bond_id: String, bond_token: String },
     Alexa,
     Sense,
+    Mysa,
+    Roku,
     Other(String),
 }
 
@@ -24,7 +26,7 @@ impl DeviceKind {
             DeviceKind::Tuya   { tuya_id, .. } => Some(tuya_id.clone()),
             DeviceKind::Bond   { bond_id, .. }  => Some(bond_id.clone()),
             DeviceKind::Matter { node_id }     => Some(node_id.to_string()),
-            DeviceKind::Alexa | DeviceKind::Sense | DeviceKind::Other(_) => None,
+            DeviceKind::Alexa | DeviceKind::Sense | DeviceKind::Mysa | DeviceKind::Roku | DeviceKind::Other(_) => None,
         }
     }
 }
