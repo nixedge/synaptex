@@ -41,7 +41,7 @@ pub async fn sync_hub(
         }
     };
 
-    // Collect device IDs already present in sled so we don't re-register.
+    // Collect device IDs already present in sled to avoid redundant writes.
     let existing: HashSet<synaptex_types::device::DeviceId> = db::list_all_devices(&trees)
         .unwrap_or_default()
         .into_iter()
@@ -50,15 +50,22 @@ pub async fn sync_hub(
 
     let mut new_count = 0usize;
     for (info, cfg) in devices {
-        if existing.contains(&info.id) {
+        // If the plugin is already live in-memory, nothing to do.
+        if registry.is_registered(&info.id) {
             continue;
         }
 
-        if let Err(e) = db::register_device(&trees, &info) {
-            tracing::warn!(name = %info.name, "bond: failed to save device info: {e}");
-            continue;
+        // Persist device info only if it's genuinely new to sled.
+        if !existing.contains(&info.id) {
+            if let Err(e) = db::register_device(&trees, &info) {
+                tracing::warn!(name = %info.name, "bond: failed to save device info: {e}");
+                continue;
+            }
         }
 
+        // Always write (or overwrite) the plugin config so it's present for
+        // future restarts — this heals the case where a prior sync wrote the
+        // registry entry but crashed before persisting the config.
         if let Err(e) = db::save_plugin_config(&trees, &info.id, &PluginConfig::Bond(cfg.clone())) {
             tracing::warn!(name = %info.name, "bond: failed to save plugin config: {e}");
             continue;

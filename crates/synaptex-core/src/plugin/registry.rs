@@ -85,6 +85,11 @@ impl PluginRegistry {
         }
     }
 
+    /// Returns `true` if a plugin for `id` is currently registered.
+    pub fn is_registered(&self, id: &DeviceId) -> bool {
+        self.entries.contains_key(id)
+    }
+
     /// Stop the supervisor, disconnect the plugin, and evict from the cache.
     pub async fn deregister(&self, id: &DeviceId) {
         if let Some((_, entry)) = self.entries.remove(id) {
