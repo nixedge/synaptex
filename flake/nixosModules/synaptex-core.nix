@@ -85,7 +85,8 @@
 
               EnvironmentFile = lib.mkIf (cfg.environmentFile != null) cfg.environmentFile;
 
-              DynamicUser = true;
+              User = "synaptex-core";
+              Group = "synaptex-core";
               StateDirectory = "synaptex-core";
               StateDirectoryMode = "0750";
 
@@ -108,6 +109,11 @@
               SystemCallFilter = ["@system-service"];
             };
           };
+          users.users.synaptex-core = {
+            isSystemUser = true;
+            group = "synaptex-core";
+          };
+          users.groups.synaptex-core = {};
         };
       };
     };
