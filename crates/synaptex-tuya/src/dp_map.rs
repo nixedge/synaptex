@@ -532,7 +532,14 @@ impl DpMap {
     pub fn capabilities(&self) -> Vec<synaptex_types::capability::Capability> {
         use synaptex_types::capability::Capability;
         let mut caps = vec![Capability::Power];
-        if self.light_power_dp.is_some() {
+        // A device is a Light if it has any light-control DPs — either a
+        // dedicated light power DP (fan+light combo) or brightness/colour DPs
+        // (plain bulb where power_dp doubles as the light switch).
+        if self.light_power_dp.is_some()
+            || self.brightness_dp.is_some()
+            || self.color_temp_dp.is_some()
+            || self.color_dp.is_some()
+        {
             caps.push(Capability::Light);
         }
         if self.brightness_dp.is_some() {
