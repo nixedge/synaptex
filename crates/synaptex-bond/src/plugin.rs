@@ -65,9 +65,27 @@ impl DevicePlugin for BondPlugin {
 
         self.connected.store(true, Ordering::Relaxed);
 
-        let has_fan = self.info.capabilities.contains(&Capability::Fan);
+        let has_fan   = self.info.capabilities.contains(&Capability::Fan);
+        let has_light = self.info.capabilities.contains(&Capability::Light);
+
+        // For fan+light devices Bond tracks the motor and light independently:
+        //   raw.power = fan motor on/off
+        //   raw.light = light on/off
+        // DeviceState.power represents the light for fan+light devices, or the
+        // motor on/off for plain fans/switches.  Fan speed reports Off when the
+        // motor is stopped so the stale stored speed doesn't leak through.
+        let power = if has_light {
+            Some(raw.light != 0)
+        } else {
+            Some(raw.power != 0)
+        };
+
         let fan_speed = if has_fan {
-            Some(speed_from_bond(raw.speed, self.cfg.max_speed))
+            Some(if raw.power == 0 {
+                FanSpeed::Off
+            } else {
+                speed_from_bond(raw.speed, self.cfg.max_speed)
+            })
         } else {
             None
         };
@@ -76,7 +94,7 @@ impl DevicePlugin for BondPlugin {
             device_id:        self.info.id,
             online:           true,
             updated_at_ms:    now_ms(),
-            power:            Some(raw.power != 0),
+            power,
             brightness:       None,
             color_temp_k:     None,
             rgb:              None,

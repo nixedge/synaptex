@@ -61,7 +61,11 @@ pub enum DeviceCmd {
         #[arg(long, value_name = "MAC")]
         mac: String,
 
-        /// Turn on or off.
+        /// Turn the light on or off (fan+light and bulb devices).
+        #[arg(long, value_name = "on|off", value_parser = parse_power)]
+        light: Option<bool>,
+
+        /// Turn an outlet or plain switch on or off.
         #[arg(long, value_name = "on|off", value_parser = parse_power)]
         power: Option<bool>,
 
@@ -90,7 +94,7 @@ pub enum DeviceCmd {
         set_dp: Option<String>,
 
         /// Set fan speed: off | low | medium | high.
-        #[arg(long, value_name = "SPEED", group = "cmd")]
+        #[arg(long, value_name = "SPEED")]
         fan_speed: Option<String>,
 
         /// Set thermostat target temperature.
@@ -200,8 +204,8 @@ pub async fn run(cmd: DeviceCmd, http_url: &str, api_key: Option<&str>) -> Resul
     match cmd {
         DeviceCmd::Get { mac } =>
             get(mac, http_url, api_key).await,
-        DeviceCmd::Set { mac, power, brightness, color_temp, rgb, mode, send_ir, set_dp, fan_speed, set_temp } =>
-            set(mac, power, brightness, color_temp, rgb, mode, send_ir, set_dp, fan_speed, set_temp, http_url, api_key).await,
+        DeviceCmd::Set { mac, light, power, brightness, color_temp, rgb, mode, send_ir, set_dp, fan_speed, set_temp } =>
+            set(mac, light, power, brightness, color_temp, rgb, mode, send_ir, set_dp, fan_speed, set_temp, http_url, api_key).await,
         DeviceCmd::List { groups } =>
             list(groups, http_url, api_key).await,
         DeviceCmd::Add { mac, name, ip, tuya_id, local_key, model, port, dp_profile } =>
@@ -235,7 +239,11 @@ fn print_device(d: &serde_json::Value, indent: &str) {
         let online = state["online"].as_bool().unwrap_or(false);
         println!("{indent}online:    {}", if online { "yes" } else { "no" });
         if let Some(p) = state["power"].as_bool() {
-            println!("{indent}power:     {}", if p { "on" } else { "off" });
+            let has_light = d["capabilities"].as_array()
+                .map(|caps| caps.iter().any(|c| c["type"].as_str() == Some("light")))
+                .unwrap_or(false);
+            let label = if has_light { "light" } else { "power" };
+            println!("{indent}{label}:     {}", if p { "on" } else { "off" });
         }
         if let Some(b) = state["brightness"].as_u64() {
             println!("{indent}brightness:{b}/1000");
@@ -295,11 +303,12 @@ async fn get(mac: String, http_url: &str, api_key: Option<&str>) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn set(
     mac:        String,
+    light:      Option<bool>,
     power:      Option<bool>,
     brightness: Option<u32>,
     color_temp: Option<u32>,
     rgb:        Option<String>,
-    mode: Option<String>,
+    mode:       Option<String>,
     send_ir:    Option<String>,
     set_dp:     Option<String>,
     fan_speed:  Option<String>,
@@ -307,38 +316,20 @@ async fn set(
     http_url:   &str,
     api_key:    Option<&str>,
 ) -> Result<()> {
-    // Look up the device type to determine whether to use SetLight or SetPower.
-    let is_light = {
-        let resp = rest_get(&format!("{http_url}/api/v1/devices/{mac}"), api_key).await
-            .context("GET /api/v1/devices/{mac}")?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            bail!("device {mac} not found");
-        }
-        if !resp.status().is_success() {
-            bail!("server error: {}", resp.text().await?);
-        }
-        let d: serde_json::Value = resp.json().await?;
-        let dtype = device_type(&d);
-        match dtype.as_str() {
-            // Groups may contain mixed device types — treat like a room and
-            // let build_command_json infer intent from whichever flags are set.
-            "group" => None,
-            t => Some(matches!(t, "rgb_bulb" | "bulb" | "fan+bulb" | "fan+rgb_bulb" | "fan+light")),
-        }
-    };
-
-    let cmd_json = build_command_json(power, brightness, color_temp, rgb, mode, send_ir, set_dp, fan_speed, set_temp, is_light)?;
+    let cmds = build_command_json(light, power, brightness, color_temp, rgb, mode, send_ir, set_dp, fan_speed, set_temp)?;
 
     let client = reqwest::Client::new();
-    let mut req = client
-        .post(format!("{http_url}/api/v1/devices/{mac}/command"))
-        .json(&cmd_json);
-    if let Some(key) = api_key {
-        req = req.header("Authorization", format!("Bearer {key}"));
-    }
-    let resp = req.send().await.context("POST /api/v1/devices/{mac}/command")?;
-    if !resp.status().is_success() {
-        bail!("command failed: {}", resp.text().await?);
+    for cmd_json in cmds {
+        let mut req = client
+            .post(format!("{http_url}/api/v1/devices/{mac}/command"))
+            .json(&cmd_json);
+        if let Some(key) = api_key {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+        let resp = req.send().await.context("POST /api/v1/devices/{mac}/command")?;
+        if !resp.status().is_success() {
+            bail!("command failed: {}", resp.text().await?);
+        }
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -845,55 +836,69 @@ async fn rest_get(url: &str, api_key: Option<&str>) -> Result<reqwest::Response>
     Ok(req.send().await?)
 }
 
-/// Build a `CommandDto`-compatible JSON value from CLI flags.
+/// Build one or more `CommandDto`-compatible JSON values from CLI flags.
 ///
-/// `is_light`: `Some(true)` = device has light capabilities (use `SetLight` for light flags),
-///             `Some(false)` = device is a plain switch (reject light attributes),
-///             `None` = unknown / room command (auto-detect from which flags are set).
+/// Returns a `Vec` because `--light`/`--power` and `--fan-speed` are independent
+/// commands that may need to be sent as separate requests.
 pub fn build_command_json(
+    light:      Option<bool>,
     power:      Option<bool>,
     brightness: Option<u32>,
     color_temp: Option<u32>,
     rgb:        Option<String>,
-    mode: Option<String>,
+    mode:       Option<String>,
     send_ir:    Option<String>,
     set_dp:     Option<String>,
     fan_speed:  Option<String>,
     set_temp:   Option<u16>,
-    is_light:   Option<bool>,
-) -> Result<serde_json::Value> {
+) -> Result<Vec<serde_json::Value>> {
     if let Some(temp) = set_temp {
-        return Ok(serde_json::json!({ "type": "set_target_temp", "temp": temp }));
+        return Ok(vec![serde_json::json!({ "type": "set_target_temp", "temp": temp })]);
     }
 
-    let has_light_attrs = brightness.is_some() || color_temp.is_some()
+    let has_light_cmd = light.is_some() || brightness.is_some() || color_temp.is_some()
         || rgb.is_some() || mode.is_some();
-    let has_exclusive = send_ir.is_some() || set_dp.is_some() || fan_speed.is_some();
 
-    if (power.is_some() || has_light_attrs) && has_exclusive {
-        bail!("--power/--brightness/--color-temp/--rgb/--mode cannot be combined \
-               with --send-ir, --set-dp, or --fan-speed");
+    // send_ir and set_dp are fully standalone — they can't share a call with anything else.
+    if (has_light_cmd || power.is_some() || fan_speed.is_some())
+        && (send_ir.is_some() || set_dp.is_some())
+    {
+        bail!("--light/--power/--brightness/--color-temp/--rgb/--mode/--fan-speed \
+               cannot be combined with --send-ir or --set-dp");
     }
 
-    // Determine whether to use SetLight based on device type (if known) or flags.
-    let use_set_light = match is_light {
-        Some(true)  => power.is_some() || has_light_attrs,
-        Some(false) => {
-            if has_light_attrs {
-                bail!("this device does not support brightness/colour controls");
+    if let Some(ir) = send_ir {
+        let pos = ir.find(':')
+            .ok_or_else(|| anyhow::anyhow!("--send-ir: expected HEAD:KEY (HEAD may be empty, e.g. \":KEY\")"))?;
+        return Ok(vec![serde_json::json!({ "type": "send_ir", "head": &ir[..pos], "key": &ir[pos+1..] })]);
+    }
+
+    if let Some(dp_spec) = set_dp {
+        let parts: Vec<&str> = dp_spec.splitn(3, ':').collect();
+        if parts.len() != 3 { bail!("--set-dp requires format DP:TYPE:VALUE, e.g. 3:str:low"); }
+        let dp: u16 = parts[0].parse().map_err(|_| anyhow::anyhow!("DP must be a number"))?;
+        let cmd = match parts[1] {
+            "bool" => {
+                let b: bool = parts[2].parse()
+                    .map_err(|_| anyhow::anyhow!("bool value must be true or false"))?;
+                serde_json::json!({ "type": "set_dp", "dp": dp, "bool_val": b })
             }
-            false // switch/outlet: fall through to SetPower
-        }
-        None => has_light_attrs, // room/unknown: use SetLight only when light attrs present
-    };
-
-    // Plain power toggle for non-light devices (or room with power-only).
-    if power.is_some() && !use_set_light {
-        return Ok(serde_json::json!({ "type": "set_power", "on": power.unwrap() }));
+            "int" => {
+                let i: i64 = parts[2].parse()
+                    .map_err(|_| anyhow::anyhow!("int value must be a number"))?;
+                serde_json::json!({ "type": "set_dp", "dp": dp, "int_val": i })
+            }
+            "str" => serde_json::json!({ "type": "set_dp", "dp": dp, "str_val": parts[2] }),
+            t => bail!("unknown DP type '{t}'; use bool, int, or str"),
+        };
+        return Ok(vec![cmd]);
     }
 
-    if use_set_light {
-        // Parse optional rgb string into separate r/g/b fields.
+    let mut cmds: Vec<serde_json::Value> = Vec::new();
+
+    // Light command: --light controls the power field; brightness/colour attrs
+    // can accompany it or stand alone (e.g. dim without toggling on/off).
+    if has_light_cmd {
         let (r, g, b) = if let Some(s) = rgb {
             let parts: Vec<u8> = s
                 .split(',')
@@ -907,7 +912,7 @@ pub fn build_command_json(
         };
         let mut obj = serde_json::Map::new();
         obj.insert("type".into(), "set_light".into());
-        if let Some(v) = power      { obj.insert("power".into(),      v.into()); }
+        if let Some(v) = light      { obj.insert("power".into(),      v.into()); }
         if let Some(v) = brightness { obj.insert("brightness".into(),  v.into()); }
         if let Some(v) = color_temp { obj.insert("color_temp".into(),  v.into()); }
         if let Some(v) = r          { obj.insert("r".into(),           v.into()); }
@@ -920,41 +925,25 @@ pub fn build_command_json(
             }
             obj.insert("mode".into(), v.into());
         }
-        return Ok(serde_json::Value::Object(obj));
+        cmds.push(serde_json::Value::Object(obj));
+    } else if let Some(on) = power {
+        cmds.push(serde_json::json!({ "type": "set_power", "on": on }));
     }
 
-    if let Some(ir) = send_ir {
-        let pos = ir.find(':')
-            .ok_or_else(|| anyhow::anyhow!("--send-ir: expected HEAD:KEY (HEAD may be empty, e.g. \":KEY\")"))?;
-        let head = &ir[..pos];
-        let key  = &ir[pos + 1..];
-        Ok(serde_json::json!({ "type": "send_ir", "head": head, "key": key }))
-    } else if let Some(dp_spec) = set_dp {
-        let parts: Vec<&str> = dp_spec.splitn(3, ':').collect();
-        if parts.len() != 3 { bail!("--set-dp requires format DP:TYPE:VALUE, e.g. 3:str:low"); }
-        let dp: u16 = parts[0].parse().map_err(|_| anyhow::anyhow!("DP must be a number"))?;
-        match parts[1] {
-            "bool" => {
-                let b: bool = parts[2].parse()
-                    .map_err(|_| anyhow::anyhow!("bool value must be true or false"))?;
-                Ok(serde_json::json!({ "type": "set_dp", "dp": dp, "bool_val": b }))
-            }
-            "int" => {
-                let i: i64 = parts[2].parse()
-                    .map_err(|_| anyhow::anyhow!("int value must be a number"))?;
-                Ok(serde_json::json!({ "type": "set_dp", "dp": dp, "int_val": i }))
-            }
-            "str" => Ok(serde_json::json!({ "type": "set_dp", "dp": dp, "str_val": parts[2] })),
-            t => bail!("unknown DP type '{t}'; use bool, int, or str"),
-        }
-    } else if let Some(s) = fan_speed {
+    // Fan speed is independent and can combine with a light/power command above.
+    if let Some(s) = fan_speed {
         match s.as_str() {
-            "off" | "low" | "medium" | "high" =>
-                Ok(serde_json::json!({ "type": "set_fan_speed", "speed": s })),
+            "off" | "low" | "medium" | "high" => {
+                cmds.push(serde_json::json!({ "type": "set_fan_speed", "speed": s }));
+            }
             _ => bail!("--fan-speed must be one of: off, low, medium, high"),
         }
-    } else {
-        bail!("provide at least one of --power, --brightness, --color-temp, --rgb, --mode, \
-               --send-ir, --set-dp, --fan-speed, or --set-temp");
     }
+
+    if cmds.is_empty() {
+        bail!("provide at least one of --light, --power, --brightness, --color-temp, --rgb, \
+               --mode, --send-ir, --set-dp, --fan-speed, or --set-temp");
+    }
+
+    Ok(cmds)
 }
