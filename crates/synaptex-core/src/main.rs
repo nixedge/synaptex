@@ -76,6 +76,9 @@ async fn main() -> Result<()> {
     let bus_tx = bus::new_bus();
     bus::spawn_persist_task(bus_tx.clone(), trees.clone(), cache.clone());
 
+    // ── Version hints: router-authoritative Tuya protocol versions ────────────
+    let version_hints: Arc<dashmap::DashMap<String, String>> = Arc::new(dashmap::DashMap::new());
+
     // ── Plugin registry ───────────────────────────────────────────────────────
     let registry = Arc::new(plugin::PluginRegistry::new(cache.clone(), bus_tx.clone()));
 
@@ -127,6 +130,7 @@ async fn main() -> Result<()> {
                         protocol_version: tuya_cfg.protocol_version.clone(),
                     },
                     bus_tx.clone(),
+                    version_hints.clone(),
                 );
                 registry.register(Arc::new(plugin));
             }
@@ -209,7 +213,7 @@ async fn main() -> Result<()> {
                 router_cert_pem: cert_pem,
             };
             router_client_cfg = Some(cfg.clone());
-            tokio::spawn(router_client::run_discovery_loop(cfg, router_devices.clone(), trees.clone()));
+            tokio::spawn(router_client::run_discovery_loop(cfg, router_devices.clone(), trees.clone(), version_hints.clone()));
             info!(endpoint = %url, "router client starting");
         }
         (Some(_), None) => anyhow::bail!("--router-cert is required when --router-url is set"),
@@ -226,6 +230,7 @@ async fn main() -> Result<()> {
         routine_runner:    routine_runner.clone(),
         router_devices,
         router_client_cfg,
+        version_hints,
     };
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.http_port));
     let tcp = tokio::net::TcpListener::bind(http_addr)

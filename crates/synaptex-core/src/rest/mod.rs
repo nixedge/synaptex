@@ -40,6 +40,9 @@ pub struct AppState {
     /// Config needed to open a gRPC connection to synaptex-router on demand
     /// (e.g. for the register-device endpoint).  None when router is not configured.
     pub router_client_cfg:  Option<RouterClientConfig>,
+    /// Protocol version strings broadcast by the router, keyed by Tuya device ID.
+    /// Shared with TuyaPlugin instances so they skip probing.
+    pub version_hints:      Arc<DashMap<String, String>>,
 }
 
 // ─── Router factory ──────────────────────────────────────────────────────────

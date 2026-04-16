@@ -6,9 +6,14 @@
 use std::{
     collections::HashMap,
     net::IpAddr,
-    sync::atomic::{AtomicU32, AtomicU8, Ordering},
+    sync::{
+        atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime},
 };
+
+use dashmap::DashMap;
 
 use async_trait::async_trait;
 use rand::RngCore;
@@ -297,16 +302,28 @@ pub struct TuyaPlugin {
     seq_no:       AtomicU32,
     /// Last detected protocol version: 0=unknown, 3=v3.3, 4=v3.4, 5=v3.5.
     last_version: AtomicU8,
+    /// Protocol version string as told by the router ("3.3", "3.4", "3.5", …), keyed by tuya_id.
+    /// Shared with run_discovery_loop; written by router, read in open_connection.
+    version_hints: Arc<DashMap<String, String>>,
+    /// Epoch-ms timestamp until which poll_state is suppressed after ECONNRESET (0 = no backoff).
+    poll_backoff_until: AtomicU64,
 }
 
 impl TuyaPlugin {
-    pub fn new(info: DeviceInfo, config: TuyaConfig, bus_tx: StateBusSender) -> Self {
+    pub fn new(
+        info:          DeviceInfo,
+        config:        TuyaConfig,
+        bus_tx:        StateBusSender,
+        version_hints: Arc<DashMap<String, String>>,
+    ) -> Self {
         Self {
             info,
             config,
             bus_tx,
-            seq_no:       AtomicU32::new(1),
-            last_version: AtomicU8::new(0),
+            seq_no:             AtomicU32::new(1),
+            last_version:       AtomicU8::new(0),
+            version_hints,
+            poll_backoff_until: AtomicU64::new(0),
         }
     }
 
@@ -321,6 +338,16 @@ impl TuyaPlugin {
             .as_millis() as u64
     }
 
+    /// If `e` is an ECONNRESET I/O error, set the poll backoff for 10 minutes.
+    fn maybe_set_backoff(&self, e: &TuyaError) {
+        if let TuyaError::Io(io_err) = e {
+            if io_err.kind() == std::io::ErrorKind::ConnectionReset {
+                let until = Self::epoch_ms() + 10 * 60 * 1_000;
+                self.poll_backoff_until.store(until, Ordering::Release);
+            }
+        }
+    }
+
     // ── Open an ephemeral connection ──────────────────────────────────────────
 
     async fn open_connection(&self) -> Result<Connection, TuyaError> {
@@ -328,9 +355,16 @@ impl TuyaPlugin {
         let mut stream = TcpStream::connect(&addr).await?;
         stream.set_nodelay(true)?;
 
-        let key  = self.config.key_bytes()?;
-        let hint = self.config.protocol_version.as_deref();
-        let (proto, leftover) = self.probe_protocol(&mut stream, &key, hint).await?;
+        let key = self.config.key_bytes()?;
+        let version_hint: Option<String> = self.version_hints
+            .get(&self.config.tuya_id)
+            .map(|r| r.value().clone());
+        let hint: &str = version_hint.as_deref()
+            .or_else(|| self.config.protocol_version.as_deref())
+            .ok_or_else(|| TuyaError::Protocol(
+                "version unknown — waiting for router discovery".into(),
+            ))?;
+        let (proto, leftover) = self.probe_protocol(&mut stream, &key, Some(hint)).await?;
 
         let version_byte = match &proto {
             ProtocolResult::V33    => 3u8,
@@ -433,25 +467,11 @@ impl TuyaPlugin {
                     Ok((ProtocolResult::V34(sk), ring))
                 }
             }
-            Ok(Err(e)) => {
-                if hint.is_some() {
-                    Err(e)
-                } else {
-                    debug!("probe error ({e}), falling back to v3.3");
-                    Ok((ProtocolResult::V33, ring))
-                }
-            }
-            Err(_elapsed) => {
-                if hint.is_some() {
-                    Err(TuyaError::Protocol(format!(
-                        "protocol probe timed out for explicit hint {:?}",
-                        hint
-                    )))
-                } else {
-                    debug!("probe timed out, falling back to v3.3");
-                    Ok((ProtocolResult::V33, ring))
-                }
-            }
+            Ok(Err(e)) => Err(e),
+            Err(_elapsed) => Err(TuyaError::Protocol(format!(
+                "protocol probe timed out for hint {:?}",
+                hint
+            ))),
         }
     }
 
@@ -666,9 +686,17 @@ impl DevicePlugin for TuyaPlugin {
 
     async fn poll_state(&self) -> PluginResult<DeviceState> {
         let id = self.info.id;
+
+        let now_ms = Self::epoch_ms();
+        if now_ms < self.poll_backoff_until.load(Ordering::Acquire) {
+            debug!(device = %id, "poll suppressed (ECONNRESET backoff)");
+            return Ok(offline_state(id));
+        }
+
         let mut conn = match self.open_connection().await {
             Ok(c) => c,
             Err(e) => {
+                self.maybe_set_backoff(&e);
                 tracing::error!(device = %id, "open_connection failed: {e}");
                 return Ok(offline_state(id));
             }
@@ -690,6 +718,7 @@ impl DevicePlugin for TuyaPlugin {
         };
 
         if let Err(e) = conn.send(cmd, payload.as_bytes()).await {
+            self.maybe_set_backoff(&e);
             debug!(device = %id, "send failed: {e}");
             return Ok(offline_state(id));
         }
@@ -707,6 +736,7 @@ impl DevicePlugin for TuyaPlugin {
                 Ok(state)
             }
             Ok(Err(e)) => {
+                self.maybe_set_backoff(&e);
                 tracing::error!(device = %id, "recv_state error: {e}");
                 Ok(offline_state(id))
             }

@@ -22,3 +22,4 @@ crc32fast   = { workspace = true }
 hmac        = { workspace = true }
 sha2        = { workspace = true }
 rand        = { workspace = true }
+dashmap     = { workspace = true }

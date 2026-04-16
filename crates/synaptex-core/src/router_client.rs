@@ -189,9 +189,10 @@ fn sync_device_from_router(trees: &Trees, tuya_id: &str, version: &str, new_ip: 
 /// router-side discovery as a fallback when core cannot see the device
 /// subnet directly.
 pub async fn run_discovery_loop(
-    cfg:   RouterClientConfig,
-    cache: Arc<DashMap<String, RouterDiscoveredDevice>>,
-    trees: Arc<Trees>,
+    cfg:           RouterClientConfig,
+    cache:         Arc<DashMap<String, RouterDiscoveredDevice>>,
+    trees:         Arc<Trees>,
+    version_hints: Arc<DashMap<String, String>>,
 ) {
     let mut backoff = Duration::from_secs(2);
 
@@ -228,6 +229,10 @@ pub async fn run_discovery_loop(
                                             version:    device.version.clone(),
                                             managed_ip,
                                         });
+
+                                        if !device.version.is_empty() {
+                                            version_hints.insert(device.tuya_id.clone(), device.version.clone());
+                                        }
 
                                         // Sync IP + protocol_version back to stored config.
                                         sync_device_from_router(&trees, &device.tuya_id, &device.version, ip);

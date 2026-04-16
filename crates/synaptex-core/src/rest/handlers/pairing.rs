@@ -228,6 +228,7 @@ pub async fn import_cloud_devices(
                                 protocol_version: cfg.protocol_version.clone(),
                             },
                             state.bus_tx.clone(),
+                            state.version_hints.clone(),
                         );
                         state.registry.deregister(&id).await;
                         state.registry.register(Arc::new(new_plugin));
@@ -356,6 +357,7 @@ fn register_device_into_state(
             protocol_version,
         },
         state.bus_tx.clone(),
+        state.version_hints.clone(),
     );
     state.registry.register(Arc::new(plugin));
 

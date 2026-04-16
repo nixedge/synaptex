@@ -4652,6 +4652,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dashmap",
  "reqwest",
  "serde_json",
  "synaptex-tuya",
@@ -4747,6 +4748,7 @@ dependencies = [
  "bytes",
  "cipher",
  "crc32fast",
+ "dashmap",
  "hex",
  "hmac",
  "rand 0.8.5",

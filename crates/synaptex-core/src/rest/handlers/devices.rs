@@ -157,6 +157,7 @@ pub async fn register_device(
             protocol_version: None,
         },
         state.bus_tx.clone(),
+        state.version_hints.clone(),
     );
     state.registry.register(Arc::new(plugin));
 
@@ -222,6 +223,7 @@ pub async fn patch_device(
             protocol_version: tuya_cfg.protocol_version,
         },
         state.bus_tx.clone(),
+        state.version_hints.clone(),
     );
     state.registry.register(Arc::new(plugin));
 

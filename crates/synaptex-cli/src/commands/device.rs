@@ -653,7 +653,7 @@ async fn probe(config_arg: Option<String>, set_dps: Vec<String>, _http_url: &str
         local_key:     tuya_cfg.local_key.clone(),
         dp_map:        tuya_cfg.dp_map(),
         protocol_version: tuya_cfg.protocol_version.clone(),
-    }, bus_tx));
+    }, bus_tx, std::sync::Arc::new(dashmap::DashMap::new())));
 
     if set_dps.is_empty() {
         // GET: poll state, capture raw DPs from bus event.
