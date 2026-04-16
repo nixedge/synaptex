@@ -33,7 +33,13 @@ fn member_dtos(member_ids: &[synaptex_types::device::DeviceId], state: &AppState
                 PluginConfig::Bond(b) => (Some(b.hub_ip.clone()), None),
                 PluginConfig::Group(_) => (None, None),
             })
-            .unwrap_or((None, None));
+            .unwrap_or_else(|| {
+                // Managed device (no plugin config): look up current IP from router cache.
+                let ip = state.router_devices
+                    .get(&mid.to_string())
+                    .map(|e| e.ip.to_string());
+                (ip, None)
+            });
         if let Some(PluginConfig::Tuya(ref t)) = cfg {
             info.capabilities = t.dp_map().capabilities();
         }
@@ -56,7 +62,12 @@ pub async fn list_devices(
                 PluginConfig::Bond(b) => (Some(b.hub_ip.clone()), None),
                 PluginConfig::Group(_) => (None, None),
             })
-            .unwrap_or((None, None));
+            .unwrap_or_else(|| {
+                let ip = state.router_devices
+                    .get(&info.id.to_string())
+                    .map(|e| e.ip.to_string());
+                (ip, None)
+            });
         let mut info = info.clone();
         if let Some(PluginConfig::Tuya(ref t)) = cfg {
             info.capabilities = t.dp_map().capabilities();
@@ -94,7 +105,12 @@ pub async fn get_device(
             PluginConfig::Bond(b) => (Some(b.hub_ip.clone()), None),
             PluginConfig::Group(_) => (None, None),
         })
-        .unwrap_or((None, None));
+        .unwrap_or_else(|| {
+            let ip = state.router_devices
+                .get(&id.to_string())
+                .map(|e| e.ip.to_string());
+            (ip, None)
+        });
 
     let members = match &cfg {
         Some(PluginConfig::Group(g)) => Some(member_dtos(&g.member_ids, &state)),

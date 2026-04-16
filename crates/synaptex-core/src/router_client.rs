@@ -213,29 +213,54 @@ pub async fn run_discovery_loop(
                         loop {
                             match stream.message().await {
                                 Ok(Some(device)) => {
-                                    tracing::info!(
-                                        tuya_id = %device.tuya_id,
-                                        ip      = %device.ip,
-                                        mac     = %device.mac,
-                                        version = %device.version,
-                                        "router: device discovered",
-                                    );
-                                    // Parse the IP — skip on failure rather than crashing.
-                                    if let Ok(ip) = device.ip.parse::<std::net::Ipv4Addr>() {
-                                        let managed_ip = device.managed_ip.parse::<std::net::Ipv4Addr>().ok();
-                                        cache.insert(device.tuya_id.clone(), RouterDiscoveredDevice {
-                                            ip,
-                                            mac:        device.mac.clone(),
-                                            version:    device.version.clone(),
-                                            managed_ip,
-                                        });
+                                    let ip_parsed = device.ip.parse::<std::net::Ipv4Addr>().ok();
+                                    let managed_ip = device.managed_ip.parse::<std::net::Ipv4Addr>().ok();
 
-                                        if !device.version.is_empty() {
-                                            version_hints.insert(device.tuya_id.clone(), device.version.clone());
+                                    if device.tuya_id.is_empty() {
+                                        // Non-Tuya device (Alexa, Roku, Mysa, Sense, …).
+                                        // Key by MAC so entries don't collide.
+                                        if device.mac.is_empty() {
+                                            tracing::debug!("router: ignoring discovery event with no tuya_id and no mac");
+                                        } else {
+                                            tracing::info!(
+                                                mac        = %device.mac,
+                                                ip         = %device.ip,
+                                                managed_ip = %device.managed_ip,
+                                                "router: managed device seen",
+                                            );
+                                            if let Some(ip) = ip_parsed {
+                                                cache.insert(device.mac.clone(), RouterDiscoveredDevice {
+                                                    ip,
+                                                    mac:        device.mac.clone(),
+                                                    version:    String::new(),
+                                                    managed_ip,
+                                                });
+                                            }
                                         }
+                                    } else {
+                                        // Tuya device.
+                                        tracing::info!(
+                                            tuya_id = %device.tuya_id,
+                                            ip      = %device.ip,
+                                            mac     = %device.mac,
+                                            version = %device.version,
+                                            "router: tuya device discovered",
+                                        );
+                                        if let Some(ip) = ip_parsed {
+                                            cache.insert(device.tuya_id.clone(), RouterDiscoveredDevice {
+                                                ip,
+                                                mac:        device.mac.clone(),
+                                                version:    device.version.clone(),
+                                                managed_ip,
+                                            });
 
-                                        // Sync IP + protocol_version back to stored config.
-                                        sync_device_from_router(&trees, &device.tuya_id, &device.version, ip);
+                                            if !device.version.is_empty() {
+                                                version_hints.insert(device.tuya_id.clone(), device.version.clone());
+                                            }
+
+                                            // Sync IP + protocol_version back to stored config.
+                                            sync_device_from_router(&trees, &device.tuya_id, &device.version, ip);
+                                        }
                                     }
                                 }
                                 Ok(None) => {
