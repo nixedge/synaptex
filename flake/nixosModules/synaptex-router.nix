@@ -132,6 +132,16 @@
             description = "Open the gRPC port in the firewall.";
           };
 
+          logLevel = lib.mkOption {
+            type = lib.types.str;
+            default = "info";
+            example = "synaptex_router=debug,info";
+            description = ''
+              Value for the RUST_LOG environment variable.  Accepts any tracing
+              filter directive, e.g. "debug", "synaptex_router=debug,warn".
+            '';
+          };
+
           keaHookSrc = lib.mkOption {
             type = lib.types.nullOr lib.types.path;
             default = null;
@@ -246,6 +256,8 @@
                   "--kea-subnet-id ${toString cfg.keaSubnetId}"
                 ]
               );
+
+              Environment = ["RUST_LOG=${cfg.logLevel}"];
 
               DynamicUser = true;
               StateDirectory = "synaptex-router";

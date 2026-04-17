@@ -53,6 +53,16 @@
               SYNAPTEX_TUYA_CLIENT_SECRET or a pre-set SYNAPTEX_API_KEY.
             '';
           };
+
+          logLevel = lib.mkOption {
+            type = lib.types.str;
+            default = "info";
+            example = "synaptex_core=debug,info";
+            description = ''
+              Value for the RUST_LOG environment variable.  Accepts any tracing
+              filter directive, e.g. "debug", "synaptex_core=debug,warn".
+            '';
+          };
         };
 
         config = lib.mkIf cfg.enable {
@@ -83,6 +93,7 @@
                 ]
               );
 
+              Environment = ["RUST_LOG=${cfg.logLevel}"];
               EnvironmentFile = lib.mkIf (cfg.environmentFile != null) cfg.environmentFile;
 
               User = "synaptex-core";
