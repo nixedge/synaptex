@@ -414,13 +414,18 @@ async fn list(groups_only: bool, http_url: &str, api_key: Option<&str>) -> Resul
             None    => if protocol == "group" { "-".to_string() } else { "v-".to_string() },
         };
         let dtype     = device_type(d);
+        let online    = match d["state"]["online"].as_bool() {
+            Some(true)  => "online",
+            Some(false) => "OFFLINE",
+            None        => "?",
+        };
         let room_lbl  = room_map.get(&mac.to_uppercase())
             .map(|r| format!("  room:{r}"))
             .unwrap_or_default();
         let group_lbl = group_map.get(&mac.to_uppercase())
             .map(|g| format!("  group:{g}"))
             .unwrap_or_default();
-        println!("{mac}  {ip:15}  {:32}  {dtype:10}  {protocol:12}  {version}{room_lbl}{group_lbl}", name);
+        println!("{mac}  {ip:15}  {:32}  {dtype:10}  {protocol:12}  {version}  {online:7}{room_lbl}{group_lbl}", name);
     }
     Ok(())
 }
