@@ -7,7 +7,7 @@ use urlencoding::encode;
 
 type HmacSha256 = Hmac<Sha256>;
 
-const IOT_HOST: &str = "a3q27gia9qg3zy-ats.iot.us-east-1.amazonaws.com";
+pub const IOT_HOST: &str = "a3q27gia9qg3zy-ats.iot.us-east-1.amazonaws.com";
 const REGION:   &str = "us-east-1";
 const SERVICE:  &str = "iotdevicegateway";
 

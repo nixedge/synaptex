@@ -5,6 +5,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use rand::RngCore as _;
 use tokio_tungstenite::tungstenite::{http::Request, Message};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -57,10 +59,21 @@ async fn run_session(
     account:  &Arc<MysaAccount>,
     cmd_rx:   &mut mpsc::Receiver<WorkerCmd>,
 ) -> Result<()> {
-    // WebSocket connect with mqtt subprotocol.
+    // Build a WebSocket upgrade request with all required headers.
+    // tungstenite 0.24 does NOT auto-generate Sec-WebSocket-Key when a custom
+    // Request is passed — all five upgrade headers must be supplied manually.
+    let mut key_bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut key_bytes);
+    let ws_key = B64.encode(key_bytes);
+
     let request = Request::builder()
         .uri(wss_url)
-        .header("Sec-WebSocket-Protocol", "mqtt")
+        .header("Host",                  crate::sigv4::IOT_HOST)
+        .header("Connection",            "Upgrade")
+        .header("Upgrade",               "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key",     ws_key)
+        .header("Sec-WebSocket-Protocol","mqtt")
         .body(())
         .context("build WebSocket request")?;
 
