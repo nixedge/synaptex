@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     plugin::MysaAccount,
-    types::{json_temp_to_tenths, mqtt_temp_to_tenths, MqttOutMsg, MysaDeviceState},
+    types::{json_temp_to_tenths, MqttOutMsg, MysaDeviceState},
 };
 use synaptex_types::plugin::{DeviceState, StateChangeEvent};
 
@@ -279,20 +279,41 @@ fn dispatch_json(device_id: Option<&str>, payload: &[u8], account: &Arc<MysaAcco
     }
 }
 
+/// Parse the binary batch telemetry frame emitted by BB-V1-0 devices on the
+/// `/v1/dev/{id}/batch` topic.
+///
+/// Frame layout (little-endian):
+/// ```text
+/// Offset  Size  Field
+///  0-1     2    Magic: 0xCA 0xA0
+///  2       1    Version (0, 1, 3, …)
+///  3-6     4    Unix timestamp (u32 LE)
+///  7-8     2    Setpoint in tenths of °C (i16 LE)
+///  9-10    2    Ambient temperature in tenths of °C (i16 LE)
+///  …       …    Remaining fields vary by version
+/// ```
+///
+/// Returns `(setpoint_tenths, ambient_temp_tenths)` on success, `None` if the
+/// payload is too short or the magic bytes do not match.
+pub(crate) fn parse_batch_frame(payload: &[u8]) -> Option<(u16, u16)> {
+    if payload.len() < 11 || payload[0] != 0xCA || payload[1] != 0xA0 {
+        return None;
+    }
+    // Raw values are already in tenths of °C — no conversion needed.
+    let sp   = i16::from_le_bytes([payload[7], payload[8]])  as u16;
+    let temp = i16::from_le_bytes([payload[9], payload[10]]) as u16;
+    Some((sp, temp))
+}
+
 fn dispatch_batch(device_id: Option<&str>, payload: &[u8], account: &Arc<MysaAccount>) {
     let id = match device_id {
         Some(d) => d,
         None    => return,
     };
-    // Binary telemetry: 0xCA 0xA0 + temp(2) + setpoint(2) + duty(2)
-    if payload.len() < 8 || payload[0] != 0xCA || payload[1] != 0xA0 {
-        return;
-    }
-    let temp_raw = u16::from_be_bytes([payload[2], payload[3]]);
-    let sp_raw   = u16::from_be_bytes([payload[4], payload[5]]);
-
-    let temp = mqtt_temp_to_tenths(temp_raw);
-    let sp   = mqtt_temp_to_tenths(sp_raw);
+    let (sp, temp) = match parse_batch_frame(payload) {
+        Some(v) => v,
+        None    => return,
+    };
 
     let mut entry = account.state_cache.entry(id.to_string()).or_insert_with(|| {
         MysaDeviceState { temp_current: 0, temp_set: 200, mode: 0 }
@@ -461,4 +482,189 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── encode_remaining_len / decode_remaining_len ───────────────────────────
+
+    #[test]
+    fn test_encode_remaining_len_single_byte() {
+        assert_eq!(encode_remaining_len(0),   vec![0x00]);
+        assert_eq!(encode_remaining_len(10),  vec![0x0A]);
+        assert_eq!(encode_remaining_len(127), vec![0x7F]);
+    }
+
+    #[test]
+    fn test_encode_remaining_len_two_bytes() {
+        // 128: LSB = 128%128=0 | 0x80 continuation = 0x80, next byte = 128/128 = 1
+        assert_eq!(encode_remaining_len(128), vec![0x80, 0x01]);
+        // 200: 200%128=72=0x48 | 0x80 = 0xC8, 200/128=1
+        assert_eq!(encode_remaining_len(200), vec![0xC8, 0x01]);
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip() {
+        for len in [0, 1, 127, 128, 200, 16383, 16384, 2_097_151] {
+            let enc = encode_remaining_len(len);
+            let (val, consumed) = decode_remaining_len(&enc);
+            assert_eq!(val, len, "round-trip failed for len={len}");
+            assert_eq!(consumed, enc.len(), "consumed mismatch for len={len}");
+        }
+    }
+
+    // ── build_connect ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_connect_type_and_magic() {
+        let pkt = build_connect("test_client", 60);
+        assert_eq!(pkt[0], 0x10, "CONNECT packet type must be 0x10");
+        assert!(pkt.windows(4).any(|w| w == b"MQTT"), "packet must contain 'MQTT'");
+    }
+
+    #[test]
+    fn test_build_connect_keepalive_bytes() {
+        let pkt = build_connect("id", 120);
+        let hi = (120u16 >> 8) as u8;
+        let lo = (120u16 & 0xFF) as u8;
+        assert!(pkt.windows(2).any(|w| w == [hi, lo]), "keepalive 120 not found in packet");
+    }
+
+    // ── build_subscribe ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_subscribe_type() {
+        let pkt = build_subscribe(1, &[("/v1/dev/abc/out", 1)]);
+        assert_eq!(pkt[0], 0x82, "SUBSCRIBE type must be 0x82");
+    }
+
+    #[test]
+    fn test_build_subscribe_contains_topic() {
+        let topic = "/v1/dev/abc/out";
+        let pkt = build_subscribe(1, &[(topic, 1)]);
+        assert!(pkt.windows(topic.len()).any(|w| w == topic.as_bytes()),
+                "topic bytes not found in SUBSCRIBE packet");
+    }
+
+    #[test]
+    fn test_build_subscribe_packet_id() {
+        // Packet ID 0x00, 0x05 = 5 should appear in the variable header.
+        let pkt = build_subscribe(5, &[("/v1/dev/x/out", 0)]);
+        assert_eq!(pkt[0], 0x82);
+        // After fixed header (type + remaining len), first two bytes are packet ID.
+        let rem_len_bytes = if pkt[1] & 0x80 == 0 { 1 } else { 2 };
+        let pid_hi = pkt[1 + rem_len_bytes];
+        let pid_lo = pkt[1 + rem_len_bytes + 1];
+        assert_eq!(u16::from_be_bytes([pid_hi, pid_lo]), 5);
+    }
+
+    // ── build_publish ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_publish_qos0() {
+        let pkt = build_publish("/v1/dev/abc/in", b"payload", 0, None);
+        assert_eq!(pkt[0], 0x30, "QoS 0 PUBLISH must have type byte 0x30");
+    }
+
+    #[test]
+    fn test_build_publish_qos1() {
+        let pkt = build_publish("/v1/dev/abc/in", b"payload", 1, Some(42));
+        assert_eq!(pkt[0] & 0x06, 0x02, "QoS 1 bits must be set in header");
+    }
+
+    #[test]
+    fn test_build_publish_contains_payload() {
+        let payload = b"hello world";
+        let pkt = build_publish("/v1/dev/abc/in", payload, 0, None);
+        assert!(pkt.windows(payload.len()).any(|w| w == payload),
+                "payload bytes not found in PUBLISH packet");
+    }
+
+    // ── extract_device_id ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_device_id_out_topic() {
+        assert_eq!(extract_device_id("/v1/dev/abc123/out"), Some("abc123"));
+    }
+
+    #[test]
+    fn test_extract_device_id_batch_topic() {
+        assert_eq!(extract_device_id("/v1/dev/abc123/batch"), Some("abc123"));
+    }
+
+    #[test]
+    fn test_extract_device_id_in_topic() {
+        assert_eq!(extract_device_id("/v1/dev/abc123/in"), Some("abc123"));
+    }
+
+    #[test]
+    fn test_extract_device_id_invalid_topics() {
+        assert_eq!(extract_device_id("/other/path"), None);
+        assert_eq!(extract_device_id(""),            None);
+        assert_eq!(extract_device_id("/v1/dev"),     None);
+    }
+
+    // ── parse_batch_frame ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_batch_frame_too_short() {
+        assert_eq!(parse_batch_frame(b""), None);
+        assert_eq!(parse_batch_frame(&[0xCA, 0xA0, 0x00]), None);
+        // 10 bytes — correct magic but one byte short of the required 11
+        let almost = [0xCA, 0xA0, 0x00, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(parse_batch_frame(&almost), None);
+    }
+
+    #[test]
+    fn test_parse_batch_frame_wrong_magic() {
+        let data = [0u8; 11];
+        assert_eq!(parse_batch_frame(&data), None);
+        let mut data = [0u8; 11];
+        data[0] = 0xCA; // only first magic byte
+        assert_eq!(parse_batch_frame(&data), None);
+    }
+
+    /// Real V3 data captured from a BB-V1-0 device (from Mysa_HA test suite).
+    /// Header: CA A0 03
+    /// Timestamp (LE u32): DE 55 79 69
+    /// Setpoint  (LE i16): E9 00  → 233 tenths = 23.3 °C
+    /// Amb. temp (LE i16): CE 00  → 206 tenths = 20.6 °C
+    #[test]
+    fn test_parse_batch_frame_real_v3_data() {
+        let data = hex::decode(
+            "caa003de557969e900ce00cd002c007e00b7000e01c81a1c01f5000002cd000007"
+        ).unwrap();
+        let (sp, temp) = parse_batch_frame(&data).unwrap();
+        assert_eq!(sp,   233, "setpoint should be 233 tenths (23.3°C)");
+        assert_eq!(temp, 206, "ambient temp should be 206 tenths (20.6°C)");
+    }
+
+    /// Constructed V0 vector matching test_parse_batch_v0 from Mysa_HA:
+    /// struct.pack("<LhhhbbhhhHbb", 1769542000, 236, 211, 210, 44, …) + checksum
+    /// ambTemp = 211 / 10 = 21.1°C.  setpoint field = 236 / 10 = 23.6°C.
+    #[test]
+    fn test_parse_batch_frame_v0_constructed() {
+        let mut data: Vec<u8> = vec![0xCA, 0xA0, 0x00];       // magic + version 0
+        data.extend_from_slice(&1_769_542_000u32.to_le_bytes()); // timestamp
+        data.extend_from_slice(&236i16.to_le_bytes());           // h1 setpoint: 23.6°C
+        data.extend_from_slice(&211i16.to_le_bytes());           // h2 ambTemp:  21.1°C
+        data.extend_from_slice(&210i16.to_le_bytes());           // h3 floor sensor
+        data.push(44);                                           // duty cycle
+        data.push(0);
+        data.extend_from_slice(&10i16.to_le_bytes());
+        data.extend_from_slice(&10i16.to_le_bytes());
+        data.extend_from_slice(&300i16.to_le_bytes());
+        data.extend_from_slice(&5000u16.to_le_bytes());
+        data.push(29);
+        data.push(0);
+        data.push(0x01);                                         // checksum
+
+        let (sp, temp) = parse_batch_frame(&data).unwrap();
+        assert_eq!(sp,   236, "setpoint should be 236 tenths (23.6°C)");
+        assert_eq!(temp, 211, "ambient temp should be 211 tenths (21.1°C)");
+    }
 }

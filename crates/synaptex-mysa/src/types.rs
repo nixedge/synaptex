@@ -120,3 +120,64 @@ pub fn json_temp_to_tenths(v: &serde_json::Value) -> Option<u16> {
         None
     }
 }
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── rest_temp_to_tenths ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_rest_temp_to_tenths() {
+        assert_eq!(rest_temp_to_tenths(21.1), 211);
+        assert_eq!(rest_temp_to_tenths(22.0), 220);
+        assert_eq!(rest_temp_to_tenths(5.0),   50);
+        assert_eq!(rest_temp_to_tenths(30.0), 300);
+    }
+
+    // ── mqtt_temp_to_tenths ───────────────────────────────────────────────────
+
+    /// Values > 100 are interpreted as centidegrees (÷ 10 → tenths).
+    /// e.g. the JSON out-topic may send 2200 meaning 22.0°C.
+    #[test]
+    fn test_mqtt_temp_to_tenths_centidegrees() {
+        assert_eq!(mqtt_temp_to_tenths(2200), 220); // 22.0°C
+        assert_eq!(mqtt_temp_to_tenths(2110), 211); // 21.1°C
+        assert_eq!(mqtt_temp_to_tenths(500),   50); //  5.0°C
+        assert_eq!(mqtt_temp_to_tenths(101),   10); // 10.1°C (integer division)
+    }
+
+    /// Values ≤ 100 are interpreted as whole °C (× 10 → tenths).
+    #[test]
+    fn test_mqtt_temp_to_tenths_whole_degrees() {
+        assert_eq!(mqtt_temp_to_tenths(22), 220);
+        assert_eq!(mqtt_temp_to_tenths(5),   50);
+        assert_eq!(mqtt_temp_to_tenths(0),    0);
+    }
+
+    // ── json_temp_to_tenths ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_json_temp_to_tenths_integer() {
+        assert_eq!(json_temp_to_tenths(&json!(2200)), Some(220));
+        assert_eq!(json_temp_to_tenths(&json!(22)),   Some(220));
+        assert_eq!(json_temp_to_tenths(&json!(0)),    Some(0));
+    }
+
+    #[test]
+    fn test_json_temp_to_tenths_float() {
+        assert_eq!(json_temp_to_tenths(&json!(21.1)), Some(211));
+        assert_eq!(json_temp_to_tenths(&json!(22.5)), Some(225));
+        assert_eq!(json_temp_to_tenths(&json!(5.0)),  Some(50));
+    }
+
+    #[test]
+    fn test_json_temp_to_tenths_invalid() {
+        assert_eq!(json_temp_to_tenths(&json!("bad")), None);
+        assert_eq!(json_temp_to_tenths(&json!(null)),  None);
+        assert_eq!(json_temp_to_tenths(&json!([])),    None);
+    }
+}
