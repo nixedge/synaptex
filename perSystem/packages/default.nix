@@ -27,6 +27,7 @@
         ../../crates/synaptex-types
         ../../crates/synaptex-tuya
         ../../crates/synaptex-bond
+        ../../crates/synaptex-mysa
         ../../crates/synaptex-core
         ../../crates/synaptex-cli
         ../../crates/synaptex-router-proto
