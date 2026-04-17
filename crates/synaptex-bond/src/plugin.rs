@@ -160,7 +160,7 @@ fn speed_to_bond(speed: FanSpeed, max_speed: u8) -> u32 {
     match speed {
         FanSpeed::Off    => 0,
         FanSpeed::Low    => 1,
-        FanSpeed::Medium => (max / 2).max(1),
+        FanSpeed::Medium => ((max + 1) / 2).max(1),
         FanSpeed::High   => max,
     }
 }
