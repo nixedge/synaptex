@@ -1,7 +1,5 @@
 /// REST handlers for hub registration and listing (Bond, Matter, Mysa, Other).
 
-use std::collections::HashMap;
-
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
@@ -32,28 +30,36 @@ pub async fn list_hubs(
     let registrations = db::list_hub_registrations(&state.trees).map_err(ie)?;
 
     // Count discovered sub-devices per hub.
-    // Bond devices group by hub MAC; Mysa devices group under the account username.
     let configs = db::load_all_plugin_configs(&state.trees).map_err(ie)?;
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut mysa_count = 0usize;
+    let mut bond_counts = std::collections::HashMap::<String, usize>::new();
+    let mut mysa_device_count = 0usize;
     for cfg in &configs {
         match cfg {
-            PluginConfig::Bond(b) => { *counts.entry(b.hub_mac.clone()).or_insert(0) += 1; }
-            PluginConfig::Mysa(_) => { mysa_count += 1; }
+            PluginConfig::Bond(b) => { *bond_counts.entry(b.hub_mac.clone()).or_insert(0) += 1; }
+            PluginConfig::Mysa(_) => { mysa_device_count += 1; }
             _ => {}
-        }
-    }
-    if mysa_count > 0 {
-        if let Ok(Some(acct)) = db::get_mysa_account_config(&state.trees) {
-            counts.insert(acct.username, mysa_count);
         }
     }
 
     let mut dtos: Vec<HubDto> = registrations
         .into_iter()
-        .map(|h| {
-            let device_count = counts.get(&h.mac).copied().unwrap_or(0);
-            HubDto { mac: h.mac, kind: h.kind, hub_ip: h.hub_ip, device_count }
+        .map(|reg| match reg {
+            HubRegistration::Bond { mac, hub_ip, .. } => HubDto {
+                device_count: bond_counts.get(&mac).copied().unwrap_or(0),
+                kind:         "bond".to_string(),
+                hub_ip,
+                mac,
+            },
+            HubRegistration::Mysa { username } => HubDto {
+                mac:          username,
+                kind:         "mysa".to_string(),
+                hub_ip:       String::new(),
+                device_count: mysa_device_count,
+            },
+            HubRegistration::Other { mac, kind, hub_ip } => HubDto {
+                device_count: 0,
+                mac, kind, hub_ip,
+            },
         })
         .collect();
 
@@ -66,7 +72,7 @@ pub async fn list_hubs(
 #[derive(Debug, Deserialize)]
 pub struct RegisterHubBody {
     /// MAC address of the hub (AA:BB:CC:DD:EE:FF).
-    /// Optional for Mysa (cloud-only; no physical hub MAC required).
+    /// Not required for Mysa (cloud-only; no physical hub MAC).
     #[serde(default)]
     pub mac:        String,
     /// Currently observed IP (optional; empty means unknown).
@@ -123,37 +129,38 @@ pub async fn register_hub(
         (StatusCode::BAD_GATEWAY, format!("register_device RPC failed: {e}"))
     })?;
 
-    // Persist the hub registration so core can rediscover sub-devices on restart,
-    // even before any sub-devices have been found.
-    let hub_reg = HubRegistration {
-        mac:        body.mac.clone(),
-        kind:       body.kind.clone(),
-        hub_ip:     resp.managed_ip.clone(),
-        bond_token: body.bond_token.clone(),
-        bond_id:    body.bond_id.clone(),
+    // Persist the hub registration so core can rediscover sub-devices on restart.
+    let hub_reg = if body.kind == "bond" {
+        HubRegistration::Bond {
+            mac:        body.mac.clone(),
+            hub_ip:     resp.managed_ip.clone(),
+            bond_token: body.bond_token.clone(),
+            bond_id:    body.bond_id.clone(),
+        }
+    } else {
+        HubRegistration::Other {
+            mac:    body.mac.clone(),
+            kind:   body.kind.clone(),
+            hub_ip: resp.managed_ip.clone(),
+        }
     };
     if let Err(e) = db::save_hub_registration(&state.trees, &hub_reg) {
         tracing::warn!(mac = %body.mac, "failed to save hub registration: {e}");
     }
 
     // For Bond hubs: immediately discover sub-devices and register virtual plugins.
-    // Use the currently observed IP for the initial connect (the device may not
-    // have renewed its DHCP lease to managed_ip yet).  managed_ip is stored in
-    // BondConfig for all future connections.
     if body.kind == "bond" && !body.bond_token.is_empty() {
         let connect_ip = if body.ip.is_empty() { resp.managed_ip.clone() } else { body.ip.clone() };
         let hub_mac    = body.mac.clone();
         let bond_token = body.bond_token.clone();
         let managed_ip = resp.managed_ip.clone();
 
-        // Kick off discovery in the background; don't block the HTTP response.
         let (ip1, mac1, tok1, mgd1) = (connect_ip.clone(), hub_mac.clone(), bond_token.clone(), managed_ip.clone());
         let (t1, r1, b1) = (state.trees.clone(), state.registry.clone(), state.bus_tx.clone());
         tokio::spawn(async move {
             bond_sync::sync_hub(&ip1, &mac1, &tok1, &mgd1, t1, r1, b1).await;
         });
 
-        // Spawn the 5-minute periodic sync for this hub.
         bond_sync::spawn_periodic_sync(
             connect_ip, hub_mac, bond_token, managed_ip,
             state.trees.clone(), state.registry.clone(), state.bus_tx.clone(),
@@ -185,32 +192,23 @@ async fn register_mysa_hub(
         (StatusCode::UNAUTHORIZED, format!("Mysa authentication failed: {e}"))
     })?;
 
-    // Persist account config.
-    let acct_cfg = MysaAccountConfig {
+    // Persist credentials and a hub registration.
+    db::save_mysa_account_config(&state.trees, &MysaAccountConfig {
         username: body.username.clone(),
         password: body.password.clone(),
-    };
-    db::save_mysa_account_config(&state.trees, &acct_cfg).map_err(ie)?;
+    }).map_err(ie)?;
 
-    // Save a hub registration so the account appears in `hub list`.
-    // Use the username as the MAC-equivalent identifier (no physical hub MAC exists).
-    let hub_reg = HubRegistration {
-        mac:        body.username.clone(),
-        kind:       "mysa".to_string(),
-        hub_ip:     String::new(),
-        bond_token: String::new(),
-        bond_id:    String::new(),
-    };
-    if let Err(e) = db::save_hub_registration(&state.trees, &hub_reg) {
+    if let Err(e) = db::save_hub_registration(&state.trees, &HubRegistration::Mysa {
+        username: body.username.clone(),
+    }) {
         tracing::warn!(username = %body.username, "failed to save mysa hub registration: {e}");
     }
 
     // Start the MQTT worker and kick off background device sync.
     account.start_mqtt_worker();
     let (t, r) = (state.trees.clone(), state.registry.clone());
-    let acct = account.clone();
     tokio::spawn(async move {
-        crate::mysa_sync::sync_account(acct, t, r).await;
+        crate::mysa_sync::sync_account(account, t, r).await;
     });
 
     tracing::info!(username = %body.username, "mysa: account registered");

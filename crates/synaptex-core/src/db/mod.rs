@@ -265,27 +265,76 @@ pub fn remove_routine(trees: &Trees, routine_id: &str) -> Result<()> {
 // ─── Hub registration helpers ────────────────────────────────────────────────
 
 /// Persisted record of a hub registered via POST /api/v1/hubs.
-/// Stored in the `config` sled tree under key `hub:<mac>`.
-/// This is the durable source of truth for hub discovery — independent of
-/// whether sub-devices have been found yet.
+/// Stored in the `config` sled tree under key `hub:<id>` where `<id>` is
+/// the MAC address for physical hubs or the account username for cloud hubs.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct HubRegistration {
-    pub mac:        String,
-    pub kind:       String,   // "bond" | "matter" | "other"
-    pub hub_ip:     String,   // router-allocated managed IP
-    pub bond_token: String,
-    pub bond_id:    String,
+pub enum HubRegistration {
+    Bond {
+        mac:        String,
+        /// Router-allocated managed IP (stable after DHCP renewal).
+        hub_ip:     String,
+        bond_token: String,
+        bond_id:    String,
+    },
+    Mysa {
+        username: String,
+    },
+    /// Catch-all for Matter and other future hub types.
+    Other {
+        mac:    String,
+        kind:   String,
+        hub_ip: String,
+    },
+}
+
+impl HubRegistration {
+    /// Sled key suffix (the part after `hub:`).
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Bond { mac, .. }  => mac,
+            Self::Mysa { username } => username,
+            Self::Other { mac, .. } => mac,
+        }
+    }
+}
+
+/// V0 flat struct — used for migrating records written before HubRegistration
+/// became a typed enum.
+#[derive(serde::Deserialize)]
+struct HubRegistrationV0 {
+    mac:        String,
+    kind:       String,
+    hub_ip:     String,
+    bond_token: String,
+    bond_id:    String,
+}
+
+impl From<HubRegistrationV0> for HubRegistration {
+    fn from(v: HubRegistrationV0) -> Self {
+        match v.kind.as_str() {
+            "bond" => Self::Bond {
+                mac:        v.mac,
+                hub_ip:     v.hub_ip,
+                bond_token: v.bond_token,
+                bond_id:    v.bond_id,
+            },
+            "mysa" => Self::Mysa { username: v.mac },
+            _ => Self::Other { mac: v.mac, kind: v.kind, hub_ip: v.hub_ip },
+        }
+    }
 }
 
 pub fn save_hub_registration(trees: &Trees, hub: &HubRegistration) -> Result<()> {
-    put_str(&trees.config, &format!("hub:{}", hub.mac), hub)
+    put_str(&trees.config, &format!("hub:{}", hub.key()), hub)
 }
 
 pub fn list_hub_registrations(trees: &Trees) -> Result<Vec<HubRegistration>> {
     let mut hubs = Vec::new();
     for item in trees.config.scan_prefix(b"hub:") {
         let (_k, v) = item?;
-        match from_bytes::<HubRegistration>(&v) {
+        let reg = from_bytes::<HubRegistration>(&v)
+            .or_else(|_| from_bytes::<HubRegistrationV0>(&v).map(Into::into));
+        match reg {
             Ok(h)  => hubs.push(h),
             Err(e) => tracing::warn!("skipping corrupt hub registration: {e}"),
         }

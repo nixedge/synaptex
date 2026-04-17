@@ -177,22 +177,19 @@ async fn main() -> Result<()> {
     let hub_registrations = db::list_hub_registrations(&trees)
         .context("load hub registrations")?;
     for hub in hub_registrations {
-        if hub.kind != "bond" || hub.bond_token.is_empty() {
-            continue;
+        if let db::HubRegistration::Bond { mac, hub_ip, bond_token, .. } = hub {
+            if bond_token.is_empty() { continue; }
+            let (t1, r1, b1) = (trees.clone(), registry.clone(), bus_tx.clone());
+            let (t2, r2, b2) = (trees.clone(), registry.clone(), bus_tx.clone());
+            let (ip1, mac1, tok1, mgd1) = (hub_ip.clone(), mac.clone(), bond_token.clone(), hub_ip.clone());
+            tokio::spawn(async move {
+                bond_sync::sync_hub(&ip1, &mac1, &tok1, &mgd1, t1, r1, b1).await;
+            });
+            bond_sync::spawn_periodic_sync(
+                hub_ip.clone(), mac, bond_token, hub_ip,
+                t2, r2, b2,
+            );
         }
-        let (t1, r1, b1) = (trees.clone(), registry.clone(), bus_tx.clone());
-        let (t2, r2, b2) = (trees.clone(), registry.clone(), bus_tx.clone());
-        let (ip, mac, tok, mgd) = (
-            hub.hub_ip.clone(), hub.mac.clone(),
-            hub.bond_token.clone(), hub.hub_ip.clone(),
-        );
-        tokio::spawn(async move {
-            bond_sync::sync_hub(&ip, &mac, &tok, &mgd, t1, r1, b1).await;
-        });
-        bond_sync::spawn_periodic_sync(
-            hub.hub_ip.clone(), hub.mac, hub.bond_token, hub.hub_ip,
-            t2, r2, b2,
-        );
     }
 
     // ── Mysa cloud account + plugins ────────────────────────────────────────
