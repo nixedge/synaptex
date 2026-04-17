@@ -8,8 +8,17 @@ pub enum HubCmd {
     /// List registered hubs and their sub-device counts.
     List,
 
-    /// Register a hub and allocate it a managed IP.
+    /// Register a hub or cloud account.
     Register {
+        #[command(subcommand)]
+        kind: RegisterKind,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RegisterKind {
+    /// Register a Bond bridge hub.
+    Bond {
         /// MAC address of the hub (AA:BB:CC:DD:EE:FF).
         #[arg(long, value_name = "MAC")]
         mac: String,
@@ -18,10 +27,6 @@ pub enum HubCmd {
         #[arg(long, value_name = "IP", default_value = "")]
         ip: String,
 
-        /// Hub kind: "bond", "matter", or "other".
-        #[arg(long, value_name = "KIND")]
-        kind: String,
-
         /// Bond hub serial number (bondid from GET /v2/sys/version).
         #[arg(long, value_name = "BOND_ID", default_value = "")]
         bond_id: String,
@@ -29,6 +34,17 @@ pub enum HubCmd {
         /// Bond local API token (BOND-Token header value).
         #[arg(long, value_name = "TOKEN", default_value = "")]
         bond_token: String,
+    },
+
+    /// Register a Mysa cloud account.
+    Mysa {
+        /// Mysa cloud account e-mail address.
+        #[arg(long, value_name = "EMAIL")]
+        username: String,
+
+        /// Mysa cloud account password.
+        #[arg(long, value_name = "PASS")]
+        password: String,
     },
 }
 
@@ -66,14 +82,21 @@ pub async fn run(cmd: HubCmd, url: &str, key: Option<&str>) -> Result<()> {
             Ok(())
         }
 
-        HubCmd::Register { mac, ip, kind, bond_id, bond_token } => {
-            let body = serde_json::json!({
-                "mac":        mac,
-                "ip":         ip,
-                "kind":       kind,
-                "bond_id":    bond_id,
-                "bond_token": bond_token,
-            });
+        HubCmd::Register { kind } => {
+            let body = match kind {
+                RegisterKind::Bond { mac, ip, bond_id, bond_token } => serde_json::json!({
+                    "kind":       "bond",
+                    "mac":        mac,
+                    "ip":         ip,
+                    "bond_id":    bond_id,
+                    "bond_token": bond_token,
+                }),
+                RegisterKind::Mysa { username, password } => serde_json::json!({
+                    "kind":     "mysa",
+                    "username": username,
+                    "password": password,
+                }),
+            };
 
             let client = reqwest::Client::new();
             let mut req = client

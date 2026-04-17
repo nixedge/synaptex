@@ -1,4 +1,4 @@
-/// REST handlers for hub registration and listing (Bond, Matter, Other).
+/// REST handlers for hub registration and listing (Bond, Matter, Mysa, Other).
 
 use std::collections::HashMap;
 
@@ -6,9 +6,10 @@ use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::bond_sync;
-use crate::db::{self, HubRegistration, PluginConfig};
+use crate::db::{self, HubRegistration, MysaAccountConfig, PluginConfig};
 use crate::router_client::RouterClient;
 use crate::rest::AppState;
+use synaptex_mysa::MysaAccount;
 
 // ─── List hubs ────────────────────────────────────────────────────────────────
 
@@ -56,11 +57,13 @@ pub async fn list_hubs(
 #[derive(Debug, Deserialize)]
 pub struct RegisterHubBody {
     /// MAC address of the hub (AA:BB:CC:DD:EE:FF).
+    /// Optional for Mysa (cloud-only; no physical hub MAC required).
+    #[serde(default)]
     pub mac:        String,
     /// Currently observed IP (optional; empty means unknown).
     #[serde(default)]
     pub ip:         String,
-    /// Hub kind: "bond" | "matter" | "other".
+    /// Hub kind: "bond" | "mysa" | "matter" | "other".
     pub kind:       String,
     /// Bond hub serial number (bondid from GET /v2/sys/version).
     #[serde(default)]
@@ -68,6 +71,12 @@ pub struct RegisterHubBody {
     /// Bond local API token (BOND-Token header value).
     #[serde(default)]
     pub bond_token: String,
+    /// Mysa cloud account e-mail address.
+    #[serde(default)]
+    pub username:   String,
+    /// Mysa cloud account password.
+    #[serde(default)]
+    pub password:   String,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,6 +89,11 @@ pub async fn register_hub(
     State(state): State<AppState>,
     Json(body):   Json<RegisterHubBody>,
 ) -> Result<Json<RegisterHubResponse>, (StatusCode, String)> {
+    // ── Mysa cloud accounts need no router integration ────────────────────────
+    if body.kind == "mysa" {
+        return register_mysa_hub(state, body).await;
+    }
+
     let cfg = state.router_client_cfg.as_ref().ok_or_else(|| {
         (StatusCode::SERVICE_UNAVAILABLE,
          "router integration not configured (--router-url / --router-cert)".to_string())
@@ -140,5 +154,46 @@ pub async fn register_hub(
     Ok(Json(RegisterHubResponse {
         device_id:  resp.device_id,
         managed_ip: resp.managed_ip,
+    }))
+}
+
+// ─── Mysa cloud hub registration ─────────────────────────────────────────────
+
+async fn register_mysa_hub(
+    state: AppState,
+    body:  RegisterHubBody,
+) -> Result<Json<RegisterHubResponse>, (StatusCode, String)> {
+    let ie = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let bad = |msg: &str| (StatusCode::BAD_REQUEST, msg.to_string());
+
+    if body.username.is_empty() || body.password.is_empty() {
+        return Err(bad("username and password are required for kind=mysa"));
+    }
+
+    // Validate credentials by attempting a fresh authentication.
+    let account = MysaAccount::new(body.username.clone(), body.password.clone(), state.bus_tx.clone());
+    account.ensure_auth().await.map_err(|e| {
+        (StatusCode::UNAUTHORIZED, format!("Mysa authentication failed: {e}"))
+    })?;
+
+    // Persist account config.
+    let acct_cfg = MysaAccountConfig {
+        username: body.username.clone(),
+        password: body.password.clone(),
+    };
+    db::save_mysa_account_config(&state.trees, &acct_cfg).map_err(ie)?;
+
+    // Start the MQTT worker and kick off background device sync.
+    account.start_mqtt_worker();
+    let (t, r) = (state.trees.clone(), state.registry.clone());
+    let acct = account.clone();
+    tokio::spawn(async move {
+        crate::mysa_sync::sync_account(acct, t, r).await;
+    });
+
+    tracing::info!(username = %body.username, "mysa: account registered");
+    Ok(Json(RegisterHubResponse {
+        device_id:  body.username.clone(),
+        managed_ip: String::new(),
     }))
 }

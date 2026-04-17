@@ -4,6 +4,7 @@ members = [
     "crates/synaptex-core",
     "crates/synaptex-tuya",
     "crates/synaptex-bond",
+    "crates/synaptex-mysa",
     "crates/synaptex-cli",
     "crates/synaptex-app",
     "crates/synaptex-router-proto",
@@ -25,6 +26,7 @@ name        = "synaptex"
 synaptex-types        = { path = "crates/synaptex-types" }
 synaptex-tuya         = { path = "crates/synaptex-tuya" }
 synaptex-bond         = { path = "crates/synaptex-bond" }
+synaptex-mysa         = { path = "crates/synaptex-mysa" }
 synaptex-router-proto = { path = "crates/synaptex-router-proto" }
 
 # ── Async runtime ─────────────────────────────────────────────────────────────

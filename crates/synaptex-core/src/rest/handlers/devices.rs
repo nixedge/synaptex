@@ -31,7 +31,7 @@ fn member_dtos(member_ids: &[synaptex_types::device::DeviceId], state: &AppState
             .map(|cfg| match cfg {
                 PluginConfig::Tuya(t) => (Some(t.ip.to_string()), t.protocol_version.clone()),
                 PluginConfig::Bond(b) => (Some(b.hub_ip.clone()), None),
-                PluginConfig::Group(_) => (None, None),
+                PluginConfig::Group(_) | PluginConfig::Mysa(_) => (None, None),
             })
             .unwrap_or_else(|| {
                 // Managed device (no plugin config): look up current IP from router cache.
@@ -60,7 +60,7 @@ pub async fn list_devices(
             .map(|cfg| match cfg {
                 PluginConfig::Tuya(t) => (Some(t.ip.to_string()), t.protocol_version.clone()),
                 PluginConfig::Bond(b) => (Some(b.hub_ip.clone()), None),
-                PluginConfig::Group(_) => (None, None),
+                PluginConfig::Group(_) | PluginConfig::Mysa(_) => (None, None),
             })
             .unwrap_or_else(|| {
                 let ip = state.router_devices
@@ -103,7 +103,7 @@ pub async fn get_device(
         .map(|cfg| match cfg {
             PluginConfig::Tuya(t) => (Some(t.ip.to_string()), t.protocol_version.clone()),
             PluginConfig::Bond(b) => (Some(b.hub_ip.clone()), None),
-            PluginConfig::Group(_) => (None, None),
+            PluginConfig::Group(_) | PluginConfig::Mysa(_) => (None, None),
         })
         .unwrap_or_else(|| {
             let ip = state.router_devices
@@ -328,6 +328,14 @@ pub async fn device_debug_config(
             "name":           b.name,
             "actions":        b.actions,
             "protocol":       "bond_local",
+        }),
+        PluginConfig::Mysa(m) => serde_json::json!({
+            "mysa_id":      m.mysa_id,
+            "name":         m.name,
+            "model":        m.model,
+            "min_setpoint": m.min_setpoint,
+            "max_setpoint": m.max_setpoint,
+            "protocol":     "mysa_cloud",
         }),
     };
 

@@ -6,6 +6,7 @@ use postcard::{from_bytes, to_allocvec};
 use serde::{de::DeserializeOwned, Serialize};
 use sled::Tree;
 use synaptex_types::{device::DeviceId, DeviceInfo};
+use synaptex_mysa::MysaConfig;
 use synaptex_tuya::TuyaDeviceConfig;
 
 // ─── Generic helpers ─────────────────────────────────────────────────────────
@@ -59,6 +60,7 @@ pub struct GroupConfig {
 }
 
 pub use synaptex_bond::BondConfig;
+pub use synaptex_mysa::MysaAccountConfig;
 
 /// Discriminated union of all per-protocol configs stored in the `configs` tree.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -66,6 +68,7 @@ pub enum PluginConfig {
     Tuya(TuyaDeviceConfig),
     Group(GroupConfig),
     Bond(BondConfig),
+    Mysa(MysaConfig),
 }
 
 /// A named room containing a set of devices (physical and/or group).
@@ -337,4 +340,16 @@ pub fn get_api_key(trees: &Trees) -> Result<Option<String>> {
 pub fn remove_api_key(trees: &Trees) -> Result<()> {
     trees.config.remove(KEY_API_KEY)?;
     Ok(())
+}
+
+// ─── Mysa account config helpers ──────────────────────────────────────────────
+
+const KEY_MYSA_ACCOUNT: &str = "mysa_account";
+
+pub fn save_mysa_account_config(trees: &Trees, cfg: &MysaAccountConfig) -> Result<()> {
+    put_str(&trees.config, KEY_MYSA_ACCOUNT, cfg)
+}
+
+pub fn get_mysa_account_config(trees: &Trees) -> Result<Option<MysaAccountConfig>> {
+    get_str(&trees.config, KEY_MYSA_ACCOUNT)
 }

@@ -3,6 +3,7 @@ mod bus;
 mod cache;
 mod db;
 mod group;
+mod mysa_sync;
 mod plugin;
 mod rest;
 mod room;
@@ -16,6 +17,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::info;
 
+use synaptex_mysa::{MysaAccount, MysaPlugin};
 use synaptex_tuya::{TuyaPlugin, plugin::TuyaConfig};
 
 use db::PluginConfig;
@@ -85,9 +87,16 @@ async fn main() -> Result<()> {
     let configs = db::load_all_plugin_configs(&trees)
         .context("load plugin configs from sled")?;
 
+    // Collect Mysa configs before the consuming loop so they can be
+    // processed separately under a shared MysaAccount.
+    let mysa_device_configs: Vec<synaptex_mysa::MysaConfig> = configs.iter()
+        .filter_map(|c| if let PluginConfig::Mysa(m) = c { Some(m.clone()) } else { None })
+        .collect();
+
     let config_count = configs.len();
     for cfg in configs {
         match cfg {
+            PluginConfig::Mysa(_) => {} // handled after Bond sync section
             PluginConfig::Bond(bond_cfg) => {
                 let info = match db::get(&trees.registry, &bond_cfg.device_id)
                     .context("read bond device info")?
@@ -184,6 +193,43 @@ async fn main() -> Result<()> {
             hub.hub_ip.clone(), hub.mac, hub.bond_token, hub.hub_ip,
             t2, r2, b2,
         );
+    }
+
+    // ── Mysa cloud account + plugins ────────────────────────────────────────
+    if let Some(mysa_acct_cfg) = db::get_mysa_account_config(&trees)
+        .context("load Mysa account config")?
+    {
+        let account = MysaAccount::new(
+            mysa_acct_cfg.username,
+            mysa_acct_cfg.password,
+            bus_tx.clone(),
+        );
+        account.start_mqtt_worker();
+
+        for cfg in &mysa_device_configs {
+            let info = match db::get(&trees.registry, &cfg.device_id)
+                .context("read mysa device info")?
+            {
+                Some(info) => info,
+                None => {
+                    tracing::warn!(
+                        device = %cfg.device_id,
+                        "mysa config found but no registry entry — skipping"
+                    );
+                    continue;
+                }
+            };
+            account.add_device(cfg.mysa_id.clone(), cfg.device_id);
+            registry.register(Arc::new(MysaPlugin::new(info, cfg.clone(), account.clone())));
+        }
+        info!(loaded = mysa_device_configs.len(), "mysa plugins loaded");
+
+        // Background sync to discover any new devices added since last run.
+        let (t, r) = (trees.clone(), registry.clone());
+        let acct = account.clone();
+        tokio::spawn(async move {
+            mysa_sync::sync_account(acct, t, r).await;
+        });
     }
 
     // ── Routine runner + cron tasks ──────────────────────────────────────────
