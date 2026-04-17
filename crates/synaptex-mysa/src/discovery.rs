@@ -29,13 +29,15 @@ pub async fn discover_devices(
     let mut results = Vec::new();
     for dev in raw_devs {
         let device_id  = device_id_for(&dev.id);
-        let min_sp = (dev.setpoint_min.unwrap_or(5.0)  * 10.0).round() as u16;
-        let max_sp = (dev.setpoint_max.unwrap_or(30.0) * 10.0).round() as u16;
+        // Setpoint range is not returned by the device-list endpoint; use
+        // hardware defaults (5–30 °C, expressed in tenths).
+        let min_sp: u16 = 50;
+        let max_sp: u16 = 300;
 
         let info = DeviceInfo {
             id:           device_id,
             name:         dev.name.clone(),
-            model:        dev.product_type.clone(),
+            model:        dev.model.clone(),
             protocol:     "mysa_cloud".to_string(),
             capabilities: vec![
                 Capability::Power,
@@ -47,7 +49,7 @@ pub async fn discover_devices(
             device_id,
             mysa_id:      dev.id,
             name:         dev.name,
-            model:        dev.product_type,
+            model:        dev.model,
             min_setpoint: min_sp,
             max_setpoint: max_sp,
         };

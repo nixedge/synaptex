@@ -25,14 +25,14 @@ impl MysaHttpClient {
         }
     }
 
-    /// `GET /api/v1/devices` — list all devices on the account.
+    /// `GET /devices` — list all devices on the account.
     pub async fn list_devices(&self, id_token: &str) -> Result<Vec<MysaDeviceInfo>> {
         let resp = self.http
-            .get(format!("{BASE_URL}/api/v1/devices"))
+            .get(format!("{BASE_URL}/devices"))
             .header("Authorization", id_token)
             .send()
             .await
-            .context("GET /api/v1/devices")?;
+            .context("GET /devices")?;
 
         let status = resp.status();
         let text   = resp.text().await.unwrap_or_default();
@@ -40,16 +40,16 @@ impl MysaHttpClient {
             bail!("list_devices failed ({status}): {text}");
         }
 
-        // Try array first, then wrapped object.
+        // Try plain array first, then {"Devices":[…]} / {"DevicesObj":{…}} wrappers.
         if let Ok(arr) = serde_json::from_str::<Vec<MysaDeviceInfo>>(&text) {
             return Ok(arr);
         }
         let wrapped: DeviceListWrapper = serde_json::from_str(&text)
             .with_context(|| format!("parse list_devices response: {text}"))?;
-        Ok(wrapped.data.unwrap_or_default())
+        Ok(wrapped.devices().unwrap_or_default())
     }
 
-    /// `GET /api/v1/state/batch` — fetch state for multiple devices at once.
+    /// `POST /state/batch` — fetch state for multiple devices at once.
     pub async fn get_state_batch(
         &self,
         id_token: &str,
@@ -57,12 +57,12 @@ impl MysaHttpClient {
     ) -> Result<HashMap<String, MysaRawState>> {
         let body = serde_json::json!({ "deviceIds": ids });
         let resp = self.http
-            .get(format!("{BASE_URL}/api/v1/state/batch"))
+            .post(format!("{BASE_URL}/state/batch"))
             .header("Authorization", id_token)
             .json(&body)
             .send()
             .await
-            .context("GET /api/v1/state/batch")?;
+            .context("POST /state/batch")?;
 
         let status = resp.status();
         let text   = resp.text().await.unwrap_or_default();
@@ -74,7 +74,7 @@ impl MysaHttpClient {
             .with_context(|| format!("parse get_state_batch response: {text}"))
     }
 
-    /// `POST /api/v1/state/{device_id}/update` — push a command to the cloud.
+    /// `POST /state/{device_id}/update` — push a command to the cloud.
     pub async fn post_command(
         &self,
         id_token:  &str,
@@ -82,12 +82,12 @@ impl MysaHttpClient {
         payload:   &serde_json::Value,
     ) -> Result<()> {
         let resp = self.http
-            .post(format!("{BASE_URL}/api/v1/state/{device_id}/update"))
+            .post(format!("{BASE_URL}/state/{device_id}/update"))
             .header("Authorization", id_token)
             .json(payload)
             .send()
             .await
-            .context("POST /api/v1/state/{device_id}/update")?;
+            .context("POST /state/{device_id}/update")?;
 
         let status = resp.status();
         if !status.is_success() {

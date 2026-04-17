@@ -41,21 +41,38 @@ pub struct MysaDeviceState {
 
 // ─── REST wire types ─────────────────────────────────────────────────────────
 
+/// Top-level wrapper around the `GET /devices` response.
+/// The backend may return `{"Devices":[…]}` or `{"DevicesObj":{…}}` (dict keyed by id).
 #[derive(Debug, Deserialize)]
 pub struct DeviceListWrapper {
-    pub data: Option<Vec<MysaDeviceInfo>>,
+    #[serde(rename = "Devices")]
+    pub devices_list: Option<Vec<MysaDeviceInfo>>,
+    #[serde(rename = "DevicesObj")]
+    pub devices_obj:  Option<std::collections::HashMap<String, MysaDeviceInfo>>,
+}
+
+impl DeviceListWrapper {
+    /// Flatten whichever variant is present into a Vec.
+    pub fn devices(self) -> Option<Vec<MysaDeviceInfo>> {
+        if let Some(list) = self.devices_list {
+            return Some(list);
+        }
+        if let Some(map) = self.devices_obj {
+            return Some(map.into_values().collect());
+        }
+        None
+    }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MysaDeviceInfo {
-    pub id:   String,
-    pub name: String,
-    #[serde(rename = "productType", default)]
-    pub product_type: String,
-    #[serde(rename = "setpointMin")]
-    pub setpoint_min: Option<f32>,
-    #[serde(rename = "setpointMax")]
-    pub setpoint_max: Option<f32>,
+    #[serde(rename = "Id")]
+    pub id:    String,
+    #[serde(rename = "Name")]
+    pub name:  String,
+    /// e.g. "BB-V1-0", "BB-V2-0", "ST-V1-0"
+    #[serde(rename = "Model", default)]
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
