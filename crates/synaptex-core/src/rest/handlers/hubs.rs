@@ -31,12 +31,21 @@ pub async fn list_hubs(
     // sub-device discovery completes.
     let registrations = db::list_hub_registrations(&state.trees).map_err(ie)?;
 
-    // Count discovered sub-devices per hub MAC.
+    // Count discovered sub-devices per hub.
+    // Bond devices group by hub MAC; Mysa devices group under the account username.
     let configs = db::load_all_plugin_configs(&state.trees).map_err(ie)?;
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for cfg in configs {
-        if let PluginConfig::Bond(b) = cfg {
-            *counts.entry(b.hub_mac).or_insert(0) += 1;
+    let mut mysa_count = 0usize;
+    for cfg in &configs {
+        match cfg {
+            PluginConfig::Bond(b) => { *counts.entry(b.hub_mac.clone()).or_insert(0) += 1; }
+            PluginConfig::Mysa(_) => { mysa_count += 1; }
+            _ => {}
+        }
+    }
+    if mysa_count > 0 {
+        if let Ok(Some(acct)) = db::get_mysa_account_config(&state.trees) {
+            counts.insert(acct.username, mysa_count);
         }
     }
 
@@ -182,6 +191,19 @@ async fn register_mysa_hub(
         password: body.password.clone(),
     };
     db::save_mysa_account_config(&state.trees, &acct_cfg).map_err(ie)?;
+
+    // Save a hub registration so the account appears in `hub list`.
+    // Use the username as the MAC-equivalent identifier (no physical hub MAC exists).
+    let hub_reg = HubRegistration {
+        mac:        body.username.clone(),
+        kind:       "mysa".to_string(),
+        hub_ip:     String::new(),
+        bond_token: String::new(),
+        bond_id:    String::new(),
+    };
+    if let Err(e) = db::save_hub_registration(&state.trees, &hub_reg) {
+        tracing::warn!(username = %body.username, "failed to save mysa hub registration: {e}");
+    }
 
     // Start the MQTT worker and kick off background device sync.
     account.start_mqtt_worker();
