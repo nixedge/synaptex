@@ -11,6 +11,8 @@ use synaptex_types::{
     DeviceInfo,
 };
 
+use tracing::{debug, info, warn};
+
 use crate::{client::BondClient, types::BondConfig};
 
 pub struct BondPlugin {
@@ -45,11 +47,16 @@ impl DevicePlugin for BondPlugin {
     fn is_connected(&self) -> bool       { self.connected.load(Ordering::Relaxed) }
 
     async fn connect(&self) -> PluginResult<()> {
+        debug!(device = %self.info.id, hub_ip = %self.cfg.hub_ip, "bond: connecting");
         self.client()
             .verify()
             .await
-            .map_err(|e| PluginError::Unreachable(e.to_string()))?;
+            .map_err(|e| {
+                warn!(device = %self.info.id, hub_ip = %self.cfg.hub_ip, "bond: connect failed: {e}");
+                PluginError::Unreachable(e.to_string())
+            })?;
         self.connected.store(true, Ordering::Relaxed);
+        info!(device = %self.info.id, hub_ip = %self.cfg.hub_ip, "bond: connected");
         Ok(())
     }
 
@@ -58,15 +65,22 @@ impl DevicePlugin for BondPlugin {
     }
 
     async fn poll_state(&self) -> PluginResult<DeviceState> {
+        let id = self.info.id;
+        debug!(device = %id, bond_device = %self.cfg.bond_device_id, "bond: polling state");
         let raw = self.client()
             .get_device_state(&self.cfg.bond_device_id)
             .await
-            .map_err(|e| PluginError::Unreachable(e.to_string()))?;
+            .map_err(|e| {
+                warn!(device = %id, "bond: poll_state failed: {e}");
+                self.connected.store(false, Ordering::Relaxed);
+                PluginError::Unreachable(e.to_string())
+            })?;
 
         self.connected.store(true, Ordering::Relaxed);
 
         let has_fan   = self.info.capabilities.contains(&Capability::Fan);
         let has_light = self.info.capabilities.contains(&Capability::Light);
+        debug!(device = %id, power = raw.power, light = raw.light, speed = raw.speed, "bond: raw state");
 
         // For fan+light devices Bond tracks the motor and light independently:
         //   raw.power = fan motor on/off
@@ -108,35 +122,30 @@ impl DevicePlugin for BondPlugin {
     }
 
     async fn execute_command(&self, cmd: DeviceCommand) -> PluginResult<()> {
-        let client = self.client();
-        let id     = &self.cfg.bond_device_id;
+        let client     = self.client();
+        let bond_id    = &self.cfg.bond_device_id;
+        let device_id  = self.info.id;
 
-        let result = match cmd {
-            DeviceCommand::SetPower(true) => {
-                client.execute_action(id, "TurnOn", None).await
+        let (action, arg): (&str, Option<u32>) = match cmd {
+            DeviceCommand::SetPower(true)  => ("TurnOn",       None),
+            DeviceCommand::SetPower(false) => ("TurnOff",      None),
+            DeviceCommand::SetFanSpeed(FanSpeed::Off) => ("TurnOff", None),
+            DeviceCommand::SetFanSpeed(speed) => {
+                let arg = speed_to_bond(speed, self.cfg.max_speed);
+                ("SetSpeed", Some(arg))
             }
-            DeviceCommand::SetPower(false) => {
-                client.execute_action(id, "TurnOff", None).await
-            }
-            DeviceCommand::SetFanSpeed(speed) => match speed {
-                FanSpeed::Off => {
-                    client.execute_action(id, "TurnOff", None).await
-                }
-                _ => {
-                    let arg = speed_to_bond(speed, self.cfg.max_speed);
-                    client.execute_action(id, "SetSpeed", Some(arg)).await
-                }
-            },
-            DeviceCommand::SetLight { power: Some(true), .. } => {
-                client.execute_action(id, "TurnLightOn", None).await
-            }
-            DeviceCommand::SetLight { power: Some(false), .. } => {
-                client.execute_action(id, "TurnLightOff", None).await
-            }
+            DeviceCommand::SetLight { power: Some(true),  .. } => ("TurnLightOn",  None),
+            DeviceCommand::SetLight { power: Some(false), .. } => ("TurnLightOff", None),
             _ => return Err(PluginError::UnsupportedCommand),
         };
 
-        result.map_err(|e| PluginError::Unreachable(e.to_string()))
+        info!(device = %device_id, action, ?arg, "bond: → action");
+        client.execute_action(bond_id, action, arg)
+            .await
+            .map_err(|e| {
+                warn!(device = %device_id, action, "bond: action failed: {e}");
+                PluginError::Unreachable(e.to_string())
+            })
     }
 }
 
