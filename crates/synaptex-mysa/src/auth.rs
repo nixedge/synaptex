@@ -44,8 +44,6 @@ const N_HEX: &str = concat!(
     "43DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF",
 );
 
-/// 3072 bits / 8 = 384 bytes.
-const N_BYTES: usize = 384;
 
 // ─── Session ─────────────────────────────────────────────────────────────────
 
@@ -162,14 +160,12 @@ async fn srp_authenticate(
     let n   = BigUint::parse_bytes(N_HEX.as_bytes(), 16).expect("parse N");
     let g   = BigUint::from(2u32);
 
-    // k = SHA256(pad(N) || pad(g))
+    // k = SHA256(padHex(N) || padHex(g))
+    // Uses Cognito-style padding: prepend 0x00 if high bit set, otherwise minimal bytes.
     let k = {
-        let n_pad = pad_biguint(&n);
-        let mut g_pad = vec![0u8; N_BYTES - 1];
-        g_pad.push(2u8);
         let mut h = Sha256::new();
-        h.update(&n_pad);
-        h.update(&g_pad);
+        h.update(&pad_hex_srp(&n));
+        h.update(&pad_hex_srp(&g));
         BigUint::from_bytes_be(&h.finalize())
     };
 
@@ -206,13 +202,11 @@ async fn srp_authenticate(
         .context("parse SRP_B")?;
     let salt_bytes = hex::decode(salt_hex).context("decode SALT hex")?;
 
-    // u = SHA256(pad(A) || pad(B))
+    // u = SHA256(padHex(A) || padHex(B))
     let (u_hash, u) = {
-        let a_pad = pad_biguint(&big_a);
-        let b_pad = pad_biguint(&b);
         let mut h = Sha256::new();
-        h.update(&a_pad);
-        h.update(&b_pad);
+        h.update(&pad_hex_srp(&big_a));
+        h.update(&pad_hex_srp(&b));
         let hash = h.finalize();
         let u = BigUint::from_bytes_be(&hash);
         (hash, u)
@@ -245,8 +239,8 @@ async fn srp_authenticate(
     let exp = &a + &u * &x;
     let s   = b_minus.modpow(&exp, &n);
 
-    // HKDF key = HKDF-SHA256(ikm=pad(S), salt=u_hash, info="Caldera Derived Key")[0..16]
-    let s_pad = pad_biguint(&s);
+    // HKDF key = HKDF-SHA256(ikm=padHex(S), salt=u_hash, info="Caldera Derived Key")[0..16]
+    let s_pad = pad_hex_srp(&s);
     let hk = Hkdf::<Sha256>::new(Some(&u_hash), &s_pad);
     let mut hkdf_key = [0u8; 16];
     hk.expand(b"Caldera Derived Key", &mut hkdf_key)
@@ -384,15 +378,19 @@ async fn cognito_identity_post(
     Ok(val)
 }
 
-/// Pad a BigUint to exactly N_BYTES (384) with leading zero bytes.
-fn pad_biguint(n: &BigUint) -> Vec<u8> {
+/// Pad a BigUint using Cognito's `padHex` convention:
+/// - Return minimal big-endian bytes (no unnecessary leading zeros)
+/// - Prepend a single 0x00 byte if the high bit is set (to prevent signed misinterpretation)
+/// This matches amazon-cognito-identity-js's `padHex` function exactly.
+fn pad_hex_srp(n: &BigUint) -> Vec<u8> {
     let bytes = n.to_bytes_be();
-    if bytes.len() >= N_BYTES {
-        bytes
+    if bytes.is_empty() || bytes[0] >= 0x80 {
+        let mut out = Vec::with_capacity(bytes.len() + 1);
+        out.push(0x00);
+        out.extend_from_slice(&bytes);
+        out
     } else {
-        let mut padded = vec![0u8; N_BYTES - bytes.len()];
-        padded.extend_from_slice(&bytes);
-        padded
+        bytes
     }
 }
 
