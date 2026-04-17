@@ -675,6 +675,10 @@ impl DevicePlugin for TuyaPlugin {
         }
     }
 
+    fn clear_backoff(&self) {
+        self.poll_backoff_until.store(0, Ordering::Release);
+    }
+
     /// No-op — connections are opened on demand per operation.
     async fn connect(&self) -> PluginResult<()> { Ok(()) }
 

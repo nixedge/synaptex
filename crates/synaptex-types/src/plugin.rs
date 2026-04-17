@@ -118,6 +118,11 @@ pub trait DevicePlugin: Send + Sync + 'static {
     async fn connect(&self)    -> PluginResult<()>;
     async fn disconnect(&self);
 
+    /// Clear any connection backoff so the next poll proceeds immediately.
+    /// Called by user-initiated operations (explicit get / set) to override
+    /// the automatic ECONNRESET backoff.  Default impl is a no-op.
+    fn clear_backoff(&self) {}
+
     /// One-shot state fetch used for initial cache hydration.
     /// Steady-state updates must be pushed via the bus sender.
     async fn poll_state(&self) -> PluginResult<DeviceState>;

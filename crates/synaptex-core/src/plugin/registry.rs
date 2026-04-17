@@ -63,7 +63,10 @@ impl PluginRegistry {
         cmd: DeviceCommand,
     ) -> PluginResult<()> {
         match self.entries.get(id) {
-            Some(e) => e.plugin.execute_command(cmd).await,
+            Some(e) => {
+                e.plugin.clear_backoff();
+                e.plugin.execute_command(cmd).await
+            }
             None    => Err(PluginError::Unreachable(format!(
                 "no plugin registered for {id}"
             ))),
@@ -75,6 +78,7 @@ impl PluginRegistry {
     pub async fn poll_device(&self, id: &DeviceId) -> PluginResult<DeviceState> {
         match self.entries.get(id) {
             Some(e) => {
+                e.plugin.clear_backoff();
                 let state = e.plugin.poll_state().await?;
                 self.cache.insert(state.clone());
                 Ok(state)
